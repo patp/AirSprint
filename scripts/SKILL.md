@@ -218,6 +218,8 @@ python3 airsprint_cli.py quote flight --body '{"legs":[{"aircraftId":"UUID","dep
 | `arrivalAirportId` | UUID | yes | From `quote airports` |
 | `departureDateUTC` | ISO 8601 | yes | e.g. `2026-04-15T14:00:00Z` |
 
+**Note:** All prices returned by the API are in **CAD** (Canadian dollars). The API does not include a currency field.
+
 ## Common Patterns
 
 ```bash

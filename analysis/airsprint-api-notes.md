@@ -211,6 +211,10 @@ The app enforces these rules before calling the API:
 
 The 8-hour rule is enforced client-side by `Utilities.checkBookTripAvailable(...)`.
 
+## Currency
+
+All prices returned by the API (flight quotes, empty leg costs, misc cost estimates) are in **CAD** (Canadian dollars). The API does not include a currency field in responses.
+
 ## Flight Tracking Feasibility
 
 Based on static analysis plus live `getMyTrips` responses on `2026-03-13`, the app API currently gives enough data to describe the trip, but not enough to reliably identify the exact aircraft on FlightAware.
