@@ -1,0 +1,349 @@
+{
+  "saved_on": "2026-03-13",
+  "artifact": {
+    "package": "com.droid.airsprint",
+    "version_name": "5.1.13",
+    "version_code": 29,
+    "xapk_path": "artifacts/com.droid.airsprint.xapk",
+    "sha256": "b756a3ba0d6a42515ece4962ac8a99726e97cdd4017b927259c09be09e7d2357"
+  },
+  "base_url": "https://prod2.airsprint.com",
+  "auth": {
+    "login_endpoint": "/oauth/token",
+    "login_method": "POST",
+    "login_content_type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "basic_authorization_header": "Basic VVNFUl9DTElFTlRfQVBQOnBhc3N3b3Jk",
+    "decoded_basic_credentials": "USER_CLIENT_APP:password",
+    "login_form_fields": [
+      "grant_type=password",
+      "username",
+      "password",
+      "deviceToken",
+      "deviceType=Android"
+    ],
+    "bearer_header_prefix": "Bearer ",
+    "token_response_fields": [
+      "access_token",
+      "token_type",
+      "refresh_token",
+      "expires_in",
+      "scope",
+      "email",
+      "jti"
+    ],
+    "refresh_behavior": "app replays password grant on 401"
+  },
+  "live_verified": [
+    {
+      "method": "POST",
+      "path": "/oauth/token",
+      "verified_on": "2026-03-13"
+    },
+    {
+      "method": "GET",
+      "path": "/user/getInitialUserInfo",
+      "verified_on": "2026-03-13"
+    },
+    {
+      "method": "GET",
+      "path": "/user/getMyTrips?arrivalTimeZone=America/Toronto",
+      "verified_on": "2026-03-13"
+    }
+  ],
+  "booking": {
+    "prep_endpoint": {
+      "method": "GET",
+      "path": "/user/getBookingInfo",
+      "returns": [
+        "accountId",
+        "authorizer",
+        "locations",
+        "aircrafts",
+        "passengers",
+        "contacts"
+      ]
+    },
+    "create_endpoint": {
+      "method": "POST",
+      "path": "/user/bookTrip"
+    },
+    "update_endpoint": {
+      "method": "PUT",
+      "path": "/user/updateTrip"
+    },
+    "payload_wrapper": "bookingReq",
+    "request_fields": {
+      "bookingReq": [
+        "accountId",
+        "aircraftRequested",
+        "authorizer",
+        "bookingId",
+        "bookingLegs",
+        "bookingSource",
+        "cancellationAuthorizer",
+        "isCancelBookingRequest",
+        "isEmptyLegBooking",
+        "isReturnTrip",
+        "revisionSource"
+      ],
+      "bookingLeg": [
+        "aircraftRequested",
+        "arrivalTimeEpoch",
+        "bookingLegId",
+        "bookingLegStatus",
+        "cateringRequested",
+        "departureAirport",
+        "departureTimeEpoch",
+        "destinationAirport",
+        "flightAttendantRequest",
+        "includeStandardRequests",
+        "isCancelBookingLegRequest",
+        "isFavourite",
+        "isNewBookingRequired",
+        "legPassengers",
+        "specialRequest",
+        "timeZone",
+        "transportationBookingRequested"
+      ],
+      "legPassenger": [
+        "id",
+        "email",
+        "firstName",
+        "lastName",
+        "gender",
+        "birthYear",
+        "isFrequentTraveller",
+        "legPassengerId",
+        "passengerId",
+        "status"
+      ]
+    },
+    "client_rules": [
+      "flyFrom required",
+      "flyTo required",
+      "departure and destination cannot match",
+      "date required",
+      "at least one of departureTime or arrivalTime required",
+      "aircraft required",
+      "max 10 passengers per leg",
+      "booking must be at least 480 minutes in the future",
+      "second leg must be later than first leg"
+    ],
+    "notes": [
+      "UI strips the visible IATA prefix before sending departureAirport and destinationAirport",
+      "bookingSource is set to App",
+      "Gson is used without serializeNulls"
+    ]
+  },
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/oauth/token",
+      "auth": "basic",
+      "category": "auth"
+    },
+    {
+      "method": "GET",
+      "path": "/user/getInitialUserInfo",
+      "auth": "bearer",
+      "category": "auth"
+    },
+    {
+      "method": "POST",
+      "path": "/user/changePassword",
+      "auth": "bearer",
+      "category": "auth"
+    },
+    {
+      "method": "POST",
+      "path": "/user/updateDeviceToken",
+      "auth": "bearer",
+      "category": "auth"
+    },
+    {
+      "method": "POST",
+      "path": "/user/logout",
+      "auth": "bearer",
+      "category": "auth"
+    },
+    {
+      "method": "POST",
+      "path": "/user/requestInfo",
+      "auth": "unknown",
+      "category": "auth"
+    },
+    {
+      "method": "POST",
+      "path": "/user/password-reset/start",
+      "auth": "unknown",
+      "category": "auth"
+    },
+    {
+      "method": "POST",
+      "path": "/user/password-reset/complete",
+      "auth": "unknown",
+      "category": "auth"
+    },
+    {
+      "method": "GET",
+      "path": "/user/getAccountInfo",
+      "auth": "bearer",
+      "category": "account"
+    },
+    {
+      "method": "POST",
+      "path": "/user/updateAccountInfo",
+      "auth": "bearer",
+      "category": "account"
+    },
+    {
+      "method": "GET",
+      "path": "/user/preferences",
+      "auth": "bearer",
+      "category": "account"
+    },
+    {
+      "method": "POST",
+      "path": "/user/preferences",
+      "auth": "bearer",
+      "category": "account"
+    },
+    {
+      "method": "POST",
+      "path": "/user/ownerHours/topUp",
+      "auth": "bearer",
+      "category": "account"
+    },
+    {
+      "method": "GET",
+      "path": "/user/getBookingInfo",
+      "auth": "bearer",
+      "category": "booking"
+    },
+    {
+      "method": "POST",
+      "path": "/user/bookTrip",
+      "auth": "bearer",
+      "category": "booking"
+    },
+    {
+      "method": "PUT",
+      "path": "/user/updateTrip",
+      "auth": "bearer",
+      "category": "booking"
+    },
+    {
+      "method": "GET",
+      "path": "/user/getMyTrips?arrivalTimeZone=...",
+      "auth": "bearer",
+      "category": "trips"
+    },
+    {
+      "method": "GET",
+      "path": "/user/getBookingById?bookingId=...&arrivalTimeZone=...",
+      "auth": "bearer",
+      "category": "trips"
+    },
+    {
+      "method": "GET",
+      "path": "/user/downloadTripSheet?bookingId=...",
+      "auth": "bearer",
+      "category": "trips"
+    },
+    {
+      "method": "GET",
+      "path": "/user/trip/{id}/invoice",
+      "auth": "bearer",
+      "category": "trips"
+    },
+    {
+      "method": "GET",
+      "path": "/user/invoices?arrivalTimeZone=...",
+      "auth": "bearer",
+      "category": "trips"
+    },
+    {
+      "method": "GET",
+      "path": "/user/preflight-info?arrivalTimeZone=...",
+      "auth": "bearer",
+      "category": "trips"
+    },
+    {
+      "method": "POST",
+      "path": "/user/preflight-info/covid/{id}",
+      "auth": "bearer",
+      "category": "trips"
+    },
+    {
+      "method": "POST",
+      "path": "/user/flight-feedback/{id}",
+      "auth": "bearer",
+      "category": "trips"
+    },
+    {
+      "method": "GET",
+      "path": "/user/getUserMessages",
+      "auth": "bearer",
+      "category": "messages"
+    },
+    {
+      "method": "POST",
+      "path": "/user/readUserMessage",
+      "auth": "bearer",
+      "category": "messages"
+    },
+    {
+      "method": "POST",
+      "path": "/user/deleteUserMessage",
+      "auth": "bearer",
+      "category": "messages"
+    },
+    {
+      "method": "POST",
+      "path": "/user/readAllUserMessages",
+      "auth": "bearer",
+      "category": "messages"
+    },
+    {
+      "method": "GET",
+      "path": "/user/feedback/subject",
+      "auth": "bearer",
+      "category": "feedback"
+    },
+    {
+      "method": "POST",
+      "path": "/user/feedback",
+      "auth": "bearer",
+      "category": "feedback"
+    },
+    {
+      "method": "GET",
+      "path": "/user/getAllCounts?currentEpoch=...&arrivalTimeZone=...",
+      "auth": "bearer",
+      "category": "misc"
+    },
+    {
+      "method": "GET",
+      "path": "/user/getStaticPageDetails?type=...",
+      "auth": "bearer",
+      "category": "misc"
+    },
+    {
+      "method": "GET",
+      "path": "/user/getEmptyLegDetails",
+      "auth": "bearer",
+      "category": "misc"
+    },
+    {
+      "method": "GET",
+      "path": "/user/verifyAppVersion?platform=android&versionName=...",
+      "auth": "unknown",
+      "category": "misc"
+    }
+  ],
+  "saved_files": [
+    "analysis/airsprint-api-notes.md",
+    "analysis/airsprint-api-catalog.json",
+    "scripts/airsprint_cli.py"
+  ]
+}
