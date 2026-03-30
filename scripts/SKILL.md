@@ -12,6 +12,7 @@ Covers: auth, user profile, trip management, booking, quotes & pricing, explore 
 # Credentials via env vars (recommended)
 export AIRSPRINT_USERNAME="email@example.com"
 export AIRSPRINT_PASSWORD="yourpassword"
+export AIRSPRINT_TIMEZONE="America/Montreal"  # required for local time in --date
 
 # Or load from .env
 source /Users/mb/src/AirSprint/.env
@@ -112,7 +113,7 @@ These commands call `api.airsprint.com` for **real server-side pricing**. Unlike
 
 | Command | Description |
 |---------|-------------|
-| `quote flight --from ICAO --to ICAO --date UTC` | Get flight quote (simple mode, auto-resolves ICAO to UUID) |
+| `quote flight --from ICAO --to ICAO --date DATETIME [--tz TZ]` | Get flight quote (simple mode, auto-resolves ICAO to UUID) |
 | `quote flight --body JSON` | Get flight quote (advanced mode, pass UUIDs directly) |
 | `quote cost --body JSON` | Misc cost estimate (catering, transport, surcharges) |
 | `quote hours-exchange --body JSON` | Hours exchange value estimate |
@@ -186,7 +187,12 @@ airsprint booking cancel --id BOOKING_ID --authorizer CONTACT_ID --dry-run
 
 **Simple mode** — just use ICAO codes:
 ```bash
+# Local time (requires --tz or AIRSPRINT_TIMEZONE)
+python3 airsprint_cli.py quote flight --from CYQB --to KTEB --date "2026-04-15T10:00" --tz America/Montreal
+
+# UTC (no --tz needed)
 python3 airsprint_cli.py quote flight --from CYQB --to KTEB --date "2026-04-15T14:00:00Z"
+
 # Returns: price, flight time, distance, departure/arrival times
 ```
 
@@ -230,12 +236,23 @@ python3 airsprint_cli.py trips get --id "a16OF000000vNCoYAM"
 # See available empty legs
 python3 airsprint_cli.py explore flights
 
-# Get a price quote
-python3 airsprint_cli.py quote flight --from CYUL --to CYYC --date "2026-05-01T12:00:00Z"
+# Get a price quote (UTC)
+python3 airsprint_cli.py quote flight --from CYUL --to CYYC --date "2026-05-01T16:00:00Z"
+
+# Get a price quote (local time)
+python3 airsprint_cli.py quote flight --from CYUL --to CYYC --date "2026-05-01T12:00" --tz America/Montreal
 
 # Read all messages
 python3 airsprint_cli.py messages read-all
 ```
+
+## Timezone
+
+No default timezone. For local times in `--date`:
+- Pass `--tz America/Montreal` on the command line, or
+- Set `AIRSPRINT_TIMEZONE=America/Montreal` in environment
+- UTC times (ending in `Z`) work without `--tz`
+- Local time without `--tz` exits with code 2
 
 ## Constraints
 
