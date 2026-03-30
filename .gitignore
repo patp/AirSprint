@@ -1,10 +1,14 @@
-.env
-.DS_Store
+# Ignore everything by default
+*
+
+# Allow these
+!.gitignore
+!README.md
+!scripts/
+!scripts/**
+!skills/
+!skills/**
+
+# Re-exclude junk inside allowed dirs
 __pycache__/
 *.pyc
-.claude/
-.learnings/
-artifacts/
-extracted/
-decompiled/
-analysis/
