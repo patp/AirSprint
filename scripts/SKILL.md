@@ -2,8 +2,9 @@
 
 ## Overview
 
-CLI for AirSprint fractional jet ownership platform (prod2.airsprint.com).
-Covers: auth, user profile, trip management, booking, explore flights, messages, feedback.
+CLI for AirSprint fractional jet ownership platform.
+Uses two APIs: prod2.airsprint.com (booking, trips, messages) and api.airsprint.com (quotes, pricing, airport/aircraft lookups).
+Covers: auth, user profile, trip management, booking, quotes & pricing, explore flights, messages, feedback.
 
 ## Setup
 
@@ -105,6 +106,19 @@ Tokens are cached at `~/.airsprint_token.json` (auto-expires). First call logs i
 | `feedback subjects` | List feedback subjects |
 | `feedback submit --body JSON` | Submit feedback |
 
+### quote — Pricing & Estimates (legacy API)
+
+These commands call `api.airsprint.com` for **real server-side pricing**. Unlike `--dry-run`, these actually query AirSprint.
+
+| Command | Description |
+|---------|-------------|
+| `quote flight --from ICAO --to ICAO --date UTC` | Get flight quote (simple mode, auto-resolves ICAO to UUID) |
+| `quote flight --body JSON` | Get flight quote (advanced mode, pass UUIDs directly) |
+| `quote cost --body JSON` | Misc cost estimate (catering, transport, surcharges) |
+| `quote hours-exchange --body JSON` | Hours exchange value estimate |
+| `quote airports [--icao CODE] [--name TEXT] [--limit N]` | Search airports (returns UUIDs for --body mode) |
+| `quote aircraft` | List all AirSprint fleet types with UUIDs |
+
 ## Booking Flow (Step by Step)
 
 1. **Get reference data**: `booking info` → extract `accountId`, `authorizer`, aircraft names, airport names, passenger list
@@ -168,6 +182,36 @@ airsprint booking cancel --id BOOKING_ID --leg-id LEG_ID --authorizer CONTACT_ID
 airsprint booking cancel --id BOOKING_ID --authorizer CONTACT_ID --dry-run
 ```
 
+## Quote Flow (Get Pricing Without Booking)
+
+**Simple mode** — just use ICAO codes:
+```bash
+python3 airsprint_cli.py quote flight --from CYQB --to KTEB --date "2026-04-15T14:00:00Z"
+# Returns: price, flight time, distance, departure/arrival times
+```
+
+**Advanced mode** — use UUIDs for full control:
+```bash
+# 1. Find airport UUIDs
+python3 airsprint_cli.py quote airports --name "Quebec"
+python3 airsprint_cli.py quote airports --icao KTEB
+
+# 2. Find aircraft UUID
+python3 airsprint_cli.py quote aircraft
+
+# 3. Get quote
+python3 airsprint_cli.py quote flight --body '{"legs":[{"aircraftId":"UUID","departureAirportId":"UUID","arrivalAirportId":"UUID","departureDateUTC":"2026-04-15T14:00:00Z"}]}'
+```
+
+### Quote leg fields (for --body)
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `aircraftId` | UUID | yes | Aircraft type UUID from `quote aircraft` |
+| `departureAirportId` | UUID | yes | From `quote airports` |
+| `arrivalAirportId` | UUID | yes | From `quote airports` |
+| `departureDateUTC` | ISO 8601 | yes | e.g. `2026-04-15T14:00:00Z` |
+
 ## Common Patterns
 
 ```bash
@@ -181,10 +225,13 @@ python3 airsprint_cli.py user profile
 python3 airsprint_cli.py trips list
 
 # Get a specific trip
-python3 airsprint_cli.py trips get --id "a]BK-12345"
+python3 airsprint_cli.py trips get --id "a16OF000000vNCoYAM"
 
 # See available empty legs
 python3 airsprint_cli.py explore flights
+
+# Get a price quote
+python3 airsprint_cli.py quote flight --from CYUL --to CYYC --date "2026-05-01T12:00:00Z"
 
 # Read all messages
 python3 airsprint_cli.py messages read-all
@@ -196,3 +243,5 @@ python3 airsprint_cli.py messages read-all
 - The API may return 401 if the token expired — re-run `auth login` to refresh
 - Airport names in bookings must match the `locations[]` values from `booking info` exactly
 - The CLI never prompts for input — all values must come via flags or env vars
+- Quote commands use a separate legacy API (api.airsprint.com) with its own token cache (~/.airsprint_legacy_token.json)
+- `quote flight --from/--to` auto-resolves ICAO codes but fetches the full airport list (~958 airports) on first call

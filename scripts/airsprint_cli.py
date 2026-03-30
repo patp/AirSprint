@@ -43,8 +43,10 @@ import typer
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://prod2.airsprint.com"
+LEGACY_BASE_URL = "https://api.airsprint.com/api"
 BASIC_AUTH = "Basic VVNFUl9DTElFTlRfQVBQOnBhc3N3b3Jk"
 TOKEN_CACHE = Path.home() / ".airsprint_token.json"
+LEGACY_TOKEN_CACHE = Path.home() / ".airsprint_legacy_token.json"
 DEFAULT_TZ = "America/Montreal"
 
 # Exit codes
@@ -205,6 +207,75 @@ def api_put(token: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Legacy API (api.airsprint.com) — used for quotes & estimates
+# ---------------------------------------------------------------------------
+
+
+def _legacy_login(username: str, password: str) -> str:
+    """Login to the legacy API → authToken."""
+    resp = _http(
+        "POST",
+        f"{LEGACY_BASE_URL}/user/sign-in-email",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        data=json.dumps({"email": username, "password": password}).encode("utf-8"),
+    )
+    token = resp.get("data", {}).get("authToken")
+    if not token:
+        raise RuntimeError(
+            json.dumps({"status": "error", "message": "No authToken in legacy login response"})
+        )
+    return token
+
+
+def _save_legacy_token(token: str, email: str) -> None:
+    data = {"authToken": token, "email": email, "_cached_at": int(time.time())}
+    LEGACY_TOKEN_CACHE.write_text(json.dumps(data, indent=2))
+    LEGACY_TOKEN_CACHE.chmod(0o600)
+
+
+def _load_legacy_token() -> str | None:
+    if not LEGACY_TOKEN_CACHE.exists():
+        return None
+    try:
+        data = json.loads(LEGACY_TOKEN_CACHE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    # Legacy tokens don't have expires_in — use 6 hour TTL
+    if time.time() - data.get("_cached_at", 0) > 21600:
+        return None
+    return data.get("authToken")
+
+
+def get_legacy_token(username: str | None = None, password: str | None = None) -> str:
+    """Return a valid legacy authToken, using cache when possible."""
+    cached = _load_legacy_token()
+    if cached:
+        return cached
+
+    u = username or os.environ.get("AIRSPRINT_USERNAME", "")
+    p = password or os.environ.get("AIRSPRINT_PASSWORD", "")
+    if not u or not p:
+        _die("Credentials required. Set AIRSPRINT_USERNAME/AIRSPRINT_PASSWORD or use --username/--password.", EXIT_AUTH)
+
+    token = _legacy_login(u, p)
+    _save_legacy_token(token, u)
+    return token
+
+
+def legacy_post(token: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    return _http(
+        "POST",
+        f"{LEGACY_BASE_URL}{path}",
+        headers={
+            "x-airsprint-auth-token": token,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        data=json.dumps(body or {}).encode("utf-8"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
 
@@ -275,6 +346,7 @@ booking_app = typer.Typer(help="Booking commands (create, update, cancel)", no_a
 explore_app = typer.Typer(help="Explore empty legs & shared flights", no_args_is_help=True)
 messages_app = typer.Typer(help="In-app message commands", no_args_is_help=True)
 feedback_app = typer.Typer(help="Feedback commands", no_args_is_help=True)
+quote_app = typer.Typer(help="Quotes & cost estimates (via legacy api.airsprint.com)", no_args_is_help=True)
 
 app.add_typer(auth_app, name="auth")
 app.add_typer(user_app, name="user")
@@ -283,6 +355,7 @@ app.add_typer(booking_app, name="booking")
 app.add_typer(explore_app, name="explore")
 app.add_typer(messages_app, name="messages")
 app.add_typer(feedback_app, name="feedback")
+app.add_typer(quote_app, name="quote")
 
 # Common options
 Username = typer.Option(None, "--username", "-u", envvar="AIRSPRINT_USERNAME", help="Login email")
@@ -773,6 +846,212 @@ def feedback_submit(
     token = get_token(username, password)
     data = api_post(token, "/user/feedback", payload)
     _out(data, fmt)
+
+
+# ---------------------------------------------------------------------------
+# quote helpers (legacy API UUID resolution)
+# ---------------------------------------------------------------------------
+
+_airport_cache: dict[str, str] = {}  # ICAO → UUID
+
+
+def _resolve_airport(token: str, icao: str) -> str:
+    """Resolve ICAO code to legacy API airport UUID."""
+    icao = icao.upper()
+    if icao in _airport_cache:
+        return _airport_cache[icao]
+
+    # Fetch all airports (cached across calls in same invocation)
+    if not _airport_cache:
+        for offset in range(0, 2000, 100):
+            resp = legacy_post(token, "/airport", {"page": {"limit": 100, "offset": offset}})
+            items = resp.get("data", {}).get("items", [])
+            if not items:
+                break
+            for a in items:
+                code = a.get("codeICAO", "")
+                if code:
+                    _airport_cache[code] = a["id"]
+
+    if icao not in _airport_cache:
+        _die(f"Airport not found: {icao}", EXIT_NOT_FOUND)
+    return _airport_cache[icao]
+
+
+def _get_default_aircraft(token: str) -> str:
+    """Get the first aircraft UUID from the user's account."""
+    resp = legacy_post(token, "/my-aircraft")
+    items = resp.get("data", {}).get("items", [])
+    if not items:
+        _die("No aircraft found on account", EXIT_NOT_FOUND)
+    return items[0]["aircraftId"]
+
+
+# ---------------------------------------------------------------------------
+# quote (legacy API — api.airsprint.com)
+# ---------------------------------------------------------------------------
+
+
+@quote_app.command("flight")
+def quote_flight(
+    departure: Optional[str] = typer.Option(None, "--from", help="Departure ICAO code (e.g. CYQB). Resolved to UUID automatically."),
+    arrival: Optional[str] = typer.Option(None, "--to", help="Arrival ICAO code (e.g. KTEB). Resolved to UUID automatically."),
+    date: Optional[str] = typer.Option(None, "--date", help="Departure date in UTC (e.g. 2026-04-15T14:00:00Z)"),
+    body: Optional[str] = typer.Option(None, "--body", help="Full JSON body (overrides --from/--to/--date)"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+):
+    """Get a flight quote with real server-side pricing from AirSprint.
+
+    Two modes:
+
+    1. Simple: --from CYQB --to KTEB --date 2026-04-15T14:00:00Z
+       (auto-resolves ICAO codes to UUIDs, uses your default aircraft)
+
+    2. Advanced: --body '{"legs": [{"aircraftId": "UUID", "departureAirportId": "UUID", ...}]}'
+       (pass UUIDs directly — get them from `quote airports` and `quote aircraft`)
+
+    Required leg fields: aircraftId, departureAirportId, arrivalAirportId, departureDateUTC
+    """
+    token = get_legacy_token(username, password)
+
+    if body:
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as e:
+            _die(f"Invalid JSON: {e}", EXIT_VALIDATION)
+    elif departure and arrival and date:
+        # Resolve ICAO → UUID
+        dep_id = _resolve_airport(token, departure)
+        arr_id = _resolve_airport(token, arrival)
+        ac_id = _get_default_aircraft(token)
+        payload = {
+            "legs": [{
+                "aircraftId": ac_id,
+                "departureAirportId": dep_id,
+                "arrivalAirportId": arr_id,
+                "departureDateUTC": date,
+            }]
+        }
+    else:
+        _die("Provide either --from/--to/--date or --body", EXIT_VALIDATION)
+
+    try:
+        resp = legacy_post(token, "/flight-quote", payload)
+        _out(resp.get("data", resp), fmt)
+    except RuntimeError as e:
+        _die(str(e), EXIT_ERROR)
+
+
+@quote_app.command("cost")
+def quote_cost(
+    body: str = typer.Option(..., "--body", help='JSON body, e.g. \'{"legs":[{"aircraft":"CITATION_CJ2_PLUS","quotePrice":750}]}\''),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+):
+    """Get miscellaneous cost estimate (catering, ground transport, surcharges).
+
+    This calls the legacy API (api.airsprint.com) for server-side cost breakdown.
+    """
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as e:
+        _die(f"Invalid JSON: {e}", EXIT_VALIDATION)
+    token = get_legacy_token(username, password)
+    try:
+        resp = legacy_post(token, "/trip/misc-cost-estimate", payload)
+        _out(resp.get("data", resp), fmt)
+    except RuntimeError as e:
+        _die(str(e), EXIT_ERROR)
+
+
+@quote_app.command("hours-exchange")
+def quote_hours_exchange(
+    body: str = typer.Option(..., "--body", help="JSON body for hours exchange estimate"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+):
+    """Estimate hours exchange value.
+
+    This calls the legacy API (api.airsprint.com) for server-side hours valuation.
+    """
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as e:
+        _die(f"Invalid JSON: {e}", EXIT_VALIDATION)
+    token = get_legacy_token(username, password)
+    try:
+        resp = legacy_post(token, "/hour-exchange/estimate", payload)
+        _out(resp.get("data", resp), fmt)
+    except RuntimeError as e:
+        _die(str(e), EXIT_ERROR)
+
+
+@quote_app.command("airports")
+def quote_airports(
+    icao: Optional[str] = typer.Option(None, "--icao", help="Filter by ICAO code (e.g. CYQB)"),
+    name: Optional[str] = typer.Option(None, "--name", help="Filter by name substring (e.g. Quebec)"),
+    limit: int = typer.Option(20, "--limit", help="Max results"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+):
+    """List airports with their UUIDs (needed for quote --body).
+
+    Use --icao or --name to filter. Returns id, ICAO, IATA, and name.
+    """
+    token = get_legacy_token(username, password)
+    all_airports = []
+    for offset in range(0, 2000, 100):
+        resp = legacy_post(token, "/airport", {"page": {"limit": 100, "offset": offset}})
+        items = resp.get("data", {}).get("items", [])
+        if not items:
+            break
+        all_airports.extend(items)
+
+    if icao:
+        icao_upper = icao.upper()
+        all_airports = [a for a in all_airports if icao_upper in (a.get("codeICAO") or "").upper()]
+    if name:
+        name_lower = name.lower()
+        all_airports = [a for a in all_airports if name_lower in (a.get("name") or "").lower()
+                        or name_lower in json.dumps(a.get("regionsServed", [])).lower()]
+
+    results = [
+        {
+            "id": a["id"],
+            "icao": a.get("codeICAO", ""),
+            "iata": a.get("codeIATA", ""),
+            "name": a.get("name", ""),
+            "city": a.get("address", {}).get("city", ""),
+            "country": a.get("address", {}).get("country", ""),
+        }
+        for a in all_airports[:limit]
+    ]
+    _out(results, fmt)
+
+
+@quote_app.command("aircraft")
+def quote_aircraft(
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+):
+    """List all AirSprint aircraft types with UUIDs (needed for quote --body)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/aircraft")
+    items = resp.get("data", {}).get("items", [])
+    results = [
+        {
+            "id": a.get("id", ""),
+            "name": a.get("aircraftName", a.get("name", "")),
+        }
+        for a in items
+    ]
+    _out(results, fmt)
 
 
 # ---------------------------------------------------------------------------
