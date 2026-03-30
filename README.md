@@ -134,7 +134,7 @@ See [`skills/SKILL.md`](skills/SKILL.md) for the full agent-oriented reference: 
 
 ## API Coverage
 
-Built from static analysis of the AirSprint Android app (`com.droid.airsprint` v5.1.13) and live API validation. See [`analysis/`](analysis/) for the full API catalog and notes.
+Built from static analysis of the AirSprint Android app (`com.droid.airsprint` v5.1.13) and live API validation.
 
 ### Endpoints Covered
 
