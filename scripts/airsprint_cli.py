@@ -47,7 +47,7 @@ LEGACY_BASE_URL = "https://api.airsprint.com/api"
 BASIC_AUTH = "Basic VVNFUl9DTElFTlRfQVBQOnBhc3N3b3Jk"
 TOKEN_CACHE = Path.home() / ".airsprint_token.json"
 LEGACY_TOKEN_CACHE = Path.home() / ".airsprint_legacy_token.json"
-DEFAULT_TZ = "America/Montreal"
+DEFAULT_TZ = ""  # No default — user must set AIRSPRINT_TIMEZONE or pass --timezone
 
 # Exit codes
 EXIT_OK = 0
@@ -312,7 +312,7 @@ def _die(message: str, code: int = EXIT_ERROR) -> None:
     raise typer.Exit(code)
 
 
-def _parse_local_dt(value: str, tz: str = DEFAULT_TZ) -> str:
+def _parse_local_dt(value: str, tz: str | None) -> str:
     """Parse a date/time string as local time and return UTC ISO 8601.
 
     Accepts:
@@ -320,17 +320,21 @@ def _parse_local_dt(value: str, tz: str = DEFAULT_TZ) -> str:
       - ISO with offset: 2026-04-15T10:00:00-04:00 → converted to UTC
       - Local (no offset): 2026-04-15T10:00 → interpreted in --timezone, converted to UTC
       - Date only: 2026-04-15 → midnight in --timezone, converted to UTC
+
+    If the value has no timezone info, --timezone is REQUIRED.
     """
     value = value.strip()
 
-    # Already has Z or offset → parse directly and convert
+    # Already has Z or offset → pass through
     if value.endswith("Z") or "+" in value[10:] or value[10:].count("-") > 0 and "T" in value:
-        # Check if it has a real offset (not just the date hyphens)
         tail = value[19:] if len(value) > 19 else ""
         if value.endswith("Z") or "+" in tail or (tail and tail[0] == "-"):
-            return value  # already has timezone info, pass through
+            return value
 
-    # No offset → treat as local time
+    # No offset → this is local time, timezone is required
+    if not tz:
+        _die("--timezone is required when using local time (no Z or offset). Set AIRSPRINT_TIMEZONE or pass --tz.", EXIT_VALIDATION)
+
     if "T" not in value:
         value = f"{value}T00:00"  # date only → midnight
 
@@ -347,11 +351,10 @@ def _parse_local_dt(value: str, tz: str = DEFAULT_TZ) -> str:
         except Exception:
             pass
 
-    # Fallback: assume UTC if no ZoneInfo
-    return naive.strftime("%Y-%m-%dT%H:%M:%SZ")
+    _die(f"Cannot convert local time: zoneinfo unavailable for {tz}", EXIT_ERROR)
 
 
-def _fmt_epoch(epoch_ms: Any, tz: str = DEFAULT_TZ, fmt: str = "%a %b %d, %H:%M") -> str:
+def _fmt_epoch(epoch_ms: Any, tz: str | None = None, fmt: str = "%a %b %d, %H:%M") -> str:
     if not epoch_ms:
         return "-"
     try:
@@ -359,7 +362,7 @@ def _fmt_epoch(epoch_ms: Any, tz: str = DEFAULT_TZ, fmt: str = "%a %b %d, %H:%M"
         dt = datetime.fromtimestamp(ts, tz=timezone.utc)
     except (TypeError, ValueError, OSError):
         return "-"
-    if ZoneInfo:
+    if tz and ZoneInfo:
         try:
             dt = dt.astimezone(ZoneInfo(tz))
         except Exception:
@@ -400,7 +403,7 @@ app.add_typer(quote_app, name="quote")
 Username = typer.Option(None, "--username", "-u", envvar="AIRSPRINT_USERNAME", help="Login email")
 Password = typer.Option(None, "--password", "-p", envvar="AIRSPRINT_PASSWORD", help="Login password")
 Format = typer.Option("json", "--format", "-f", help="Output format: json | human")
-Timezone = typer.Option(DEFAULT_TZ, "--timezone", "--tz", help="Timezone for date display")
+Timezone = typer.Option(None, "--timezone", "--tz", envvar="AIRSPRINT_TIMEZONE", help="Timezone (e.g. America/Montreal). Required for local time. Env: AIRSPRINT_TIMEZONE")
 
 
 # ---------------------------------------------------------------------------
@@ -533,28 +536,30 @@ def user_update(
 
 @trips_app.command("list")
 def trips_list(
-    timezone: str = Timezone,
+    timezone: Optional[str] = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
     """List all trips."""
     token = get_token(username, password)
-    data = api_get(token, f"/user/getMyTrips?arrivalTimeZone={timezone}")
+    tz_param = f"?arrivalTimeZone={timezone}" if timezone else ""
+    data = api_get(token, f"/user/getMyTrips{tz_param}")
     _out(data, fmt)
 
 
 @trips_app.command("get")
 def trips_get(
     booking_id: str = typer.Option(..., "--id", help="Booking ID"),
-    timezone: str = Timezone,
+    timezone: Optional[str] = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
     """Get a specific trip by booking ID."""
     token = get_token(username, password)
-    data = api_get(token, f"/user/getBookingById?bookingId={booking_id}&arrivalTimeZone={timezone}")
+    tz_param = f"&arrivalTimeZone={timezone}" if timezone else ""
+    data = api_get(token, f"/user/getBookingById?bookingId={booking_id}{tz_param}")
     if not data:
         _die(f"Trip {booking_id} not found", EXIT_NOT_FOUND)
     _out(data, fmt)
@@ -600,27 +605,29 @@ def trips_invoice(
 
 @trips_app.command("invoices")
 def trips_invoices(
-    timezone: str = Timezone,
+    timezone: Optional[str] = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
     """List all invoices."""
     token = get_token(username, password)
-    data = api_get(token, f"/user/invoices?arrivalTimeZone={timezone}")
+    tz_param = f"?arrivalTimeZone={timezone}" if timezone else ""
+    data = api_get(token, f"/user/invoices{tz_param}")
     _out(data, fmt)
 
 
 @trips_app.command("preflight")
 def trips_preflight(
-    timezone: str = Timezone,
+    timezone: Optional[str] = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
     """Get preflight info for upcoming trips."""
     token = get_token(username, password)
-    data = api_get(token, f"/user/preflight-info?arrivalTimeZone={timezone}")
+    tz_param = f"?arrivalTimeZone={timezone}" if timezone else ""
+    data = api_get(token, f"/user/preflight-info{tz_param}")
     _out(data, fmt)
 
 
@@ -773,7 +780,7 @@ def booking_cancel(
 
 @explore_app.command("flights")
 def explore_flights(
-    timezone: str = Timezone,
+    timezone: Optional[str] = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
@@ -786,7 +793,7 @@ def explore_flights(
 
 @explore_app.command("counts")
 def explore_counts(
-    timezone: str = Timezone,
+    timezone: Optional[str] = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
@@ -794,7 +801,8 @@ def explore_counts(
     """Get dashboard counts (unread messages, upcoming trips, etc.)."""
     token = get_token(username, password)
     epoch = int(time.time() * 1000)
-    data = api_get(token, f"/user/getAllCounts?currentEpoch={epoch}&arrivalTimeZone={timezone}")
+    tz_param = f"&arrivalTimeZone={timezone}" if timezone else ""
+    data = api_get(token, f"/user/getAllCounts?currentEpoch={epoch}{tz_param}")
     _out(data, fmt)
 
 
@@ -937,7 +945,7 @@ def quote_flight(
     arrival: Optional[str] = typer.Option(None, "--to", help="Arrival ICAO code (e.g. KTEB). Resolved to UUID automatically."),
     date: Optional[str] = typer.Option(None, "--date", help="Departure date/time in local time (e.g. 2026-04-15T10:00, 2026-04-15). Converted to UTC using --timezone."),
     body: Optional[str] = typer.Option(None, "--body", help="Full JSON body (overrides --from/--to/--date)"),
-    timezone: str = Timezone,
+    timezone: Optional[str] = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
@@ -952,10 +960,10 @@ def quote_flight(
     2. Advanced: --body '{"legs": [{"aircraftId": "UUID", "departureAirportId": "UUID", ...}]}'
        (pass UUIDs directly — get them from `quote airports` and `quote aircraft`)
 
-    Date accepts local time (default: America/Montreal), e.g.:
-      --date 2026-04-15T10:00      → 10:00 AM Eastern
-      --date 2026-04-15             → midnight Eastern
-      --date 2026-04-15T14:00:00Z   → already UTC, passed through
+    Date accepts local time (requires --timezone or AIRSPRINT_TIMEZONE), e.g.:
+      --date 2026-04-15T10:00 --tz America/Montreal  → 10:00 AM Eastern
+      --date 2026-04-15 --tz America/Montreal         → midnight Eastern
+      --date 2026-04-15T14:00:00Z                     → already UTC, no --tz needed
     """
     token = get_legacy_token(username, password)
 
