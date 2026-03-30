@@ -312,6 +312,45 @@ def _die(message: str, code: int = EXIT_ERROR) -> None:
     raise typer.Exit(code)
 
 
+def _parse_local_dt(value: str, tz: str = DEFAULT_TZ) -> str:
+    """Parse a date/time string as local time and return UTC ISO 8601.
+
+    Accepts:
+      - Already UTC: 2026-04-15T14:00:00Z → passed through
+      - ISO with offset: 2026-04-15T10:00:00-04:00 → converted to UTC
+      - Local (no offset): 2026-04-15T10:00 → interpreted in --timezone, converted to UTC
+      - Date only: 2026-04-15 → midnight in --timezone, converted to UTC
+    """
+    value = value.strip()
+
+    # Already has Z or offset → parse directly and convert
+    if value.endswith("Z") or "+" in value[10:] or value[10:].count("-") > 0 and "T" in value:
+        # Check if it has a real offset (not just the date hyphens)
+        tail = value[19:] if len(value) > 19 else ""
+        if value.endswith("Z") or "+" in tail or (tail and tail[0] == "-"):
+            return value  # already has timezone info, pass through
+
+    # No offset → treat as local time
+    if "T" not in value:
+        value = f"{value}T00:00"  # date only → midnight
+
+    try:
+        naive = datetime.fromisoformat(value)
+    except ValueError:
+        _die(f"Cannot parse date: {value}. Use YYYY-MM-DDTHH:MM or YYYY-MM-DD", EXIT_VALIDATION)
+
+    if ZoneInfo:
+        try:
+            local_dt = naive.replace(tzinfo=ZoneInfo(tz))
+            utc_dt = local_dt.astimezone(timezone.utc)
+            return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            pass
+
+    # Fallback: assume UTC if no ZoneInfo
+    return naive.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _fmt_epoch(epoch_ms: Any, tz: str = DEFAULT_TZ, fmt: str = "%a %b %d, %H:%M") -> str:
     if not epoch_ms:
         return "-"
@@ -896,8 +935,9 @@ def _get_default_aircraft(token: str) -> str:
 def quote_flight(
     departure: Optional[str] = typer.Option(None, "--from", help="Departure ICAO code (e.g. CYQB). Resolved to UUID automatically."),
     arrival: Optional[str] = typer.Option(None, "--to", help="Arrival ICAO code (e.g. KTEB). Resolved to UUID automatically."),
-    date: Optional[str] = typer.Option(None, "--date", help="Departure date in UTC (e.g. 2026-04-15T14:00:00Z)"),
+    date: Optional[str] = typer.Option(None, "--date", help="Departure date/time in local time (e.g. 2026-04-15T10:00, 2026-04-15). Converted to UTC using --timezone."),
     body: Optional[str] = typer.Option(None, "--body", help="Full JSON body (overrides --from/--to/--date)"),
+    timezone: str = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
@@ -906,13 +946,16 @@ def quote_flight(
 
     Two modes:
 
-    1. Simple: --from CYQB --to KTEB --date 2026-04-15T14:00:00Z
-       (auto-resolves ICAO codes to UUIDs, uses your default aircraft)
+    1. Simple: --from CYQB --to KTEB --date 2026-04-15T10:00
+       (ICAO auto-resolved, local time converted to UTC via --timezone, uses your default aircraft)
 
     2. Advanced: --body '{"legs": [{"aircraftId": "UUID", "departureAirportId": "UUID", ...}]}'
        (pass UUIDs directly — get them from `quote airports` and `quote aircraft`)
 
-    Required leg fields: aircraftId, departureAirportId, arrivalAirportId, departureDateUTC
+    Date accepts local time (default: America/Montreal), e.g.:
+      --date 2026-04-15T10:00      → 10:00 AM Eastern
+      --date 2026-04-15             → midnight Eastern
+      --date 2026-04-15T14:00:00Z   → already UTC, passed through
     """
     token = get_legacy_token(username, password)
 
@@ -922,7 +965,7 @@ def quote_flight(
         except json.JSONDecodeError as e:
             _die(f"Invalid JSON: {e}", EXIT_VALIDATION)
     elif departure and arrival and date:
-        # Resolve ICAO → UUID
+        date_utc = _parse_local_dt(date, timezone)
         dep_id = _resolve_airport(token, departure)
         arr_id = _resolve_airport(token, arrival)
         ac_id = _get_default_aircraft(token)
@@ -931,7 +974,7 @@ def quote_flight(
                 "aircraftId": ac_id,
                 "departureAirportId": dep_id,
                 "arrivalAirportId": arr_id,
-                "departureDateUTC": date,
+                "departureDateUTC": date_utc,
             }]
         }
     else:
