@@ -105,7 +105,7 @@ python3 scripts/airsprint_cli.py quote hours-exchange --body '{"...": "..."}'
 ### Booking Flow
 
 1. `booking info` — get `accountId`, `authorizer`, valid airports, aircraft, passengers
-2. Build a `bookingReq` JSON payload (see [SKILL.md](skills/airsprint/SKILL.md) for schema)
+2. Build a `bookingReq` JSON payload (see [SKILL.md](skills/SKILL.md) for schema)
 3. `booking create --body '...' --dry-run` — validate without submitting
 4. `booking create --body '...'` — submit the booking
 
@@ -130,7 +130,7 @@ UTC times (ending in `Z`) work without `--tz`.
 
 ## Agent Guide
 
-See [`skills/airsprint/SKILL.md`](skills/airsprint/SKILL.md) for the full agent-oriented reference: every command, payload schemas, booking rules, and common patterns.
+See [`skills/SKILL.md`](skills/SKILL.md) for the full agent-oriented reference: every command, payload schemas, booking rules, and common patterns.
 
 ## API Coverage
 
