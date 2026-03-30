@@ -32,9 +32,11 @@ except ImportError:
     ZoneInfo = None
 
 try:
-    import certifi
+    import truststore
+    truststore.inject_into_ssl()
+    _truststore_active = True
 except ImportError:
-    certifi = None
+    _truststore_active = False
 
 import typer
 
@@ -62,8 +64,6 @@ EXIT_AUTH = 4
 
 
 def _ssl_ctx() -> ssl.SSLContext:
-    if certifi is not None:
-        return ssl.create_default_context(cafile=certifi.where())
     return ssl.create_default_context()
 
 

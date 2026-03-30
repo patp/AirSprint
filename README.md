@@ -19,7 +19,7 @@ Agent-friendly CLI for [AirSprint](https://www.airsprint.com/) fractional jet ow
 ## Setup
 
 ```bash
-pip install typer certifi
+pip install typer truststore
 ```
 
 Set credentials and timezone:
@@ -154,4 +154,4 @@ Built from static analysis of the AirSprint Android app (`com.droid.airsprint` v
 
 - Python 3.10+
 - `typer` (CLI framework)
-- `certifi` (optional, for SSL on some systems)
+- `truststore` (uses OS native certificate store for SSL)
