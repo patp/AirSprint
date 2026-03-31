@@ -19,7 +19,7 @@ import os
 import ssl
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone as _tz_utc
 from pathlib import Path
 from typing import Any, Optional
 from urllib.error import HTTPError, URLError
@@ -262,6 +262,17 @@ def get_legacy_token(username: str | None = None, password: str | None = None) -
     return token
 
 
+def legacy_get(token: str, path: str) -> dict[str, Any]:
+    return _http(
+        "GET",
+        f"{LEGACY_BASE_URL}{path}",
+        headers={
+            "x-airsprint-auth-token": token,
+            "Accept": "application/json",
+        },
+    )
+
+
 def legacy_post(token: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
     return _http(
         "POST",
@@ -273,6 +284,13 @@ def legacy_post(token: str, path: str, body: dict[str, Any] | None = None) -> di
         },
         data=json.dumps(body or {}).encode("utf-8"),
     )
+
+
+def _get_legacy_account_ids(token: str) -> list[str]:
+    """Get account IDs from the legacy API."""
+    resp = legacy_post(token, "/my-accounts", {})
+    items = resp.get("data", {}).get("items", [])
+    return [item["id"] for item in items if "id" in item]
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +364,7 @@ def _parse_local_dt(value: str, tz: str | None) -> str:
     if ZoneInfo:
         try:
             local_dt = naive.replace(tzinfo=ZoneInfo(tz))
-            utc_dt = local_dt.astimezone(timezone.utc)
+            utc_dt = local_dt.astimezone(_tz_utc.utc)
             return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         except Exception:
             pass
@@ -359,7 +377,7 @@ def _fmt_epoch(epoch_ms: Any, tz: str | None = None, fmt: str = "%a %b %d, %H:%M
         return "-"
     try:
         ts = float(epoch_ms) / 1000 if float(epoch_ms) > 1e12 else float(epoch_ms)
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        dt = datetime.fromtimestamp(ts, tz=_tz_utc.utc)
     except (TypeError, ValueError, OSError):
         return "-"
     if tz and ZoneInfo:
@@ -466,9 +484,9 @@ def user_profile(
     fmt: str = Format,
 ):
     """Get current user profile."""
-    token = get_token(username, password)
-    data = api_get(token, "/user/getInitialUserInfo")
-    _out(data, fmt)
+    token = get_legacy_token(username, password)
+    resp = legacy_get(token, "/me")
+    _out(resp.get("data", resp), fmt)
 
 
 @user_app.command("accounts")
@@ -477,10 +495,11 @@ def user_accounts(
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Get account info (shares, access levels)."""
-    token = get_token(username, password)
-    data = api_get(token, "/user/getAccountInfo")
-    _out(data, fmt)
+    """Get account info (shares, aircraft, access levels, hours)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/my-accounts", {})
+    items = resp.get("data", {}).get("items", [])
+    _out(items, fmt)
 
 
 @user_app.command("preferences")
@@ -536,33 +555,63 @@ def user_update(
 
 @trips_app.command("list")
 def trips_list(
+    upcoming: bool = typer.Option(True, "--upcoming/--past", help="Show upcoming (default) or past trips"),
+    limit: int = typer.Option(25, "--limit", "-n", help="Max trips to return"),
     timezone: Optional[str] = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """List all trips."""
-    token = get_token(username, password)
-    tz_param = f"?arrivalTimeZone={timezone}" if timezone else ""
-    data = api_get(token, f"/user/getMyTrips{tz_param}")
-    _out(data, fmt)
+    """List trips (including interchange flights).
+
+    Uses the legacy API which returns all trip types including interchange.
+    """
+    token = get_legacy_token(username, password)
+    account_ids = _get_legacy_account_ids(token)
+    if not account_ids:
+        _die("No accounts found", EXIT_ERROR)
+
+    now = datetime.now(tz=_tz_utc.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    time_filter = {"min": now} if upcoming else {"max": now}
+    sort_dir = "ASC" if upcoming else "DESC"
+
+    payload = {
+        "sort": [{"departureDate": sort_dir}],
+        "page": {"limit": limit, "offset": 0},
+        "filter": {
+            "departureTime": time_filter,
+            "accountId": account_ids,
+        },
+    }
+    resp = legacy_post(token, "/my-leg", payload)
+    items = resp.get("data", {}).get("items", [])
+    _out(items, fmt)
 
 
 @trips_app.command("get")
 def trips_get(
-    booking_id: str = typer.Option(..., "--id", help="Booking ID"),
-    timezone: Optional[str] = Timezone,
+    booking_id: str = typer.Option(..., "--id", help="Booking ID (e.g. IYIBL)"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
     """Get a specific trip by booking ID."""
-    token = get_token(username, password)
-    tz_param = f"&arrivalTimeZone={timezone}" if timezone else ""
-    data = api_get(token, f"/user/getBookingById?bookingId={booking_id}{tz_param}")
-    if not data:
+    token = get_legacy_token(username, password)
+    account_ids = _get_legacy_account_ids(token)
+    if not account_ids:
+        _die("No accounts found", EXIT_ERROR)
+
+    # Search all legs for this booking ID
+    resp = legacy_post(token, "/my-leg", {
+        "sort": [{"departureDate": "ASC"}],
+        "page": {"limit": 100, "offset": 0},
+        "filter": {"accountId": account_ids},
+    })
+    items = resp.get("data", {}).get("items", [])
+    matches = [item for item in items if item.get("bookingId") == booking_id]
+    if not matches:
         _die(f"Trip {booking_id} not found", EXIT_NOT_FOUND)
-    _out(data, fmt)
+    _out(matches, fmt)
 
 
 @trips_app.command("tripsheet")
@@ -780,30 +829,64 @@ def booking_cancel(
 
 @explore_app.command("flights")
 def explore_flights(
-    timezone: Optional[str] = Timezone,
+    limit: int = typer.Option(25, "--limit", "-n", help="Max results"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
     """List available empty legs and shared flights."""
-    token = get_token(username, password)
-    data = api_get(token, "/user/getEmptyLegDetails")
-    _out(data, fmt)
+    token = get_legacy_token(username, password)
+    now = datetime.now(tz=_tz_utc.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    resp = legacy_post(token, "/my-flights", {
+        "sort": [{"departureTimestamp": "ASC"}],
+        "page": {"limit": limit, "offset": 0},
+        "filter": {
+            "departureTime": {"min": now},
+            "type": ["EMPTY_LEG"],
+            "locked": False,
+        },
+    })
+    items = resp.get("data", {}).get("items", [])
+    _out(items, fmt)
 
 
 @explore_app.command("counts")
 def explore_counts(
-    timezone: Optional[str] = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Get dashboard counts (unread messages, upcoming trips, etc.)."""
-    token = get_token(username, password)
-    epoch = int(time.time() * 1000)
-    tz_param = f"&arrivalTimeZone={timezone}" if timezone else ""
-    data = api_get(token, f"/user/getAllCounts?currentEpoch={epoch}{tz_param}")
-    _out(data, fmt)
+    """Get dashboard counts (unread messages, upcoming trips)."""
+    token = get_legacy_token(username, password)
+    account_ids = _get_legacy_account_ids(token)
+
+    # Unread notifications count
+    notif_resp = legacy_post(token, "/my-notifications", {
+        "sort": [], "page": {"limit": 1, "offset": 0},
+        "filter": {"isRead": False},
+    })
+    unread = notif_resp.get("data", {}).get("total", 0)
+
+    # Upcoming trips count
+    now = datetime.now(tz=_tz_utc.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    trips_resp = legacy_post(token, "/my-leg", {
+        "sort": [], "page": {"limit": 1, "offset": 0},
+        "filter": {"departureTime": {"min": now}, "accountId": account_ids},
+    })
+    upcoming = trips_resp.get("data", {}).get("total", 0)
+
+    # Empty legs count
+    flights_resp = legacy_post(token, "/my-flights", {
+        "sort": [], "page": {"limit": 1, "offset": 0},
+        "filter": {"departureTime": {"min": now}, "type": ["EMPTY_LEG"], "locked": False},
+    })
+    empty_legs = flights_resp.get("data", {}).get("total", 0)
+
+    _out({
+        "unreadMessages": unread,
+        "upcomingTrips": upcoming,
+        "emptyLegs": empty_legs,
+    }, fmt)
 
 
 # ---------------------------------------------------------------------------
@@ -813,14 +896,24 @@ def explore_counts(
 
 @messages_app.command("list")
 def messages_list(
+    unread: Optional[bool] = typer.Option(None, "--unread/--all", help="Filter unread only"),
+    limit: int = typer.Option(25, "--limit", "-n", help="Max results"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """List all in-app messages."""
-    token = get_token(username, password)
-    data = api_get(token, "/user/getUserMessages")
-    _out(data, fmt)
+    """List in-app notifications/messages."""
+    token = get_legacy_token(username, password)
+    filt: dict[str, Any] = {}
+    if unread is True:
+        filt["isRead"] = False
+    resp = legacy_post(token, "/my-notifications", {
+        "sort": [],
+        "page": {"limit": limit, "offset": 0},
+        "filter": filt,
+    })
+    items = resp.get("data", {}).get("items", [])
+    _out(items, fmt)
 
 
 @messages_app.command("read")
@@ -908,21 +1001,18 @@ def _resolve_airport(token: str, icao: str) -> str:
     if icao in _airport_cache:
         return _airport_cache[icao]
 
-    # Fetch all airports (cached across calls in same invocation)
-    if not _airport_cache:
-        for offset in range(0, 2000, 100):
-            resp = legacy_post(token, "/airport", {"page": {"limit": 100, "offset": offset}})
-            items = resp.get("data", {}).get("items", [])
-            if not items:
-                break
-            for a in items:
-                code = a.get("codeICAO", "")
-                if code:
-                    _airport_cache[code] = a["id"]
+    resp = legacy_post(token, "/airport", {
+        "sort": [], "page": {"limit": 1, "offset": 0},
+        "filter": {"query": icao},
+    })
+    items = resp.get("data", {}).get("items", [])
+    for a in items:
+        code = a.get("codeICAO", "")
+        if code and code.upper() == icao:
+            _airport_cache[icao] = a["id"]
+            return a["id"]
 
-    if icao not in _airport_cache:
-        _die(f"Airport not found: {icao}", EXIT_NOT_FOUND)
-    return _airport_cache[icao]
+    _die(f"Airport not found: {icao}", EXIT_NOT_FOUND)
 
 
 def _get_default_aircraft(token: str) -> str:
@@ -1043,34 +1133,26 @@ def quote_hours_exchange(
 
 @quote_app.command("airports")
 def quote_airports(
-    icao: Optional[str] = typer.Option(None, "--icao", help="Filter by ICAO code (e.g. CYQB)"),
-    name: Optional[str] = typer.Option(None, "--name", help="Filter by name substring (e.g. Quebec)"),
+    query: Optional[str] = typer.Option(None, "--query", "-q", help="Search by ICAO, IATA, or name (e.g. CYQB, Quebec)"),
+    saved: bool = typer.Option(False, "--saved", help="Show saved/favourite airports only"),
     limit: int = typer.Option(20, "--limit", help="Max results"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """List airports with their UUIDs (needed for quote --body).
-
-    Use --icao or --name to filter. Returns id, ICAO, IATA, and name.
-    """
+    """Search airports. Returns id, ICAO, IATA, name, and location."""
     token = get_legacy_token(username, password)
-    all_airports = []
-    for offset in range(0, 2000, 100):
-        resp = legacy_post(token, "/airport", {"page": {"limit": 100, "offset": offset}})
-        items = resp.get("data", {}).get("items", [])
-        if not items:
-            break
-        all_airports.extend(items)
-
-    if icao:
-        icao_upper = icao.upper()
-        all_airports = [a for a in all_airports if icao_upper in (a.get("codeICAO") or "").upper()]
-    if name:
-        name_lower = name.lower()
-        all_airports = [a for a in all_airports if name_lower in (a.get("name") or "").lower()
-                        or name_lower in json.dumps(a.get("regionsServed", [])).lower()]
-
+    filt: dict[str, Any] = {}
+    if query:
+        filt["query"] = query
+    if saved:
+        filt["saved"] = True
+    resp = legacy_post(token, "/airport", {
+        "sort": [],
+        "page": {"limit": limit, "offset": 0},
+        "filter": filt,
+    })
+    items = resp.get("data", {}).get("items", [])
     results = [
         {
             "id": a["id"],
@@ -1080,7 +1162,7 @@ def quote_airports(
             "city": a.get("address", {}).get("city", ""),
             "country": a.get("address", {}).get("country", ""),
         }
-        for a in all_airports[:limit]
+        for a in items
     ]
     _out(results, fmt)
 
