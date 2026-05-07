@@ -1,9 +1,9 @@
 # AirSprint CLI
 
-Agent-friendly CLI for [AirSprint](https://www.airsprint.com/) fractional jet ownership. Uses two APIs:
+Agent-friendly CLI for [AirSprint](https://www.airsprint.com/) fractional jet ownership.
 
-- **prod2.airsprint.com** — booking, trips, messages (OAuth2, from the mobile app)
-- **api.airsprint.com** — quotes, pricing, airport/aircraft lookups (legacy API)
+- **api.airsprint.com** — owner portal API: bookings, trips, messages, quotes, pricing, lookups (the only live host as of April 2026)
+- **prod2.airsprint.com** — old mobile-app API, decommissioned April 2026; `raw prod2-*` escape hatches are kept only for reference
 
 ## Features
 
@@ -61,7 +61,7 @@ python3 scripts/airsprint_cli.py <group> <command> [options]
 | `messages` | List, read, delete in-app messages |
 | `feedback` | List subjects, submit feedback |
 | `cache` | Manage the local airport/aircraft mirror |
-| `raw` | Raw API escape hatches (legacy GET/POST, prod2 GET/POST/PUT) |
+| `raw` | Raw API escape hatches (api GET/POST/PATCH, prod2 GET/POST/PUT) |
 | `account` | Account-user management (list, invite, update, roles) |
 | `passenger` | Saved passengers (list, get, create) |
 | `passport` | Saved passports + document upload/attach |
@@ -166,25 +166,25 @@ Built from static analysis of the AirSprint Android app (`com.droid.airsprint` v
 
 | Category | API | Endpoints |
 |----------|-----|-----------|
-| Auth | prod2 + legacy | `/oauth/token`, `user/2fa/setup`, `user/2fa/verify`, `user/2fa/disable`, `user/request-reset-password`, `user/reset-password` |
-| User | prod2 + legacy | `getInitialUserInfo`, `getAccountInfo`, `updateAccountInfo`, `preferences`, `my-user`, `my-user/avatar`, `my-user/change-password`, `my-notifications`, `my-notification-settings` |
-| Trips | prod2 + legacy | `getMyTrips`, `getBookingById`, `downloadTripSheet`, `invoices`, `preflight-info`, `trip/manifest`, `trip/manifest/send`, `leg/recent/list`, `leg/recent/save` |
-| Booking | prod2 + legacy | `getBookingInfo`, `bookTrip`, `updateTrip` (update + cancel), `empty-leg/book`, `shared-flight/book`, `flight/lock`, `reserve-day`, `cancel-own`, `booking-survey/create` |
-| Explore | prod2 | `getEmptyLegDetails`, `getAllCounts` |
-| Messages | prod2 | `getUserMessages`, `readUserMessage`, `readAllUserMessages`, `deleteUserMessage` |
-| Feedback | prod2 + legacy | `feedback/subject`, `feedback`, `feedback/create` |
-| Quotes | legacy | `flight-quote`, `trip/misc-cost-estimate`, `hour-exchange/estimate` |
-| Lookups | legacy | `airport`, `airport/nearest`, `my-saved-airports`, `aircraft`, `my-aircraft`, `baggage-type` |
-| Account | legacy | `my-account-users`, `my-account-user/{id}`, `account-user/invite`, `account-user/update`, `account-user-role` |
-| Passenger | legacy | `my-passenger`, `my-passenger/{id}`, `my-passenger/create` |
-| Passport | legacy | `my-passport`, `my-passport/create`, `my-passport/upload-init`, `my-passport/attach` |
-| Pet | legacy | `my-pet`, `my-pet/create`, `my-pet/upload-init`, `my-pet/attach` |
-| Customs | legacy | `myCanadianCustomsDeclaration`, `canadianCustomsDeclaration/create`, `canadianCustomsDeclaration/create-public`, `canadianCustomsDeclaration/link-create` |
-| Address | legacy | `address/autocomplete`, `my-address/create` |
-| Hours | legacy | `hour-exchange/estimate`, `hour-exchange/power`, `hours-exchange-listing/create`, `my-hours-exchange-listing` |
-| Files | legacy | `my-file`, `file-public/create` |
-| Content | legacy | `faq`, `faq-category`, `policy`, `policy-category`, `system-notice`, `required-info`, `concierge` |
-| Social | legacy | `my-user/followers`, `my-user/following`, `my-user/follower-requests`, `user/follow`, `user/follower/accept`, `user/follower/decline` |
+| Auth | api | `/oauth/token`, `user/2fa/setup`, `user/2fa/verify`, `user/2fa/disable`, `user/request-reset-password`, `user/reset-password` |
+| User | api | `getInitialUserInfo`, `getAccountInfo`, `updateAccountInfo`, `preferences`, `my-user`, `my-user/avatar`, `my-user/change-password`, `my-notifications`, `my-notification-settings` |
+| Trips | api | `getMyTrips`, `getBookingById`, `downloadTripSheet`, `invoices`, `preflight-info`, `trip/manifest`, `trip/manifest/send`, `leg/recent/list`, `leg/recent/save` |
+| Booking | api | `getBookingInfo`, `bookTrip`, `updateTrip` (update + cancel), `empty-leg/book`, `shared-flight/book`, `flight/lock`, `reserve-day`, `cancel-own`, `booking-survey/create` |
+| Explore | api | `getEmptyLegDetails`, `getAllCounts` |
+| Messages | api | `getUserMessages`, `readUserMessage`, `readAllUserMessages`, `deleteUserMessage` |
+| Feedback | api | `feedback/subject`, `feedback`, `feedback/create` |
+| Quotes | api | `flight-quote`, `trip/misc-cost-estimate`, `hour-exchange/estimate` |
+| Lookups | api | `airport`, `airport/nearest`, `my-saved-airports`, `aircraft`, `my-aircraft`, `baggage-type` |
+| Account | api | `my-account-users`, `my-account-user/{id}`, `account-user/invite`, `account-user/update`, `account-user-role` |
+| Passenger | api | `my-passenger`, `my-passenger/{id}`, `my-passenger/create` |
+| Passport | api | `my-passport`, `my-passport/create`, `my-passport/upload-init`, `my-passport/attach` |
+| Pet | api | `my-pet`, `my-pet/create`, `my-pet/upload-init`, `my-pet/attach` |
+| Customs | api | `myCanadianCustomsDeclaration`, `canadianCustomsDeclaration/create`, `canadianCustomsDeclaration/create-public`, `canadianCustomsDeclaration/link-create` |
+| Address | api | `address/autocomplete`, `my-address/create` |
+| Hours | api | `hour-exchange/estimate`, `hour-exchange/power`, `hours-exchange-listing/create`, `my-hours-exchange-listing` |
+| Files | api | `my-file`, `file-public/create` |
+| Content | api | `faq`, `faq-category`, `policy`, `policy-category`, `system-notice`, `required-info`, `concierge` |
+| Social | api | `my-user/followers`, `my-user/following`, `my-user/follower-requests`, `user/follow`, `user/follower/accept`, `user/follower/decline` |
 | Raw | both | Generic GET/POST/PUT escape hatches for any endpoint not yet typed |
 
 ## Requirements

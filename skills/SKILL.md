@@ -234,13 +234,14 @@ For any endpoint not yet typed. Path is relative to the API host.
 
 | Command | Description |
 |---------|-------------|
-| `raw legacy-get PATH` | GET against api.airsprint.com |
-| `raw legacy-post PATH [--body JSON]` | POST against api.airsprint.com |
-| `raw prod2-get PATH` | GET against prod2.airsprint.com |
-| `raw prod2-post PATH [--body JSON]` | POST against prod2.airsprint.com |
-| `raw prod2-put PATH [--body JSON]` | PUT against prod2.airsprint.com |
+| `raw api-get PATH` | GET against api.airsprint.com |
+| `raw api-post PATH [--body JSON]` | POST against api.airsprint.com |
+| `raw api-patch PATH [--body JSON]` | PATCH against api.airsprint.com |
+| `raw prod2-get PATH` | GET against prod2.airsprint.com (decommissioned) |
+| `raw prod2-post PATH [--body JSON]` | POST against prod2.airsprint.com (decommissioned) |
+| `raw prod2-put PATH [--body JSON]` | PUT against prod2.airsprint.com (decommissioned) |
 
-### quote — Pricing & Estimates (legacy API)
+### quote — Pricing & Estimates
 
 These commands call `api.airsprint.com` for **real server-side pricing**. Unlike `--dry-run`, these actually query AirSprint.
 
@@ -398,5 +399,5 @@ No default timezone. For local times in `--date`:
 - The API may return 401 if the token expired — re-run `auth login` to refresh
 - Airport names in bookings must match the `locations[]` values from `booking info` exactly
 - The CLI never prompts for input — all values must come via flags or env vars
-- Quote commands use a separate legacy API (api.airsprint.com) with its own token cache (~/.airsprint_legacy_token.json)
+- Quote commands use api.airsprint.com with its own token cache (~/.airsprint_api_token.json)
 - `quote flight --from/--to` auto-resolves ICAO codes via the local mirror (`cache refresh` to populate); cache misses fall back to a single-airport API lookup and extend the mirror
