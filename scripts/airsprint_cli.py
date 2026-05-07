@@ -300,6 +300,19 @@ def legacy_post(token: str, path: str, body: dict[str, Any] | None = None) -> di
     )
 
 
+def legacy_patch(token: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    return _http(
+        "PATCH",
+        f"{LEGACY_BASE_URL}{path}",
+        headers={
+            "x-airsprint-auth-token": token,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        data=json.dumps(body or {}).encode("utf-8"),
+    )
+
+
 def _get_legacy_account_ids(token: str) -> list[str]:
     """Get account IDs from the legacy API."""
     resp = legacy_post(token, "/my-accounts", {})
@@ -602,18 +615,20 @@ def user_set_preferences(
 
 @user_app.command("update")
 def user_update(
-    body: str = typer.Option(..., "--body", help="JSON body with account fields to update"),
+    body: str = typer.Option(..., "--body", help='JSON body — fields to update, e.g. {"firstName":"X","phone":"5551234"}. Wrapped in {"options":...} automatically; pass {"options":...} to override.'),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Update account info."""
+    """Update user profile (PATCH /my-user)."""
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as e:
         _die(f"Invalid JSON: {e}", EXIT_VALIDATION)
-    token = get_token(username, password)
-    data = api_post(token, "/user/updateAccountInfo", payload)
+    if "options" not in payload:
+        payload = {"options": payload}
+    token = get_legacy_token(username, password)
+    data = legacy_patch(token, "/my-user", payload)
     _out(data, fmt)
 
 
@@ -1030,14 +1045,15 @@ def messages_list(
 
 @messages_app.command("read")
 def messages_read(
-    message_id: str = typer.Option(..., "--id", help="Message ID to mark as read"),
+    message_id: str = typer.Option(..., "--id", help="Message ID to mark as read (or comma-separated IDs)"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Mark a single message as read."""
-    token = get_token(username, password)
-    data = api_post(token, "/user/readUserMessage", {"messageId": message_id})
+    """Mark one or more messages as read."""
+    token = get_legacy_token(username, password)
+    ids = [s.strip() for s in message_id.split(",") if s.strip()]
+    data = legacy_patch(token, "/my-notifications/update", {"ids": ids, "isRead": True})
     _out(data, fmt)
 
 
@@ -1047,9 +1063,19 @@ def messages_read_all(
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Mark all messages as read."""
-    token = get_token(username, password)
-    data = api_post(token, "/user/readAllUserMessages")
+    """Mark all unread messages as read."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/my-notifications", {
+        "sort": [],
+        "page": {"limit": 500, "offset": 0},
+        "filter": {"isRead": False},
+    })
+    items = resp.get("data", {}).get("items", [])
+    ids = [i["id"] for i in items if i.get("id")]
+    if not ids:
+        _out({"updated": 0, "message": "No unread notifications"}, fmt)
+        return
+    data = legacy_patch(token, "/my-notifications/update", {"ids": ids, "isRead": True})
     _out(data, fmt)
 
 
@@ -1060,10 +1086,8 @@ def messages_delete(
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Delete a message."""
-    token = get_token(username, password)
-    data = api_post(token, "/user/deleteUserMessage", {"messageId": message_id})
-    _out(data, fmt)
+    """Delete a message — not supported on the new API."""
+    _die(f"messages delete: {_FEATURE_REMOVED_MSG}", EXIT_ERROR)
 
 
 # ---------------------------------------------------------------------------
@@ -1077,10 +1101,14 @@ def feedback_subjects(
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """List available feedback subjects."""
-    token = get_token(username, password)
-    data = api_get(token, "/user/feedback/subject")
-    _out(data, fmt)
+    """Feedback subjects — not available on the new API.
+
+    The legacy prod2 API exposed free-form feedback with a "subject" tag.
+    On api.airsprint.com, feedback is structured per-leg ratings instead;
+    see `feedback submit` for the new schema (legId, quality, cleanliness,
+    professionalism, fbo, catering, additionalFeedback, score).
+    """
+    _die(f"feedback subjects: {_FEATURE_REMOVED_MSG}", EXIT_ERROR)
 
 
 @feedback_app.command("submit")
@@ -1651,6 +1679,20 @@ def raw_legacy_post(
     """POST against api.airsprint.com (legacy API)."""
     token = get_legacy_token(username, password)
     _out(legacy_post(token, path, _parse_json(body)), fmt, compact)
+
+
+@raw_app.command("legacy-patch")
+def raw_legacy_patch(
+    path: str = typer.Option(..., "--path", help="Path on api.airsprint.com"),
+    body: str = typer.Option("{}", "--body", help="JSON body (default empty)"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """PATCH against api.airsprint.com (legacy API)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_patch(token, path, _parse_json(body)), fmt, compact)
 
 
 @raw_app.command("prod2-get")
@@ -2546,13 +2588,13 @@ def messages_settings_update(
 
 @messages_app.command("update")
 def messages_update(
-    body: str = typer.Option(..., "--body", help="JSON body — e.g. mark messages read/unread"),
+    body: str = typer.Option(..., "--body", help='JSON body — e.g. {"ids":["id1","id2"],"isRead":true}'),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Bulk-update notifications (POST /my-notifications/update)."""
+    """Bulk-update notifications (PATCH /my-notifications/update)."""
     token = get_legacy_token(username, password)
-    _out(legacy_post(token, "/my-notifications/update", _parse_json(body)), fmt, compact)
+    _out(legacy_patch(token, "/my-notifications/update", _parse_json(body)), fmt, compact)
 
 
 # ---------------------------------------------------------------------------
