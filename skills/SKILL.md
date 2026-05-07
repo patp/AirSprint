@@ -25,7 +25,10 @@ python3 /Users/mb/src/AirSprint/scripts/airsprint_cli.py <group> <command> [opti
 
 - Default: JSON with `{"status": "ok", "data": ...}` wrapper
 - Human-readable: `--format human` or `-f human`
+- Token-efficient: `--compact` (or `AIRSPRINT_COMPACT=1`) — strips null/empty/audit fields and emits minified JSON
 - Errors: `{"status": "error", "message": "..."}` on stderr
+
+`--compact` is wired into `summary`, `trips list`, `explore flights`, `quote airports`, `quote aircraft`. Use it when feeding output to another agent.
 
 ## Exit Codes
 
@@ -40,6 +43,36 @@ python3 /Users/mb/src/AirSprint/scripts/airsprint_cli.py <group> <command> [opti
 ## Token Caching
 
 Tokens are cached at `~/.airsprint_token.json` (auto-expires). First call logs in automatically if env vars are set. Use `auth login` to force refresh.
+
+## Local Data Mirror
+
+Static reference data (airports, fleet aircraft, owned aircraft) is mirrored to `~/.airsprint_cache.json` with a 7-day TTL. This lets `quote airports`, `quote aircraft`, and ICAO resolution in `quote flight`/`quote roundtrip` work without API roundtrips.
+
+| Command | Description |
+|---------|-------------|
+| `cache refresh` | Pull airports, aircraft, my-aircraft into the local mirror (~943 airports as of last sync) |
+| `cache status` | Show what's cached and how stale |
+| `cache clear` | Delete the cache file |
+
+The mirror is consulted automatically. Bypass it with `--no-cache` on `quote airports` / `quote aircraft`. Cache misses on `quote flight` ICAO lookup transparently fall back to the live API and extend the mirror.
+
+## Compound Commands
+
+These bundle multiple endpoints into a single call — the agent-friendly default for context gathering and round-trip pricing.
+
+| Command | Replaces |
+|---------|----------|
+| `summary` | `user accounts` + `trips list` + `explore flights` + `explore counts` |
+| `quote roundtrip` | Two `quote flight` calls + duplicated airport/aircraft resolution |
+
+```bash
+# One call: accounts, upcoming trips, empty legs, unread messages
+python3 airsprint_cli.py summary --compact
+
+# One call: outbound + return quote
+python3 airsprint_cli.py quote roundtrip --from CYQB --to KTEB \
+  --out 2026-04-15T10:00 --return 2026-04-18T17:00 --tz America/Montreal
+```
 
 ## Commands
 
@@ -107,6 +140,106 @@ Tokens are cached at `~/.airsprint_token.json` (auto-expires). First call logs i
 | `feedback subjects` | List feedback subjects |
 | `feedback submit --body JSON` | Submit feedback |
 
+### account — Account-User Management
+
+| Command | Description |
+|---------|-------------|
+| `account users` | List users on the account |
+| `account user-get --id ID` | Get account-user by ID |
+| `account invite --body JSON` | Invite a user to the account |
+| `account user-update --body JSON` | Update an account-user |
+| `account roles` | List account-user roles |
+
+### passenger — Saved Passengers
+
+| Command | Description |
+|---------|-------------|
+| `passenger list` | List saved passengers |
+| `passenger get --id ID` | Get a saved passenger |
+| `passenger create --body JSON` | Create a saved passenger |
+
+### passport — Passports & Documents
+
+| Command | Description |
+|---------|-------------|
+| `passport list` | List saved passports |
+| `passport get --id ID` | Get a saved passport |
+| `passport create --body JSON` | Create a saved passport |
+| `passport upload-init --body JSON` | Begin a passport doc upload (returns presigned URL) |
+| `passport attach --body JSON` | Attach uploaded document to passport |
+
+### pet — Pets & Documents
+
+Same shape as `passport`: `list`, `get`, `create`, `upload-init`, `attach`.
+
+### customs — Canadian Customs Declarations
+
+| Command | Description |
+|---------|-------------|
+| `customs list` | List my customs declarations |
+| `customs declaration --body JSON` | Get declaration form/template |
+| `customs create --body JSON` | Create a declaration |
+| `customs create-public --body JSON` | Public link-based declaration (no auth) |
+| `customs link-create --body JSON` | Create a link to share with a passenger |
+
+### address — Addresses
+
+| Command | Description |
+|---------|-------------|
+| `address autocomplete --body JSON` | Address autocomplete |
+| `address create --body JSON` | Save an address |
+
+### hours — Hours-Exchange Marketplace
+
+| Command | Description |
+|---------|-------------|
+| `hours estimate --body JSON` | Estimate hours-exchange value |
+| `hours power --body JSON` | Hours-exchange power calculation |
+| `hours listing-create --body JSON` | List hours for sale |
+| `hours my-listings` | List my hours-exchange listings |
+
+### files — Files
+
+| Command | Description |
+|---------|-------------|
+| `files list` | List my files |
+| `files public-create --body JSON` | Create a public-file record |
+
+### content — Static Content
+
+| Command | Description |
+|---------|-------------|
+| `content faq` | List FAQ entries |
+| `content faq-categories` | List FAQ categories |
+| `content policies` | List policies |
+| `content policy-categories` | List policy categories |
+| `content system-notice` | Current system notice |
+| `content required-info` | Required-info prompts |
+| `content concierge` | Concierge contact info |
+
+### social — Follow Graph
+
+| Command | Description |
+|---------|-------------|
+| `social followers` | List my followers |
+| `social following` | List who I follow |
+| `social requests` | Pending follower requests |
+| `social follow --body JSON` | Follow a user |
+| `social accept --body JSON` | Accept a follower request |
+| `social decline --body JSON` | Decline a follower request |
+
+### raw — Escape Hatches
+
+For any endpoint not yet typed. Path is relative to the API host.
+
+| Command | Description |
+|---------|-------------|
+| `raw legacy-get PATH` | GET against api.airsprint.com |
+| `raw legacy-post PATH [--body JSON]` | POST against api.airsprint.com |
+| `raw prod2-get PATH` | GET against prod2.airsprint.com |
+| `raw prod2-post PATH [--body JSON]` | POST against prod2.airsprint.com |
+| `raw prod2-put PATH [--body JSON]` | PUT against prod2.airsprint.com |
+
 ### quote — Pricing & Estimates (legacy API)
 
 These commands call `api.airsprint.com` for **real server-side pricing**. Unlike `--dry-run`, these actually query AirSprint.
@@ -115,10 +248,11 @@ These commands call `api.airsprint.com` for **real server-side pricing**. Unlike
 |---------|-------------|
 | `quote flight --from ICAO --to ICAO --date DATETIME [--tz TZ]` | Get flight quote (simple mode, auto-resolves ICAO to UUID) |
 | `quote flight --body JSON` | Get flight quote (advanced mode, pass UUIDs directly) |
+| `quote roundtrip --from ICAO --to ICAO --out DATETIME --return DATETIME [--tz TZ]` | Quote outbound + return in one call |
 | `quote cost --body JSON` | Misc cost estimate (catering, transport, surcharges) |
 | `quote hours-exchange --body JSON` | Hours exchange value estimate |
-| `quote airports [--icao CODE] [--name TEXT] [--limit N]` | Search airports (returns UUIDs for --body mode) |
-| `quote aircraft` | List all AirSprint fleet types with UUIDs |
+| `quote airports [-q QUERY] [--saved] [--limit N] [--no-cache]` | Search airports (cache-served when fresh) |
+| `quote aircraft [--no-cache]` | List all AirSprint fleet types with UUIDs (cache-served when fresh) |
 
 ## Booking Flow (Step by Step)
 
@@ -265,4 +399,4 @@ No default timezone. For local times in `--date`:
 - Airport names in bookings must match the `locations[]` values from `booking info` exactly
 - The CLI never prompts for input — all values must come via flags or env vars
 - Quote commands use a separate legacy API (api.airsprint.com) with its own token cache (~/.airsprint_legacy_token.json)
-- `quote flight --from/--to` auto-resolves ICAO codes but fetches the full airport list (~958 airports) on first call
+- `quote flight --from/--to` auto-resolves ICAO codes via the local mirror (`cache refresh` to populate); cache misses fall back to a single-airport API lookup and extend the mirror

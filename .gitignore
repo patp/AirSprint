@@ -12,3 +12,4 @@
 # Re-exclude junk inside allowed dirs
 __pycache__/
 *.pyc
+*.bak

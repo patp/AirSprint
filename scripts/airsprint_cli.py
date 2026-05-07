@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""AirSprint CLI — agent-friendly interface to prod2.airsprint.com.
+"""AirSprint CLI — agent-friendly interface to AirSprint's owner APIs.
 
-Auth: OAuth2 password grant against /oauth/token.
+The mobile-app API (prod2.airsprint.com) was decommissioned by AirSprint in
+April 2026. The CLI now authenticates against api.airsprint.com (the same
+backend the owner web portal uses) via /user/sign-in-email and stores the
+returned JWT for downstream calls.
 Output: JSON by default (--format human for readable output).
 Credentials: AIRSPRINT_USERNAME / AIRSPRINT_PASSWORD env vars, or --username/--password flags.
 Token cache: ~/.airsprint_token.json (avoids re-login per invocation).
@@ -49,6 +52,8 @@ LEGACY_BASE_URL = "https://api.airsprint.com/api"
 BASIC_AUTH = "Basic VVNFUl9DTElFTlRfQVBQOnBhc3N3b3Jk"
 TOKEN_CACHE = Path.home() / ".airsprint_token.json"
 LEGACY_TOKEN_CACHE = Path.home() / ".airsprint_legacy_token.json"
+DATA_CACHE = Path.home() / ".airsprint_cache.json"  # local mirror: airports, aircraft
+DATA_CACHE_TTL = 7 * 24 * 3600  # 7 days
 DEFAULT_TZ = ""  # No default — user must set AIRSPRINT_TIMEZONE or pass --timezone
 
 # Exit codes
@@ -94,8 +99,15 @@ def _http(
             json.dumps({"status": "error", "http_code": exc.code, "message": body})
         ) from exc
     except URLError as exc:
+        msg = str(exc)
+        if "prod2.airsprint.com" in url and "nodename nor servname" in msg:
+            msg = (
+                "prod2.airsprint.com was decommissioned by AirSprint in April 2026. "
+                "This command targets a route that has not yet been migrated to "
+                "api.airsprint.com. Use the new typed commands or `raw legacy-*`."
+            )
         raise RuntimeError(
-            json.dumps({"status": "error", "message": str(exc)})
+            json.dumps({"status": "error", "message": msg})
         ) from exc
 
 
@@ -130,28 +142,30 @@ def _clear_token() -> None:
 
 
 def _do_login(username: str, password: str) -> dict[str, Any]:
-    """OAuth2 password grant → token dict."""
-    form = urlencode({
-        "grant_type": "password",
-        "username": username,
-        "password": password,
-        "deviceToken": "",
-        "deviceType": "CLI",
-    }).encode("utf-8")
+    """Login to api.airsprint.com → token dict (prod2-OAuth-compatible shape).
+
+    prod2.airsprint.com was retired in April 2026; this calls the
+    sign-in-email endpoint that the owner web portal uses, then reshapes
+    the response to look like the old OAuth2 response so the rest of the
+    CLI's token-cache code keeps working unchanged.
+    """
     resp = _http(
         "POST",
-        f"{BASE_URL}/oauth/token",
-        headers={
-            "Authorization": BASIC_AUTH,
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        },
-        data=form,
+        f"{LEGACY_BASE_URL}/user/sign-in-email",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        data=json.dumps({"email": username, "password": password}).encode("utf-8"),
     )
-    if "access_token" not in resp:
+    token = resp.get("data", {}).get("authToken")
+    if not token:
         raise RuntimeError(
-            json.dumps({"status": "error", "message": "No access_token in response", "response": resp})
+            json.dumps({"status": "error", "message": "No authToken in sign-in-email response", "response": resp})
         )
-    return resp
+    return {
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": 7 * 24 * 3600,
+        "mfa": resp.get("data", {}).get("mfa", False),
+    }
 
 
 def get_token(username: str | None = None, password: str | None = None) -> str:
@@ -298,10 +312,40 @@ def _get_legacy_account_ids(token: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _out(data: Any, fmt: str = "json") -> None:
-    """Print data as JSON (default) or human-readable."""
+# Noisy fields stripped in --compact mode (audit metadata, internal flags, long IDs
+# that aren't typically referenced by users/agents).
+_COMPACT_DROP = frozenset({
+    "createdAt", "updatedAt", "modifiedAt", "version", "__v",
+    "createdBy", "updatedBy", "modifiedBy",
+    "isDeleted", "deletedAt",
+    "tenantId", "organizationId",
+})
+
+
+def _compact(value: Any) -> Any:
+    """Recursively strip null/empty values and known-noisy fields. Token-efficient."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if k in _COMPACT_DROP:
+                continue
+            cv = _compact(v)
+            if cv is None or cv == "" or cv == [] or cv == {}:
+                continue
+            out[k] = cv
+        return out
+    if isinstance(value, list):
+        return [_compact(v) for v in value]
+    return value
+
+
+def _out(data: Any, fmt: str = "json", compact: bool = False) -> None:
+    """Print data as JSON (default) or human-readable. `compact` strips noise."""
+    if compact:
+        data = _compact(data)
     if fmt == "json":
-        print(json.dumps({"status": "ok", "data": data}, indent=2, default=str))
+        indent = None if compact else 2
+        print(json.dumps({"status": "ok", "data": data}, indent=indent, default=str, separators=(",", ":") if compact else None))
     else:
         if isinstance(data, list):
             for item in data:
@@ -407,6 +451,18 @@ explore_app = typer.Typer(help="Explore empty legs & shared flights", no_args_is
 messages_app = typer.Typer(help="In-app message commands", no_args_is_help=True)
 feedback_app = typer.Typer(help="Feedback commands", no_args_is_help=True)
 quote_app = typer.Typer(help="Quotes & cost estimates (via legacy api.airsprint.com)", no_args_is_help=True)
+cache_app = typer.Typer(help="Local data mirror (airports, aircraft) at ~/.airsprint_cache.json", no_args_is_help=True)
+raw_app = typer.Typer(help="Raw API escape hatches (legacy + prod2). Use when no typed command exists.", no_args_is_help=True)
+account_app = typer.Typer(help="Account-user management (invite, update, roles)", no_args_is_help=True)
+passenger_app = typer.Typer(help="Saved passengers", no_args_is_help=True)
+passport_app = typer.Typer(help="Saved passports & passport documents", no_args_is_help=True)
+pet_app = typer.Typer(help="Saved pets & pet documents", no_args_is_help=True)
+customs_app = typer.Typer(help="Canadian customs declarations", no_args_is_help=True)
+address_app = typer.Typer(help="Address autocomplete & saved addresses", no_args_is_help=True)
+hours_app = typer.Typer(help="Hours-exchange marketplace (estimate, power, listings)", no_args_is_help=True)
+files_app = typer.Typer(help="File uploads & retrieval", no_args_is_help=True)
+content_app = typer.Typer(help="Content: FAQ, policies, system notices, concierge", no_args_is_help=True)
+social_app = typer.Typer(help="Follow / follower social graph", no_args_is_help=True)
 
 app.add_typer(auth_app, name="auth")
 app.add_typer(user_app, name="user")
@@ -416,11 +472,24 @@ app.add_typer(explore_app, name="explore")
 app.add_typer(messages_app, name="messages")
 app.add_typer(feedback_app, name="feedback")
 app.add_typer(quote_app, name="quote")
+app.add_typer(cache_app, name="cache")
+app.add_typer(raw_app, name="raw")
+app.add_typer(account_app, name="account")
+app.add_typer(passenger_app, name="passenger")
+app.add_typer(passport_app, name="passport")
+app.add_typer(pet_app, name="pet")
+app.add_typer(customs_app, name="customs")
+app.add_typer(address_app, name="address")
+app.add_typer(hours_app, name="hours")
+app.add_typer(files_app, name="files")
+app.add_typer(content_app, name="content")
+app.add_typer(social_app, name="social")
 
 # Common options
 Username = typer.Option(None, "--username", "-u", envvar="AIRSPRINT_USERNAME", help="Login email")
 Password = typer.Option(None, "--password", "-p", envvar="AIRSPRINT_PASSWORD", help="Login password")
 Format = typer.Option("json", "--format", "-f", help="Output format: json | human")
+Compact = typer.Option(False, "--compact", envvar="AIRSPRINT_COMPACT", help="Strip null/empty/noisy fields and use minimal JSON. Token-efficient for agents.")
 Timezone = typer.Option(None, "--timezone", "--tz", envvar="AIRSPRINT_TIMEZONE", help="Timezone (e.g. America/Montreal). Required for local time. Env: AIRSPRINT_TIMEZONE")
 
 
@@ -508,26 +577,26 @@ def user_preferences(
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Get user preferences."""
-    token = get_token(username, password)
-    data = api_get(token, "/user/preferences")
+    """Get notification settings (GET /my-notification-settings)."""
+    token = get_legacy_token(username, password)
+    data = legacy_get(token, "/my-notification-settings")
     _out(data, fmt)
 
 
 @user_app.command("set-preferences")
 def user_set_preferences(
-    body: str = typer.Option(..., "--body", help="JSON body with preference fields"),
+    body: str = typer.Option(..., "--body", help="JSON body with notification-setting fields"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Update user preferences."""
+    """Update notification settings (POST /my-notification-settings)."""
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as e:
         _die(f"Invalid JSON: {e}", EXIT_VALIDATION)
-    token = get_token(username, password)
-    data = api_post(token, "/user/preferences", payload)
+    token = get_legacy_token(username, password)
+    data = legacy_post(token, "/my-notification-settings", payload)
     _out(data, fmt)
 
 
@@ -561,6 +630,7 @@ def trips_list(
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
+    compact: bool = Compact,
 ):
     """List trips (including interchange flights).
 
@@ -585,7 +655,7 @@ def trips_list(
     }
     resp = legacy_post(token, "/my-leg", payload)
     items = resp.get("data", {}).get("items", [])
-    _out(items, fmt)
+    _out(items, fmt, compact)
 
 
 @trips_app.command("get")
@@ -595,36 +665,56 @@ def trips_get(
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Get a specific trip by booking ID."""
+    """Get a specific trip by trip-UUID or booking code (e.g. BAKEW)."""
     token = get_legacy_token(username, password)
-    account_ids = _get_legacy_account_ids(token)
-    if not account_ids:
-        _die("No accounts found", EXIT_ERROR)
-
-    # Search all legs for this booking ID
-    resp = legacy_post(token, "/my-leg", {
-        "sort": [{"departureDate": "ASC"}],
-        "page": {"limit": 100, "offset": 0},
-        "filter": {"accountId": account_ids},
-    })
-    items = resp.get("data", {}).get("items", [])
-    matches = [item for item in items if item.get("bookingId") == booking_id]
-    if not matches:
-        _die(f"Trip {booking_id} not found", EXIT_NOT_FOUND)
-    _out(matches, fmt)
+    trip_uuid = booking_id
+    # If it doesn't look like a UUID, treat it as a booking code and resolve via /my-leg.
+    if "-" not in booking_id:
+        account_ids = _get_legacy_account_ids(token)
+        resp = legacy_post(token, "/my-leg", {
+            "sort": [{"departureDate": "ASC"}],
+            "page": {"limit": 200, "offset": 0},
+            "filter": {"accountId": account_ids},
+        })
+        items = resp.get("data", {}).get("items", [])
+        match = next((i for i in items if i.get("bookingId") == booking_id), None)
+        if not match or not match.get("tripId"):
+            _die(f"Trip {booking_id} not found", EXIT_NOT_FOUND)
+        trip_uuid = match["tripId"]
+    try:
+        data = legacy_get(token, f"/trip/{trip_uuid}")
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "404" in msg or "not found" in msg.lower():
+            _die(f"Trip {booking_id} not found", EXIT_NOT_FOUND)
+        raise
+    _out(data.get("data", data), fmt)
 
 
 @trips_app.command("tripsheet")
 def trips_tripsheet(
-    booking_id: str = typer.Option(..., "--id", help="Booking ID"),
+    booking_id: str = typer.Option(..., "--id", help="Trip UUID or booking code (e.g. BAKEW)"),
     output: str = typer.Option("-", "--output", "-o", help="Output file path (- for stdout info)"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
 ):
-    """Download trip sheet PDF for a booking."""
-    token = get_token(username, password)
-    url = f"{BASE_URL}/user/downloadTripSheet?bookingId={booking_id}"
-    req = Request(url, method="GET", headers=_bearer(token))
+    """Download trip sheet (manifest) PDF (GET /trip/manifest/{id})."""
+    token = get_legacy_token(username, password)
+    trip_uuid = booking_id
+    if "-" not in booking_id:
+        account_ids = _get_legacy_account_ids(token)
+        resp = legacy_post(token, "/my-leg", {
+            "sort": [{"departureDate": "ASC"}],
+            "page": {"limit": 200, "offset": 0},
+            "filter": {"accountId": account_ids},
+        })
+        items = resp.get("data", {}).get("items", [])
+        match = next((i for i in items if i.get("bookingId") == booking_id), None)
+        if not match or not match.get("tripId"):
+            _die(f"Trip {booking_id} not found", EXIT_NOT_FOUND)
+        trip_uuid = match["tripId"]
+    url = f"{LEGACY_BASE_URL}/trip/manifest/{trip_uuid}"
+    req = Request(url, method="GET", headers={"x-airsprint-auth-token": token})
     try:
         with urlopen(req, timeout=60, context=_ssl_ctx()) as resp:
             content = resp.read()
@@ -693,8 +783,9 @@ def trips_flight_feedback(
         payload = json.loads(body)
     except json.JSONDecodeError as e:
         _die(f"Invalid JSON: {e}", EXIT_VALIDATION)
-    token = get_token(username, password)
-    data = api_post(token, f"/user/flight-feedback/{trip_id}", payload)
+    token = get_legacy_token(username, password)
+    payload.setdefault("tripId", trip_id)
+    data = legacy_post(token, "/booking-survey/create", payload)
     _out(data, fmt)
 
 
@@ -833,6 +924,7 @@ def explore_flights(
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
+    compact: bool = Compact,
 ):
     """List available empty legs and shared flights."""
     token = get_legacy_token(username, password)
@@ -847,7 +939,7 @@ def explore_flights(
         },
     })
     items = resp.get("data", {}).get("items", [])
-    _out(items, fmt)
+    _out(items, fmt, compact)
 
 
 @explore_app.command("counts")
@@ -983,42 +1075,128 @@ def feedback_submit(
         payload = json.loads(body)
     except json.JSONDecodeError as e:
         _die(f"Invalid JSON: {e}", EXIT_VALIDATION)
-    token = get_token(username, password)
-    data = api_post(token, "/user/feedback", payload)
+    token = get_legacy_token(username, password)
+    data = legacy_post(token, "/feedback/create", payload)
     _out(data, fmt)
 
 
 # ---------------------------------------------------------------------------
-# quote helpers (legacy API UUID resolution)
+# Local data cache (airports, aircraft) — persistent disk mirror
 # ---------------------------------------------------------------------------
 
-_airport_cache: dict[str, str] = {}  # ICAO → UUID
+
+def _load_data_cache() -> dict[str, Any]:
+    if not DATA_CACHE.exists():
+        return {}
+    try:
+        return json.loads(DATA_CACHE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_data_cache(cache: dict[str, Any]) -> None:
+    DATA_CACHE.write_text(json.dumps(cache, indent=2))
+    DATA_CACHE.chmod(0o600)
+
+
+def _cache_section_fresh(cache: dict[str, Any], key: str) -> bool:
+    section = cache.get(key) or {}
+    return bool(section) and (time.time() - section.get("_cached_at", 0)) < DATA_CACHE_TTL
+
+
+def _refresh_airports(token: str, cache: dict[str, Any]) -> None:
+    """Fetch all airports the user can see and mirror them locally."""
+    items: list[dict[str, Any]] = []
+    offset = 0
+    page = 200
+    while True:
+        resp = legacy_post(token, "/airport", {
+            "sort": [],
+            "page": {"limit": page, "offset": offset},
+            "filter": {},
+        })
+        batch = resp.get("data", {}).get("items", [])
+        if not batch:
+            break
+        items.extend(batch)
+        if len(batch) < page:
+            break
+        offset += page
+    by_icao: dict[str, dict[str, str]] = {}
+    for a in items:
+        icao = (a.get("codeICAO") or "").upper()
+        if not icao or "id" not in a:
+            continue
+        by_icao[icao] = {
+            "id": a["id"],
+            "iata": a.get("codeIATA", ""),
+            "name": a.get("name", ""),
+            "city": (a.get("address") or {}).get("city", ""),
+            "country": (a.get("address") or {}).get("country", ""),
+        }
+    cache["airports"] = {"_cached_at": int(time.time()), "by_icao": by_icao}
+
+
+def _refresh_aircraft(token: str, cache: dict[str, Any]) -> None:
+    resp = legacy_post(token, "/aircraft")
+    items = resp.get("data", {}).get("items", [])
+    by_id = {
+        a["id"]: {"name": a.get("aircraftName", a.get("name", ""))}
+        for a in items if "id" in a
+    }
+    cache["aircraft"] = {"_cached_at": int(time.time()), "by_id": by_id}
+
+
+def _refresh_my_aircraft(token: str, cache: dict[str, Any]) -> None:
+    resp = legacy_post(token, "/my-aircraft")
+    items = resp.get("data", {}).get("items", [])
+    cache["my_aircraft"] = {"_cached_at": int(time.time()), "items": items}
 
 
 def _resolve_airport(token: str, icao: str) -> str:
-    """Resolve ICAO code to legacy API airport UUID."""
+    """Resolve ICAO code to legacy API airport UUID, using local mirror first."""
     icao = icao.upper()
-    if icao in _airport_cache:
-        return _airport_cache[icao]
+    cache = _load_data_cache()
 
+    # Try cached mirror first
+    section = cache.get("airports") or {}
+    by_icao = section.get("by_icao") or {}
+    if icao in by_icao:
+        return by_icao[icao]["id"]
+
+    # Fall back to single-airport lookup; opportunistically extend cache
     resp = legacy_post(token, "/airport", {
         "sort": [], "page": {"limit": 1, "offset": 0},
         "filter": {"query": icao},
     })
     items = resp.get("data", {}).get("items", [])
     for a in items:
-        code = a.get("codeICAO", "")
-        if code and code.upper() == icao:
-            _airport_cache[icao] = a["id"]
+        code = (a.get("codeICAO") or "").upper()
+        if code == icao and "id" in a:
+            by_icao = section.get("by_icao") or {}
+            by_icao[icao] = {
+                "id": a["id"],
+                "iata": a.get("codeIATA", ""),
+                "name": a.get("name", ""),
+                "city": (a.get("address") or {}).get("city", ""),
+                "country": (a.get("address") or {}).get("country", ""),
+            }
+            section["by_icao"] = by_icao
+            section.setdefault("_cached_at", int(time.time()))
+            cache["airports"] = section
+            _save_data_cache(cache)
             return a["id"]
 
     _die(f"Airport not found: {icao}", EXIT_NOT_FOUND)
 
 
 def _get_default_aircraft(token: str) -> str:
-    """Get the first aircraft UUID from the user's account."""
-    resp = legacy_post(token, "/my-aircraft")
-    items = resp.get("data", {}).get("items", [])
+    """Get the first aircraft UUID from the user's account, cached on disk."""
+    cache = _load_data_cache()
+    if not _cache_section_fresh(cache, "my_aircraft"):
+        _refresh_my_aircraft(token, cache)
+        _save_data_cache(cache)
+    items = (cache.get("my_aircraft") or {}).get("items") or []
     if not items:
         _die("No aircraft found on account", EXIT_NOT_FOUND)
     return items[0]["aircraftId"]
@@ -1085,6 +1263,52 @@ def quote_flight(
         _die(str(e), EXIT_ERROR)
 
 
+@quote_app.command("roundtrip")
+def quote_roundtrip(
+    departure: str = typer.Option(..., "--from", help="Departure ICAO (e.g. CYQB)"),
+    arrival: str = typer.Option(..., "--to", help="Arrival ICAO (e.g. KTEB)"),
+    out_date: str = typer.Option(..., "--out", help="Outbound date/time (local; needs --tz)"),
+    return_date: str = typer.Option(..., "--return", help="Return date/time (local; needs --tz)"),
+    timezone: Optional[str] = Timezone,
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+):
+    """Quote a round-trip in a single call (outbound + return).
+
+    Compound version of `quote flight`: resolves airports once, fetches both legs,
+    and returns combined pricing.
+    """
+    token = get_legacy_token(username, password)
+    out_utc = _parse_local_dt(out_date, timezone)
+    ret_utc = _parse_local_dt(return_date, timezone)
+    dep_id = _resolve_airport(token, departure)
+    arr_id = _resolve_airport(token, arrival)
+    ac_id = _get_default_aircraft(token)
+
+    payload = {
+        "legs": [
+            {
+                "aircraftId": ac_id,
+                "departureAirportId": dep_id,
+                "arrivalAirportId": arr_id,
+                "departureDateUTC": out_utc,
+            },
+            {
+                "aircraftId": ac_id,
+                "departureAirportId": arr_id,
+                "arrivalAirportId": dep_id,
+                "departureDateUTC": ret_utc,
+            },
+        ]
+    }
+    try:
+        resp = legacy_post(token, "/flight-quote", payload)
+        _out(resp.get("data", resp), fmt)
+    except RuntimeError as e:
+        _die(str(e), EXIT_ERROR)
+
+
 @quote_app.command("cost")
 def quote_cost(
     body: str = typer.Option(..., "--body", help='JSON body, e.g. \'{"legs":[{"aircraft":"CITATION_CJ2_PLUS","quotePrice":750}]}\''),
@@ -1136,11 +1360,41 @@ def quote_airports(
     query: Optional[str] = typer.Option(None, "--query", "-q", help="Search by ICAO, IATA, or name (e.g. CYQB, Quebec)"),
     saved: bool = typer.Option(False, "--saved", help="Show saved/favourite airports only"),
     limit: int = typer.Option(20, "--limit", help="Max results"),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Bypass local mirror, hit the API"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
+    compact: bool = Compact,
 ):
-    """Search airports. Returns id, ICAO, IATA, name, and location."""
+    """Search airports. Returns id, ICAO, IATA, name, and location.
+
+    Uses local mirror at ~/.airsprint_cache.json (refresh with `cache refresh`).
+    `--saved` and `--no-cache` always hit the live API.
+    """
+    # Local mirror path: free + offline-capable for non-saved searches
+    if query and not saved and not no_cache:
+        cache = _load_data_cache()
+        if _cache_section_fresh(cache, "airports"):
+            by_icao = (cache.get("airports") or {}).get("by_icao") or {}
+            q = query.strip().lower()
+            results = []
+            for icao, info in by_icao.items():
+                hay = " ".join(str(info.get(f) or "") for f in ("iata", "name", "city", "country")).lower() + " " + icao.lower()
+                if q in hay:
+                    results.append({
+                        "id": info["id"],
+                        "icao": icao,
+                        "iata": info.get("iata") or "",
+                        "name": info.get("name") or "",
+                        "city": info.get("city") or "",
+                        "country": info.get("country") or "",
+                    })
+                    if len(results) >= limit:
+                        break
+            if results:
+                _out(results, fmt, compact)
+                return
+
     token = get_legacy_token(username, password)
     filt: dict[str, Any] = {}
     if query:
@@ -1164,27 +1418,1195 @@ def quote_airports(
         }
         for a in items
     ]
-    _out(results, fmt)
+    _out(results, fmt, compact)
 
 
 @quote_app.command("aircraft")
 def quote_aircraft(
+    no_cache: bool = typer.Option(False, "--no-cache", help="Bypass local mirror, hit the API"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """List all AirSprint aircraft types with UUIDs (needed for quote --body)."""
+    """List all AirSprint aircraft types with UUIDs (needed for quote --body).
+
+    Served from local mirror when fresh; refresh with `cache refresh`.
+    """
+    cache = _load_data_cache()
+    if not no_cache and _cache_section_fresh(cache, "aircraft"):
+        by_id = (cache.get("aircraft") or {}).get("by_id") or {}
+        results = [{"id": k, "name": v.get("name", "")} for k, v in by_id.items()]
+        _out(results, fmt)
+        return
+
     token = get_legacy_token(username, password)
-    resp = legacy_post(token, "/aircraft")
-    items = resp.get("data", {}).get("items", [])
-    results = [
-        {
-            "id": a.get("id", ""),
-            "name": a.get("aircraftName", a.get("name", "")),
-        }
-        for a in items
-    ]
+    _refresh_aircraft(token, cache)
+    _save_data_cache(cache)
+    by_id = cache["aircraft"]["by_id"]
+    results = [{"id": k, "name": v.get("name", "")} for k, v in by_id.items()]
     _out(results, fmt)
+
+
+# ---------------------------------------------------------------------------
+# cache (local data mirror)
+# ---------------------------------------------------------------------------
+
+
+@cache_app.command("refresh")
+def cache_refresh(
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+):
+    """Refresh the local mirror (airports, aircraft, my-aircraft).
+
+    Stored at ~/.airsprint_cache.json with a 7-day TTL.
+    """
+    token = get_legacy_token(username, password)
+    cache = _load_data_cache()
+    _refresh_airports(token, cache)
+    _refresh_aircraft(token, cache)
+    _refresh_my_aircraft(token, cache)
+    _save_data_cache(cache)
+    _out({
+        "airports": len((cache.get("airports") or {}).get("by_icao") or {}),
+        "aircraft": len((cache.get("aircraft") or {}).get("by_id") or {}),
+        "my_aircraft": len((cache.get("my_aircraft") or {}).get("items") or []),
+        "path": str(DATA_CACHE),
+    }, fmt)
+
+
+@cache_app.command("status")
+def cache_status(fmt: str = Format):
+    """Show cache contents and freshness."""
+    cache = _load_data_cache()
+    if not cache:
+        _out({"exists": False, "path": str(DATA_CACHE)}, fmt)
+        return
+    out: dict[str, Any] = {"exists": True, "path": str(DATA_CACHE), "ttl_seconds": DATA_CACHE_TTL}
+    for key in ("airports", "aircraft", "my_aircraft"):
+        section = cache.get(key) or {}
+        cached_at = section.get("_cached_at", 0)
+        if not cached_at:
+            out[key] = {"present": False}
+            continue
+        age = int(time.time() - cached_at)
+        count = (
+            len(section.get("by_icao") or {}) if key == "airports"
+            else len(section.get("by_id") or {}) if key == "aircraft"
+            else len(section.get("items") or [])
+        )
+        out[key] = {
+            "present": True,
+            "count": count,
+            "age_seconds": age,
+            "fresh": age < DATA_CACHE_TTL,
+            "cached_at": _fmt_epoch(cached_at, fmt="%Y-%m-%d %H:%M:%S"),
+        }
+    _out(out, fmt)
+
+
+@cache_app.command("clear")
+def cache_clear():
+    """Delete the local data cache."""
+    if DATA_CACHE.exists():
+        DATA_CACHE.unlink()
+    _out({"message": "Cache cleared", "path": str(DATA_CACHE)})
+
+
+# ---------------------------------------------------------------------------
+# summary (compound dashboard — single command, multiple endpoints)
+# ---------------------------------------------------------------------------
+
+
+@app.command("summary")
+def summary(
+    timezone: Optional[str] = Timezone,
+    upcoming_limit: int = typer.Option(5, "--upcoming-limit", help="Max upcoming trips to include"),
+    empty_legs_limit: int = typer.Option(5, "--empty-legs-limit", help="Max empty legs to include"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Single-call dashboard: accounts, hours, upcoming trips, empty legs, unread messages.
+
+    Replaces 4+ separate calls (`user accounts`, `trips list`, `explore flights`,
+    `explore counts`) with one compound query — ideal for agents that just want context.
+    """
+    token = get_legacy_token(username, password)
+    now = datetime.now(tz=_tz_utc.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    # accounts (also yields the IDs we need for trip filters)
+    accts_resp = legacy_post(token, "/my-accounts", {})
+    accounts = accts_resp.get("data", {}).get("items", [])
+    account_ids = [a["id"] for a in accounts if "id" in a]
+
+    upcoming: list[dict[str, Any]] = []
+    upcoming_total = 0
+    if account_ids:
+        trips_resp = legacy_post(token, "/my-leg", {
+            "sort": [{"departureDate": "ASC"}],
+            "page": {"limit": upcoming_limit, "offset": 0},
+            "filter": {"departureTime": {"min": now}, "accountId": account_ids},
+        })
+        upcoming = trips_resp.get("data", {}).get("items", []) or []
+        upcoming_total = trips_resp.get("data", {}).get("total", len(upcoming))
+
+    legs_resp = legacy_post(token, "/my-flights", {
+        "sort": [{"departureTimestamp": "ASC"}],
+        "page": {"limit": empty_legs_limit, "offset": 0},
+        "filter": {"departureTime": {"min": now}, "type": ["EMPTY_LEG"], "locked": False},
+    })
+    empty_legs = legs_resp.get("data", {}).get("items", []) or []
+    empty_legs_total = legs_resp.get("data", {}).get("total", len(empty_legs))
+
+    notif_resp = legacy_post(token, "/my-notifications", {
+        "sort": [], "page": {"limit": 1, "offset": 0},
+        "filter": {"isRead": False},
+    })
+    unread = notif_resp.get("data", {}).get("total", 0)
+
+    # condensed account view — just the high-signal fields actually returned
+    accounts_brief = [
+        {
+            "id": a.get("id"),
+            "name": a.get("name"),
+            "ownedAircraftIds": a.get("ownedAircraftIds") or [],
+            "accessLevels": a.get("accessLevels") or [],
+        }
+        for a in accounts
+    ]
+
+    _out({
+        "accounts": accounts_brief,
+        "upcomingTripsTotal": upcoming_total,
+        "upcomingTrips": upcoming,
+        "emptyLegsTotal": empty_legs_total,
+        "emptyLegs": empty_legs,
+        "unreadMessages": unread,
+    }, fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# Helper: parse JSON body safely, fail with exit code 2
+# ---------------------------------------------------------------------------
+
+
+def _parse_json(s: str) -> dict[str, Any]:
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError as e:
+        _die(f"Invalid JSON: {e}", EXIT_VALIDATION)
+        return {}  # unreachable
+
+
+# ---------------------------------------------------------------------------
+# raw — generic escape hatches for any endpoint
+# ---------------------------------------------------------------------------
+
+
+@raw_app.command("legacy-get")
+def raw_legacy_get(
+    path: str = typer.Option(..., "--path", help='Path on api.airsprint.com (e.g. "/my-saved-airports/")'),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """GET against api.airsprint.com (legacy API)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_get(token, path), fmt, compact)
+
+
+@raw_app.command("legacy-post")
+def raw_legacy_post(
+    path: str = typer.Option(..., "--path", help="Path on api.airsprint.com"),
+    body: str = typer.Option("{}", "--body", help="JSON body (default empty)"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """POST against api.airsprint.com (legacy API)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, path, _parse_json(body)), fmt, compact)
+
+
+@raw_app.command("prod2-get")
+def raw_prod2_get(
+    path: str = typer.Option(..., "--path", help='Path on prod2.airsprint.com (e.g. "/user/preferences")'),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """GET against prod2.airsprint.com (mobile API)."""
+    token = get_token(username, password)
+    _out(api_get(token, path), fmt, compact)
+
+
+@raw_app.command("prod2-post")
+def raw_prod2_post(
+    path: str = typer.Option(..., "--path", help="Path on prod2.airsprint.com"),
+    body: str = typer.Option("{}", "--body", help="JSON body (default empty)"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """POST against prod2.airsprint.com (mobile API)."""
+    token = get_token(username, password)
+    _out(api_post(token, path, _parse_json(body)), fmt, compact)
+
+
+@raw_app.command("prod2-put")
+def raw_prod2_put(
+    path: str = typer.Option(..., "--path", help="Path on prod2.airsprint.com"),
+    body: str = typer.Option(..., "--body", help="JSON body"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """PUT against prod2.airsprint.com (mobile API)."""
+    token = get_token(username, password)
+    _out(api_put(token, path, _parse_json(body)), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# account — account-user management
+# ---------------------------------------------------------------------------
+
+
+@account_app.command("users")
+def account_users(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List users on the account (POST /my-account-users)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/my-account-users", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
+    _out(resp.get("data", resp), fmt, compact)
+
+
+@account_app.command("user-get")
+def account_user_get(
+    user_id: str = typer.Option(..., "--id", help="Account-user ID"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Get an account-user by ID (GET /my-account-user/{id})."""
+    token = get_legacy_token(username, password)
+    _out(legacy_get(token, f"/my-account-user/{user_id}"), fmt, compact)
+
+
+@account_app.command("invite")
+def account_invite(
+    body: str = typer.Option(..., "--body", help="JSON body for invite"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Invite a user to the account (POST /account-user/invite)."""
+    payload = _parse_json(body)
+    if dry_run:
+        _out({"dry_run": True, "payload": payload, "endpoint": "/account-user/invite"}, fmt, compact)
+        return
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/account-user/invite", payload), fmt, compact)
+
+
+@account_app.command("user-update")
+def account_user_update(
+    body: str = typer.Option(..., "--body", help="JSON body"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Update an account-user (POST /account-user/update)."""
+    payload = _parse_json(body)
+    if dry_run:
+        _out({"dry_run": True, "payload": payload, "endpoint": "/account-user/update"}, fmt, compact)
+        return
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/account-user/update", payload), fmt, compact)
+
+
+@account_app.command("roles")
+def account_roles(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List account-user roles (POST /account-user-role)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/account-user-role", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
+    _out(resp.get("data", resp), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# passenger — saved passengers
+# ---------------------------------------------------------------------------
+
+
+@passenger_app.command("list")
+def passenger_list(
+    limit: int = typer.Option(100, "--limit"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List saved passengers (POST /my-passenger)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/my-passenger", {"sort": [], "page": {"limit": limit, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@passenger_app.command("get")
+def passenger_get(
+    passenger_id: str = typer.Option(..., "--id"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Get a saved passenger (GET /my-passenger/{id})."""
+    token = get_legacy_token(username, password)
+    _out(legacy_get(token, f"/my-passenger/{passenger_id}"), fmt, compact)
+
+
+@passenger_app.command("create")
+def passenger_create(
+    body: str = typer.Option(..., "--body", help="JSON body for new passenger"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Create a saved passenger (POST /my-passenger/create)."""
+    payload = _parse_json(body)
+    if dry_run:
+        _out({"dry_run": True, "payload": payload, "endpoint": "/my-passenger/create"}, fmt, compact)
+        return
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/my-passenger/create", payload), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# passport — saved passports & docs
+# ---------------------------------------------------------------------------
+
+
+@passport_app.command("list")
+def passport_list(
+    limit: int = typer.Option(100, "--limit"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List saved passports (POST /my-passport)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/my-passport", {"sort": [], "page": {"limit": limit, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@passport_app.command("get")
+def passport_get(
+    passport_id: str = typer.Option(..., "--id"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Get a saved passport (GET /my-passport/{id})."""
+    token = get_legacy_token(username, password)
+    _out(legacy_get(token, f"/my-passport/{passport_id}"), fmt, compact)
+
+
+@passport_app.command("create")
+def passport_create(
+    body: str = typer.Option(..., "--body"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Create a saved passport (POST /my-passport/create)."""
+    payload = _parse_json(body)
+    if dry_run:
+        _out({"dry_run": True, "payload": payload, "endpoint": "/my-passport/create"}, fmt, compact)
+        return
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/my-passport/create", payload), fmt, compact)
+
+
+@passport_app.command("upload-init")
+def passport_upload_init(
+    body: str = typer.Option(..., "--body", help="JSON body — typically describes file metadata"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Begin a passport document upload — returns a presigned upload URL (POST /my-passport/document/upload-init)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/my-passport/document/upload-init", _parse_json(body)), fmt, compact)
+
+
+@passport_app.command("attach")
+def passport_attach(
+    body: str = typer.Option(..., "--body", help="JSON body — references the uploaded file"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Attach a previously-uploaded document to a passport (POST /my-passport/document/attach)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/my-passport/document/attach", _parse_json(body)), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# pet — saved pets & docs
+# ---------------------------------------------------------------------------
+
+
+@pet_app.command("list")
+def pet_list(
+    limit: int = typer.Option(100, "--limit"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List saved pets (POST /my-pet)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/my-pet", {"sort": [], "page": {"limit": limit, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@pet_app.command("get")
+def pet_get(
+    pet_id: str = typer.Option(..., "--id"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Get a saved pet (GET /my-pet/{id})."""
+    token = get_legacy_token(username, password)
+    _out(legacy_get(token, f"/my-pet/{pet_id}"), fmt, compact)
+
+
+@pet_app.command("create")
+def pet_create(
+    body: str = typer.Option(..., "--body"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Create a saved pet (POST /my-pet/create)."""
+    payload = _parse_json(body)
+    if dry_run:
+        _out({"dry_run": True, "payload": payload, "endpoint": "/my-pet/create"}, fmt, compact)
+        return
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/my-pet/create", payload), fmt, compact)
+
+
+@pet_app.command("upload-init")
+def pet_upload_init(
+    body: str = typer.Option(..., "--body"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Begin a pet document upload (POST /my-pet/document/upload-init)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/my-pet/document/upload-init", _parse_json(body)), fmt, compact)
+
+
+@pet_app.command("attach")
+def pet_attach(
+    body: str = typer.Option(..., "--body"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Attach an uploaded document to a pet (POST /my-pet/document/attach)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/my-pet/document/attach", _parse_json(body)), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# customs — Canadian customs declarations
+# ---------------------------------------------------------------------------
+
+
+@customs_app.command("list")
+def customs_list(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List my Canadian customs declarations (POST /myCanadianCustomsDeclaration)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/myCanadianCustomsDeclaration", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@customs_app.command("declaration")
+def customs_declaration(
+    body: str = typer.Option("{}", "--body", help="Optional filter body"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Get the customs-declaration form/template (POST /canadian-custom-declaration)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/canadian-custom-declaration", _parse_json(body)), fmt, compact)
+
+
+@customs_app.command("create")
+def customs_create(
+    body: str = typer.Option(..., "--body"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Create a customs declaration (POST /canadianCustomsDeclaration/create)."""
+    payload = _parse_json(body)
+    if dry_run:
+        _out({"dry_run": True, "payload": payload, "endpoint": "/canadianCustomsDeclaration/create"}, fmt, compact)
+        return
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/canadianCustomsDeclaration/create", payload), fmt, compact)
+
+
+@customs_app.command("create-public")
+def customs_create_public(
+    body: str = typer.Option(..., "--body"),
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Create a public (link-based) customs declaration — no auth required (POST /canadianCustomsDeclaration/create-public)."""
+    payload = _parse_json(body)
+    _out(_http("POST", f"{LEGACY_BASE_URL}/canadianCustomsDeclaration/create-public",
+               headers={"Content-Type": "application/json", "Accept": "application/json"},
+               data=json.dumps(payload).encode("utf-8")), fmt, compact)
+
+
+@customs_app.command("link-create")
+def customs_link_create(
+    body: str = typer.Option(..., "--body"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Create a customs-declaration link to share with a passenger (POST /canadian-customs-declaration-link/create)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/canadian-customs-declaration-link/create", _parse_json(body)), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# booking — additional flows
+# ---------------------------------------------------------------------------
+
+
+@booking_app.command("empty-leg")
+def booking_empty_leg(
+    body: str = typer.Option(..., "--body", help="JSON body for empty-leg booking"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Book an empty leg (POST /empty-leg/book)."""
+    payload = _parse_json(body)
+    if dry_run:
+        _out({"dry_run": True, "payload": payload, "endpoint": "/empty-leg/book"}, fmt, compact)
+        return
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/empty-leg/book", payload), fmt, compact)
+
+
+@booking_app.command("shared-flight")
+def booking_shared_flight(
+    body: str = typer.Option(..., "--body"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Book a shared flight (POST /shared-flight/book)."""
+    payload = _parse_json(body)
+    if dry_run:
+        _out({"dry_run": True, "payload": payload, "endpoint": "/shared-flight/book"}, fmt, compact)
+        return
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/shared-flight/book", payload), fmt, compact)
+
+
+@booking_app.command("trip-book")
+def booking_trip_book(
+    body: str = typer.Option(..., "--body"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Book a trip via the legacy API (POST /trip/book). Compare with `booking create` which uses prod2."""
+    payload = _parse_json(body)
+    if dry_run:
+        _out({"dry_run": True, "payload": payload, "endpoint": "/trip/book"}, fmt, compact)
+        return
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/trip/book", payload), fmt, compact)
+
+
+@booking_app.command("cancel-own")
+def booking_cancel_own(
+    body: str = typer.Option(..., "--body", help='JSON body, e.g. {"legId":"...", "reason":"..."}'),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Self-cancel a leg/trip via the legacy API (POST /cancel-own)."""
+    payload = _parse_json(body)
+    if dry_run:
+        _out({"dry_run": True, "payload": payload, "endpoint": "/cancel-own"}, fmt, compact)
+        return
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/cancel-own", payload), fmt, compact)
+
+
+@booking_app.command("lock")
+def booking_lock(
+    body: str = typer.Option(..., "--body"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Lock (hold) a flight (POST /flight/lock)."""
+    payload = _parse_json(body)
+    if dry_run:
+        _out({"dry_run": True, "payload": payload, "endpoint": "/flight/lock"}, fmt, compact)
+        return
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/flight/lock", payload), fmt, compact)
+
+
+@booking_app.command("reserve-day")
+def booking_reserve_day(
+    body: str = typer.Option(..., "--body"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Reserve a day on the calendar (POST /reserve-day)."""
+    payload = _parse_json(body)
+    if dry_run:
+        _out({"dry_run": True, "payload": payload, "endpoint": "/reserve-day"}, fmt, compact)
+        return
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/reserve-day", payload), fmt, compact)
+
+
+@booking_app.command("survey")
+def booking_survey(
+    body: str = typer.Option(..., "--body"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Submit a post-booking survey (POST /booking-survey/create)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/booking-survey/create", _parse_json(body)), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# trips — manifest & recent
+# ---------------------------------------------------------------------------
+
+
+@trips_app.command("manifest")
+def trips_manifest(
+    trip_id: str = typer.Option(..., "--id", help="Trip or leg ID"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Get the trip manifest (GET /trip/manifest/{id})."""
+    token = get_legacy_token(username, password)
+    _out(legacy_get(token, f"/trip/manifest/{trip_id}"), fmt, compact)
+
+
+@trips_app.command("manifest-send")
+def trips_manifest_send(
+    body: str = typer.Option(..., "--body", help="JSON body — recipients & trip ID"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Email the trip manifest (POST /trip/manifest/send)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/trip/manifest/send", _parse_json(body)), fmt, compact)
+
+
+@trips_app.command("recent")
+def trips_recent(
+    limit: int = typer.Option(20, "--limit"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List recent legs (POST /leg/recent/list)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/leg/recent/list", {"sort": [], "page": {"limit": limit, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@trips_app.command("recent-save")
+def trips_recent_save(
+    body: str = typer.Option(..., "--body"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Save a leg to recents (POST /leg/recent/save)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/leg/recent/save", _parse_json(body)), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# quote — airport-nearest, saved-airports
+# ---------------------------------------------------------------------------
+
+
+@quote_app.command("airport-nearest")
+def quote_airport_nearest(
+    lat: float = typer.Option(..., "--lat", help="Latitude"),
+    lng: float = typer.Option(..., "--lng", help="Longitude"),
+    limit: int = typer.Option(5, "--limit"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Find airports nearest a coordinate (POST /airport/nearest)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/airport/nearest", {
+        "sort": [], "page": {"limit": limit, "offset": 0},
+        "filter": {"latitude": lat, "longitude": lng},
+    })
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@quote_app.command("saved-airports")
+def quote_saved_airports(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List my saved/favourite airports (POST /my-saved-airports/)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/my-saved-airports/", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# address — autocomplete & saved
+# ---------------------------------------------------------------------------
+
+
+@address_app.command("autocomplete")
+def address_autocomplete(
+    query: str = typer.Option(..., "--query", "-q", help="Partial address text"),
+    limit: int = typer.Option(10, "--limit"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Address autocomplete (POST /address/autocomplete)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/address/autocomplete", {
+        "sort": [], "page": {"limit": limit, "offset": 0},
+        "filter": {"query": query},
+    })
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@address_app.command("create")
+def address_create(
+    body: str = typer.Option(..., "--body"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Save an address (POST /my-address/create)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/my-address/create", _parse_json(body)), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# hours — exchange marketplace (estimate already at quote.hours-exchange)
+# ---------------------------------------------------------------------------
+
+
+@hours_app.command("estimate")
+def hours_estimate(
+    body: str = typer.Option(..., "--body"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Estimate hours-exchange value (POST /hour-exchange/estimate). Mirror of `quote hours-exchange`."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/hour-exchange/estimate", _parse_json(body)), fmt, compact)
+
+
+@hours_app.command("power")
+def hours_power(
+    body: str = typer.Option(..., "--body"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Hours-exchange power calculation (POST /hour-exchange/power)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/hour-exchange/power", _parse_json(body)), fmt, compact)
+
+
+@hours_app.command("listing-create")
+def hours_listing_create(
+    body: str = typer.Option(..., "--body"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List hours for sale on the marketplace (POST /hours-exchange-listing/create)."""
+    payload = _parse_json(body)
+    if dry_run:
+        _out({"dry_run": True, "payload": payload, "endpoint": "/hours-exchange-listing/create"}, fmt, compact)
+        return
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/hours-exchange-listing/create", payload), fmt, compact)
+
+
+@hours_app.command("my-listings")
+def hours_my_listings(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List my hours-exchange listings (POST /my-hours-exchange-listing)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/my-hours-exchange-listing", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# files
+# ---------------------------------------------------------------------------
+
+
+@files_app.command("list")
+def files_list(
+    limit: int = typer.Option(50, "--limit"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List my files (POST /my-file)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/my-file", {"sort": [], "page": {"limit": limit, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@files_app.command("public-create")
+def files_public_create(
+    body: str = typer.Option(..., "--body"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Create a public-file record (POST /file-public/create)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/file-public/create", _parse_json(body)), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# content — FAQ, policy, system notice, concierge
+# ---------------------------------------------------------------------------
+
+
+@content_app.command("faq")
+def content_faq(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List FAQ entries (POST /faq)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/faq", {"sort": [], "page": {"limit": 200, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@content_app.command("faq-categories")
+def content_faq_categories(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List FAQ categories (POST /faq-category)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/faq-category", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@content_app.command("policies")
+def content_policies(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List policies (POST /policy)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/policy", {"sort": [], "page": {"limit": 200, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@content_app.command("policy-categories")
+def content_policy_categories(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List policy categories (POST /policy-category)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/policy-category", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@content_app.command("system-notice")
+def content_system_notice(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Get current system notice (POST /system-notice)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/system-notice", {}), fmt, compact)
+
+
+@content_app.command("required-info")
+def content_required_info(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Get required-info prompts (POST /required-info)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/required-info", {}), fmt, compact)
+
+
+@content_app.command("concierge")
+def content_concierge(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Get concierge contact info (POST /concierge)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/concierge", {}), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# social — follow / followers
+# ---------------------------------------------------------------------------
+
+
+@social_app.command("followers")
+def social_followers(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List my followers (POST /my-user/followers)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/my-user/followers", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@social_app.command("following")
+def social_following(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List who I follow (POST /my-user/following)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/my-user/following", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@social_app.command("requests")
+def social_requests(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """List pending follower requests (POST /my-user/follower-requests)."""
+    token = get_legacy_token(username, password)
+    resp = legacy_post(token, "/my-user/follower-requests", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
+    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+
+
+@social_app.command("follow")
+def social_follow(
+    user_id: str = typer.Option(..., "--user", help="User ID to follow"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Follow a user (POST /user/follow)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/user/follow", {"userId": user_id}), fmt, compact)
+
+
+@social_app.command("accept")
+def social_accept(
+    user_id: str = typer.Option(..., "--user", help="Follower user ID to accept"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Accept a follower request (POST /user/follower/accept)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/user/follower/accept", {"userId": user_id}), fmt, compact)
+
+
+@social_app.command("decline")
+def social_decline(
+    user_id: str = typer.Option(..., "--user", help="Follower user ID to decline"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Decline a follower request (POST /user/follower/decline)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/user/follower/decline", {"userId": user_id}), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# user — me / change-password / avatar (additional)
+# ---------------------------------------------------------------------------
+
+
+@user_app.command("me")
+def user_me(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Get my full user record (POST /my-user). Richer than `user profile`."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/my-user", {}), fmt, compact)
+
+
+@user_app.command("change-password")
+def user_change_password(
+    body: str = typer.Option(..., "--body", help='JSON body, e.g. {"currentPassword":"...", "newPassword":"..."}'),
+    confirm: bool = typer.Option(False, "--confirm", help="Required — change-password is destructive"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Change your password (POST /my-user/change-password). Requires --confirm."""
+    if not confirm:
+        _die("--confirm required to actually change the password.", EXIT_VALIDATION)
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/my-user/change-password", _parse_json(body)), fmt, compact)
+
+
+@user_app.command("avatar")
+def user_avatar(
+    user_id: str = typer.Option(..., "--id", help="User ID"),
+    output: str = typer.Option("-", "--output", "-o", help="Output file path or - for metadata only"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+):
+    """Download a user avatar (GET /my-user/avatar/{id})."""
+    token = get_legacy_token(username, password)
+    url = f"{LEGACY_BASE_URL}/my-user/avatar/{user_id}"
+    req = Request(url, method="GET", headers={
+        "x-airsprint-auth-token": token, "Accept": "*/*",
+    })
+    try:
+        with urlopen(req, timeout=60, context=_ssl_ctx()) as resp:
+            content = resp.read()
+            if output == "-":
+                _out({"size_bytes": len(content), "content_type": resp.headers.get("Content-Type", "")})
+            else:
+                Path(output).write_bytes(content)
+                _out({"message": f"Saved to {output}", "size_bytes": len(content)})
+    except HTTPError as e:
+        _die(f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')}", EXIT_ERROR)
+
+
+# ---------------------------------------------------------------------------
+# messages — notification settings
+# ---------------------------------------------------------------------------
+
+
+@messages_app.command("settings")
+def messages_settings(
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Get notification settings (POST /my-notification-settings)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/my-notification-settings", {}), fmt, compact)
+
+
+@messages_app.command("settings-update")
+def messages_settings_update(
+    body: str = typer.Option(..., "--body"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Update notification settings (POST /my-notification-settings/update)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/my-notification-settings/update", _parse_json(body)), fmt, compact)
+
+
+@messages_app.command("update")
+def messages_update(
+    body: str = typer.Option(..., "--body", help="JSON body — e.g. mark messages read/unread"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Bulk-update notifications (POST /my-notifications/update)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/my-notifications/update", _parse_json(body)), fmt, compact)
+
+
+# ---------------------------------------------------------------------------
+# auth — 2FA & password reset
+# ---------------------------------------------------------------------------
+
+
+@auth_app.command("2fa-setup")
+def auth_2fa_setup(
+    body: str = typer.Option("{}", "--body"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Begin 2FA setup (POST /user/2fa/setup)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/user/2fa/setup", _parse_json(body)), fmt, compact)
+
+
+@auth_app.command("2fa-verify")
+def auth_2fa_verify(
+    body: str = typer.Option(..., "--body", help='JSON body, e.g. {"code":"123456"}'),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Verify a 2FA code during setup (POST /user/2fa/verify)."""
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/user/2fa/verify", _parse_json(body)), fmt, compact)
+
+
+@auth_app.command("2fa-sign-in")
+def auth_2fa_sign_in(
+    body: str = typer.Option(..., "--body"),
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Complete a 2FA sign-in (POST /user/2fa/sign-in) — no auth header required."""
+    _out(_http("POST", f"{LEGACY_BASE_URL}/user/2fa/sign-in",
+               headers={"Content-Type": "application/json", "Accept": "application/json"},
+               data=json.dumps(_parse_json(body)).encode("utf-8")), fmt, compact)
+
+
+@auth_app.command("2fa-disable")
+def auth_2fa_disable(
+    body: str = typer.Option("{}", "--body"),
+    confirm: bool = typer.Option(False, "--confirm", help="Required — disabling 2FA reduces account security"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Disable 2FA (POST /user/2fa/disable). Requires --confirm."""
+    if not confirm:
+        _die("--confirm required to disable 2FA.", EXIT_VALIDATION)
+    token = get_legacy_token(username, password)
+    _out(legacy_post(token, "/user/2fa/disable", _parse_json(body)), fmt, compact)
+
+
+@auth_app.command("reset-request")
+def auth_reset_request(
+    email: str = typer.Option(..., "--email"),
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Request a password-reset email (POST /user/request-reset-password). No auth required."""
+    _out(_http("POST", f"{LEGACY_BASE_URL}/user/request-reset-password",
+               headers={"Content-Type": "application/json", "Accept": "application/json"},
+               data=json.dumps({"email": email}).encode("utf-8")), fmt, compact)
+
+
+@auth_app.command("reset-confirm")
+def auth_reset_confirm(
+    body: str = typer.Option(..., "--body", help='JSON body, e.g. {"token":"...", "newPassword":"..."}'),
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Confirm a password reset (POST /user/reset-password). No auth required."""
+    _out(_http("POST", f"{LEGACY_BASE_URL}/user/reset-password",
+               headers={"Content-Type": "application/json", "Accept": "application/json"},
+               data=json.dumps(_parse_json(body)).encode("utf-8")), fmt, compact)
 
 
 # ---------------------------------------------------------------------------
@@ -1192,4 +2614,14 @@ def quote_aircraft(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    app()
+    try:
+        app()
+    except RuntimeError as exc:
+        # Surface our structured-error JSON cleanly instead of a Python traceback.
+        msg = str(exc)
+        try:
+            parsed = json.loads(msg)
+        except json.JSONDecodeError:
+            parsed = {"status": "error", "message": msg}
+        sys.stderr.write(json.dumps(parsed) + "\n")
+        sys.exit(EXIT_ERROR)

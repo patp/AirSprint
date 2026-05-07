@@ -9,6 +9,9 @@ Agent-friendly CLI for [AirSprint](https://www.airsprint.com/) fractional jet ow
 
 - **Non-interactive** — all inputs via flags or env vars, no prompts
 - **JSON by default** — structured `{"status": "ok", "data": ...}` output, parseable by agents
+- **`--compact` mode** — strips null/empty/audit fields and emits minified JSON for token-efficient agent piping
+- **Local data mirror** — airports + fleet cached at `~/.airsprint_cache.json` (7-day TTL); offline ICAO resolution and search
+- **Compound commands** — `summary` (one call replaces 4) and `quote roundtrip` (one call, both legs)
 - **OAuth2 auth** with automatic token caching (`~/.airsprint_token.json`)
 - **Server-side pricing** — get real flight quotes without submitting a booking
 - **Local time support** — `--date 2026-04-15T10:00 --tz America/Montreal`
@@ -48,20 +51,39 @@ python3 scripts/airsprint_cli.py <group> <command> [options]
 
 | Group | Description |
 |-------|-------------|
-| `auth` | Login, logout, check token status |
-| `user` | Profile, account info, preferences |
-| `trips` | List trips, get details, invoices, preflight info |
-| `booking` | Get booking prep data, create/update/cancel bookings |
-| `quote` | Flight quotes, cost estimates, airport/aircraft lookups |
+| `summary` | One-call dashboard (accounts + trips + empty legs + unread) |
+| `auth` | Login, logout, token status, 2FA setup/verify/disable |
+| `user` | Profile, account info, preferences, avatar, change password |
+| `trips` | List trips, get details, invoices, preflight, manifest, recent legs |
+| `booking` | Get booking prep data, create/update/cancel, empty-leg & shared-flight booking, flight lock, reserve-day |
+| `quote` | Flight quotes (one-way & roundtrip), cost estimates, airport/aircraft lookups, nearest airport, saved airports |
 | `explore` | Browse empty legs and shared flights |
 | `messages` | List, read, delete in-app messages |
 | `feedback` | List subjects, submit feedback |
+| `cache` | Manage the local airport/aircraft mirror |
+| `raw` | Raw API escape hatches (legacy GET/POST, prod2 GET/POST/PUT) |
+| `account` | Account-user management (list, invite, update, roles) |
+| `passenger` | Saved passengers (list, get, create) |
+| `passport` | Saved passports + document upload/attach |
+| `pet` | Saved pets + document upload/attach |
+| `customs` | Canadian customs declarations (list, create, public link) |
+| `address` | Address autocomplete + saved addresses |
+| `hours` | Hours-exchange marketplace (estimate, power, listings) |
+| `files` | File listing & public-file records |
+| `content` | FAQ, policies, system notice, concierge, required info |
+| `social` | Follow / followers / following / requests (accept/decline) |
 
 ### Quick Start
 
 ```bash
 # Login (token cached automatically)
 python3 scripts/airsprint_cli.py auth login
+
+# Populate the local airport/aircraft mirror (one-time, 7-day TTL)
+python3 scripts/airsprint_cli.py cache refresh
+
+# Single-call dashboard for an agent
+python3 scripts/airsprint_cli.py summary --compact
 
 # View profile and hours balance
 python3 scripts/airsprint_cli.py user profile
@@ -85,15 +107,19 @@ python3 scripts/airsprint_cli.py user profile --format human
 ### Quote Flow (Get Pricing Without Booking)
 
 ```bash
-# Simple — use ICAO codes, auto-resolved
+# Simple — use ICAO codes, auto-resolved (cache-served when fresh)
 python3 scripts/airsprint_cli.py quote flight --from CYQB --to KTEB --date "2026-04-15T10:00" --tz America/Montreal
 
-# List aircraft types
+# Round-trip in one call
+python3 scripts/airsprint_cli.py quote roundtrip --from CYQB --to KTEB \
+  --out 2026-04-15T10:00 --return 2026-04-18T17:00 --tz America/Montreal
+
+# List aircraft types (cache-served)
 python3 scripts/airsprint_cli.py quote aircraft
 
-# Search airports
-python3 scripts/airsprint_cli.py quote airports --name Montreal
-python3 scripts/airsprint_cli.py quote airports --icao KTEB
+# Search airports (cache-served when fresh; query matches ICAO/IATA/name/city/country)
+python3 scripts/airsprint_cli.py quote airports -q montreal
+python3 scripts/airsprint_cli.py quote airports -q KTEB
 
 # Misc cost estimate (catering, transport, surcharges)
 python3 scripts/airsprint_cli.py quote cost --body '{"legs":[...]}'
@@ -140,15 +166,26 @@ Built from static analysis of the AirSprint Android app (`com.droid.airsprint` v
 
 | Category | API | Endpoints |
 |----------|-----|-----------|
-| Auth | prod2 | `/oauth/token` |
-| User | prod2 | `getInitialUserInfo`, `getAccountInfo`, `updateAccountInfo`, `preferences` |
-| Trips | prod2 | `getMyTrips`, `getBookingById`, `downloadTripSheet`, `invoices`, `preflight-info` |
-| Booking | prod2 | `getBookingInfo`, `bookTrip`, `updateTrip` (update + cancel) |
+| Auth | prod2 + legacy | `/oauth/token`, `user/2fa/setup`, `user/2fa/verify`, `user/2fa/disable`, `user/request-reset-password`, `user/reset-password` |
+| User | prod2 + legacy | `getInitialUserInfo`, `getAccountInfo`, `updateAccountInfo`, `preferences`, `my-user`, `my-user/avatar`, `my-user/change-password`, `my-notifications`, `my-notification-settings` |
+| Trips | prod2 + legacy | `getMyTrips`, `getBookingById`, `downloadTripSheet`, `invoices`, `preflight-info`, `trip/manifest`, `trip/manifest/send`, `leg/recent/list`, `leg/recent/save` |
+| Booking | prod2 + legacy | `getBookingInfo`, `bookTrip`, `updateTrip` (update + cancel), `empty-leg/book`, `shared-flight/book`, `flight/lock`, `reserve-day`, `cancel-own`, `booking-survey/create` |
 | Explore | prod2 | `getEmptyLegDetails`, `getAllCounts` |
 | Messages | prod2 | `getUserMessages`, `readUserMessage`, `readAllUserMessages`, `deleteUserMessage` |
-| Feedback | prod2 | `feedback/subject`, `feedback` |
+| Feedback | prod2 + legacy | `feedback/subject`, `feedback`, `feedback/create` |
 | Quotes | legacy | `flight-quote`, `trip/misc-cost-estimate`, `hour-exchange/estimate` |
-| Lookups | legacy | `airport`, `aircraft`, `my-aircraft` |
+| Lookups | legacy | `airport`, `airport/nearest`, `my-saved-airports`, `aircraft`, `my-aircraft`, `baggage-type` |
+| Account | legacy | `my-account-users`, `my-account-user/{id}`, `account-user/invite`, `account-user/update`, `account-user-role` |
+| Passenger | legacy | `my-passenger`, `my-passenger/{id}`, `my-passenger/create` |
+| Passport | legacy | `my-passport`, `my-passport/create`, `my-passport/upload-init`, `my-passport/attach` |
+| Pet | legacy | `my-pet`, `my-pet/create`, `my-pet/upload-init`, `my-pet/attach` |
+| Customs | legacy | `myCanadianCustomsDeclaration`, `canadianCustomsDeclaration/create`, `canadianCustomsDeclaration/create-public`, `canadianCustomsDeclaration/link-create` |
+| Address | legacy | `address/autocomplete`, `my-address/create` |
+| Hours | legacy | `hour-exchange/estimate`, `hour-exchange/power`, `hours-exchange-listing/create`, `my-hours-exchange-listing` |
+| Files | legacy | `my-file`, `file-public/create` |
+| Content | legacy | `faq`, `faq-category`, `policy`, `policy-category`, `system-notice`, `required-info`, `concierge` |
+| Social | legacy | `my-user/followers`, `my-user/following`, `my-user/follower-requests`, `user/follow`, `user/follower/accept`, `user/follower/decline` |
+| Raw | both | Generic GET/POST/PUT escape hatches for any endpoint not yet typed |
 
 ## Requirements
 
