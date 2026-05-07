@@ -698,7 +698,11 @@ def trips_tripsheet(
     username: Optional[str] = Username,
     password: Optional[str] = Password,
 ):
-    """Download trip sheet (manifest) PDF (GET /trip/manifest/{id})."""
+    """Download trip sheet (manifest) PDF (GET /trip/manifest/{id}).
+
+    The endpoint returns a JSON envelope with a presigned S3 URL; this command
+    follows the URL and saves the PDF (or reports the URL with --output -).
+    """
     token = get_legacy_token(username, password)
     trip_uuid = booking_id
     if "-" not in booking_id:
@@ -713,20 +717,34 @@ def trips_tripsheet(
         if not match or not match.get("tripId"):
             _die(f"Trip {booking_id} not found", EXIT_NOT_FOUND)
         trip_uuid = match["tripId"]
-    url = f"{LEGACY_BASE_URL}/trip/manifest/{trip_uuid}"
-    req = Request(url, method="GET", headers={"x-airsprint-auth-token": token})
+    try:
+        envelope = legacy_get(token, f"/trip/manifest/{trip_uuid}")
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "404" in msg or "not found" in msg.lower() or "Flight not found" in msg:
+            _die(f"No manifest available for {booking_id} (flight may not have departed yet)", EXIT_NOT_FOUND)
+        raise
+    pdf_url = envelope.get("data", {}).get("data", {}).get("url") or envelope.get("data", {}).get("url")
+    if not pdf_url:
+        _die(f"No manifest URL returned for {booking_id}", EXIT_NOT_FOUND)
+    if output == "-":
+        _out({"url": pdf_url, "message": "Use --output FILE to download the PDF."})
+        return
+    req = Request(pdf_url, method="GET")
     try:
         with urlopen(req, timeout=60, context=_ssl_ctx()) as resp:
             content = resp.read()
-            if not content:
-                _die(f"No trip sheet available for {booking_id}", EXIT_NOT_FOUND)
-            if output == "-":
-                _out({"message": f"Trip sheet available, {len(content)} bytes. Use --output FILE to save."})
-            else:
-                Path(output).write_bytes(content)
-                _out({"message": f"Saved to {output}", "size_bytes": len(content)})
+            Path(output).write_bytes(content)
+            _out({"message": f"Saved to {output}", "size_bytes": len(content)})
     except HTTPError as e:
         _die(f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')}", EXIT_ERROR)
+
+
+_FEATURE_REMOVED_MSG = (
+    "This endpoint is not available on the current api.airsprint.com — "
+    "the prod2 mobile API was decommissioned and AirSprint did not port this "
+    "feature to the new web API. Check the owners.airsprint.com portal."
+)
 
 
 @trips_app.command("invoice")
@@ -736,10 +754,8 @@ def trips_invoice(
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Get invoice for a specific trip."""
-    token = get_token(username, password)
-    data = api_get(token, f"/user/trip/{trip_id}/invoice")
-    _out(data, fmt)
+    """[REMOVED] Per-trip invoice not available on current API."""
+    _die(f"trips invoice: {_FEATURE_REMOVED_MSG}", EXIT_ERROR)
 
 
 @trips_app.command("invoices")
@@ -749,11 +765,8 @@ def trips_invoices(
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """List all invoices."""
-    token = get_token(username, password)
-    tz_param = f"?arrivalTimeZone={timezone}" if timezone else ""
-    data = api_get(token, f"/user/invoices{tz_param}")
-    _out(data, fmt)
+    """[REMOVED] Invoices listing not available on current API."""
+    _die(f"trips invoices: {_FEATURE_REMOVED_MSG}", EXIT_ERROR)
 
 
 @trips_app.command("preflight")
@@ -763,11 +776,8 @@ def trips_preflight(
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Get preflight info for upcoming trips."""
-    token = get_token(username, password)
-    tz_param = f"?arrivalTimeZone={timezone}" if timezone else ""
-    data = api_get(token, f"/user/preflight-info{tz_param}")
-    _out(data, fmt)
+    """[REMOVED] Preflight info not available on current API."""
+    _die(f"trips preflight: {_FEATURE_REMOVED_MSG}", EXIT_ERROR)
 
 
 @trips_app.command("flight-feedback")
