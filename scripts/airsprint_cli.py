@@ -810,116 +810,126 @@ def booking_info(
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Get booking prep data: accountId, authorizer, locations, aircraft, passengers, contacts.
+    """Compose booking prep data: accounts, aircraft, passengers, saved airports.
 
-    Use this BEFORE creating a booking to get valid reference values.
+    Run this BEFORE creating a booking to get valid reference values
+    (accountId, aircraftId, departureAirportId, passenger ids, etc.).
     """
-    token = get_token(username, password)
-    data = api_get(token, "/user/getBookingInfo")
-    _out(data, fmt)
+    token = get_legacy_token(username, password)
+    accounts = legacy_post(token, "/my-accounts", {}).get("data", {}).get("items", [])
+    aircraft = legacy_post(token, "/my-aircraft", {}).get("data", {}).get("items", [])
+    passengers = legacy_post(token, "/my-passenger", {"sort": [], "page": {"limit": 200, "offset": 0}, "filter": {}}).get("data", {}).get("items", [])
+    airports = legacy_post(token, "/airport", {"sort": [], "page": {"limit": 50, "offset": 0}, "filter": {"saved": True}}).get("data", {}).get("items", [])
+    _out({
+        "accounts": accounts,
+        "aircraft": aircraft,
+        "passengers": passengers,
+        "savedAirports": airports,
+    }, fmt)
 
 
 @booking_app.command("create")
 def booking_create(
-    body: str = typer.Option(..., "--body", help='JSON body with bookingReq object'),
+    body: str = typer.Option(..., "--body", help='JSON body for POST /trip/book'),
     dry_run: bool = typer.Option(False, "--dry-run", help="Validate and show payload without submitting"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Book a new trip.
+    """Book a new trip (POST /trip/book).
 
-    Requires a JSON body with a top-level "bookingReq" object.
-    Run `airsprint booking info` first to get valid accountId, authorizer, locations, and aircraft.
+    Required body schema (top-level keys):
+        legs:           [{ departureAirportId, arrivalAirportId, aircraftId,
+                           date, numberOfSeats, passengers: [], petIds: [],
+                           requestSettings: {} }]
+        baggage:        []
+        shareSettings:  {}
 
-    Rules enforced by the API:
-    - departure and destination cannot match
-    - booking must be >=8 hours in the future
-    - max 10 passengers per leg
-    - at least one of departureTimeEpoch or arrivalTimeEpoch required
+    Run `airsprint booking info` first to get valid IDs.
     """
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as e:
         _die(f"Invalid JSON: {e}", EXIT_VALIDATION)
 
-    if "bookingReq" not in payload:
-        _die('Body must contain a "bookingReq" key.', EXIT_VALIDATION)
+    for key in ("legs", "baggage", "shareSettings"):
+        if key not in payload:
+            _die(f'Body must contain "{key}" (see --help for full schema).', EXIT_VALIDATION)
 
     if dry_run:
-        _out({"dry_run": True, "payload": payload, "message": "Would POST /user/bookTrip"}, fmt)
+        _out({"dry_run": True, "payload": payload, "message": "Would POST /trip/book"}, fmt)
         return
 
-    token = get_token(username, password)
-    data = api_post(token, "/user/bookTrip", payload)
+    token = get_legacy_token(username, password)
+    data = legacy_post(token, "/trip/book", payload)
     _out(data, fmt)
 
 
 @booking_app.command("update")
 def booking_update(
-    body: str = typer.Option(..., "--body", help='JSON body with bookingReq (include bookingId)'),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Validate and show payload without submitting"),
+    body: str = typer.Option(..., "--body", help="(unused — endpoint not available)"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Update an existing trip (change legs, add return, etc.).
+    """[REMOVED] Trip-update endpoint not available on current API.
 
-    Set revisionSource to "App" in the body.
+    The new api.airsprint.com has no equivalent of the old PUT /user/updateTrip.
+    The owners.airsprint.com web portal also does not expose a working
+    "Modify Flight" action — modifications now go through the concierge.
     """
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError as e:
-        _die(f"Invalid JSON: {e}", EXIT_VALIDATION)
-
-    if dry_run:
-        _out({"dry_run": True, "payload": payload, "message": "Would PUT /user/updateTrip"}, fmt)
-        return
-
-    token = get_token(username, password)
-    data = api_put(token, "/user/updateTrip", payload)
-    _out(data, fmt)
+    _die("booking update: " + _FEATURE_REMOVED_MSG, EXIT_ERROR)
 
 
 @booking_app.command("cancel")
 def booking_cancel(
-    booking_id: str = typer.Option(..., "--id", help="Booking ID to cancel"),
-    leg_id: Optional[str] = typer.Option(None, "--leg-id", help="Cancel a single leg instead of whole trip"),
-    authorizer: str = typer.Option(..., "--authorizer", help="Cancellation authorizer contact ID"),
+    booking_id: Optional[str] = typer.Option(None, "--id", help="Booking code (e.g. BAKEW) — resolved to tripId"),
+    trip_id: Optional[str] = typer.Option(None, "--trip-id", help="Trip UUID (alternative to --id)"),
+    leg_id: Optional[str] = typer.Option(None, "--leg-id", help="Cancel a single leg by leg UUID"),
+    leg_ids: Optional[str] = typer.Option(None, "--leg-ids", help="Comma-separated leg UUIDs"),
+    reason: str = typer.Option(..., "--reason", help="Cancellation reason (required by API)"),
+    authorizer: Optional[str] = typer.Option(None, "--authorizer", help="(deprecated, ignored — kept for compat)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show payload without submitting"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Cancel a trip or a single leg.
+    """Cancel a trip or specific legs (POST /cancel-own).
 
-    Get the authorizer ID from `airsprint booking info`.
+    One of --id, --trip-id, --leg-id, or --leg-ids is required.
+    --id resolves a booking code (e.g. BAKEW) to its tripId via /my-leg.
     """
+    if not any([booking_id, trip_id, leg_id, leg_ids]):
+        _die("Provide one of --id, --trip-id, --leg-id, --leg-ids", EXIT_VALIDATION)
+
+    payload: dict[str, Any] = {"reason": reason}
     if leg_id:
-        payload = {
-            "bookingReq": {
-                "bookingId": booking_id,
-                "isCancelBookingRequest": False,
-                "cancellationAuthorizer": authorizer,
-                "bookingLegs": [{"bookingLegId": leg_id, "isCancelBookingLegRequest": True}],
-            }
-        }
-    else:
-        payload = {
-            "bookingReq": {
-                "bookingId": booking_id,
-                "isCancelBookingRequest": True,
-                "cancellationAuthorizer": authorizer,
-                "bookingLegs": None,
-            }
-        }
+        payload["legId"] = leg_id
+    elif leg_ids:
+        payload["legIds"] = [s.strip() for s in leg_ids.split(",") if s.strip()]
+    elif trip_id:
+        payload["tripId"] = trip_id
+    elif booking_id:
+        token_for_lookup = get_legacy_token(username, password)
+        account_ids = _get_legacy_account_ids(token_for_lookup)
+        resp = legacy_post(token_for_lookup, "/my-leg", {
+            "sort": [{"departureDate": "ASC"}],
+            "page": {"limit": 200, "offset": 0},
+            "filter": {"accountId": account_ids},
+        })
+        items = resp.get("data", {}).get("items", [])
+        match = next((i for i in items if i.get("bookingId") == booking_id), None)
+        if not match or not match.get("tripId"):
+            _die(f"Booking {booking_id} not found", EXIT_NOT_FOUND)
+        payload["tripId"] = match["tripId"]
 
     if dry_run:
-        _out({"dry_run": True, "payload": payload, "message": "Would PUT /user/updateTrip"}, fmt)
+        _out({"dry_run": True, "payload": payload, "message": "Would POST /cancel-own"}, fmt)
         return
 
-    token = get_token(username, password)
-    data = api_put(token, "/user/updateTrip", payload)
+    token = get_legacy_token(username, password)
+    data = legacy_post(token, "/cancel-own", payload)
     _out(data, fmt)
 
 
