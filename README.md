@@ -19,6 +19,8 @@ Agent-friendly CLI for [AirSprint](https://www.airsprint.com/) fractional jet ow
 - **Semantic exit codes** — 0 success, 1 error, 2 validation, 3 not found, 4 auth
 - **Single file** — `scripts/airsprint_cli.py`, no package structure needed
 
+The agent-friendly design (compact mode, local mirror, compound commands) follows the [Printing Press](https://printingpress.dev/) principles for token-efficient CLIs.
+
 ## Setup
 
 ```bash

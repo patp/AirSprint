@@ -6,6 +6,8 @@ CLI for AirSprint fractional jet ownership platform.
 Uses two APIs: prod2.airsprint.com (booking, trips, messages) and api.airsprint.com (quotes, pricing, airport/aircraft lookups).
 Covers: auth, user profile, trip management, booking, quotes & pricing, explore flights, messages, feedback.
 
+Token-efficient design (compact mode, local mirror, compound commands) follows the [Printing Press](https://printingpress.dev/) principles for agent-friendly CLIs.
+
 ## Setup
 
 ```bash
