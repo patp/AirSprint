@@ -140,6 +140,19 @@ python3 scripts/airsprint_cli.py booking cancel \
 
 ## Saved passengers and passports
 
+`passport list` performs one bounded `POST /my-passenger` read and flattens the
+exact embedded `passports` records. Do not call `POST /my-passport`; the
+collection route returns 404. Preserve the API's exact `nationality` and
+`issuingAuthority` fields. Never infer, translate, or relabel `nationality` as
+`country`; the passport record has no `country` field.
+
+For passport-data audits, the physical passport scan is the source of truth;
+saved AirSprint values can be stale or wrong. Read the printed `Issuing
+Country/Pays émetteur` and `Authority/Autorité` separately. Do not compare the
+printed three-letter issuing-country code (for example, `CAN`) as though it
+were the API's two-letter `nationality` value (for example, `CA`). Visually
+verify the scan before proposing any saved-passport replacement.
+
 Working deletion routes use HTTP DELETE:
 
 ```bash
@@ -159,7 +172,9 @@ accepts ISO dates, epoch seconds, or epoch milliseconds and always sends ms.
 Android 6.1.4 parses `yyyy-MM-dd` at device-local midnight before taking
 `millisecondsSinceEpoch`. For timezone-less ISO input, always pass `--tz` (or
 set `AIRSPRINT_TIMEZONE`) so the CLI preserves the same calendar date in the
-Android UI; the CLI refuses ambiguous input without it.
+Android UI; the CLI refuses ambiguous input without it. This is the Android
+device timezone, not a fixed AirSprint HQ/Calgary timezone. Use
+`America/Edmonton` only when that is the device's configured timezone.
 
 The app displays the first UUID in a passenger's `passportIds` array;
 `selectedPassportId` does not persist. Use:

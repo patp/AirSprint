@@ -2547,9 +2547,10 @@ def _passport_epoch_ms(value: Any, field: str, timezone: str | None = None) -> i
     """Normalize date text, epoch seconds, or epoch milliseconds to ms.
 
     The Android app parses ``yyyy-MM-dd`` in the device's local timezone before
-    reading ``millisecondsSinceEpoch``. Require the equivalent IANA timezone
-    for timezone-less CLI input so the same calendar date survives Android's
-    local-time display path.
+    reading ``millisecondsSinceEpoch``. It does not use a fixed AirSprint HQ or
+    Calgary/Edmonton timezone for passport dates. Require the equivalent IANA
+    timezone for timezone-less CLI input so the same calendar date survives
+    Android's local-time display path.
     """
     if isinstance(value, bool):
         _die(f'"{field}" must be an ISO date or epoch value.', EXIT_VALIDATION)
@@ -2568,7 +2569,8 @@ def _passport_epoch_ms(value: Any, field: str, timezone: str | None = None) -> i
                 if not timezone:
                     _die(
                         f'--timezone is required when "{field}" has no Z or UTC offset. '
-                        "Set AIRSPRINT_TIMEZONE or pass --tz to match the Android device.",
+                        "Set AIRSPRINT_TIMEZONE or pass --tz to match the Android device; "
+                        "passport dates do not default to AirSprint HQ time.",
                         EXIT_VALIDATION,
                     )
                 if not ZoneInfo:
@@ -2632,14 +2634,45 @@ def _passenger_passport_ids(passenger: Any) -> list[str]:
 
 @passport_app.command("list")
 def passport_list(
-    limit: int = typer.Option(100, "--limit"),
+    limit: int = typer.Option(100, "--limit", help="Maximum saved passengers to scan"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """List saved passports (POST /my-passport)."""
+    """List exact passport records embedded in saved AirSprint passengers.
+
+    The owner API has no working passport collection route: POST /my-passport
+    returns 404. POST /my-passenger includes the saved passport objects, so use
+    that single bounded read and preserve AirSprint's field names and values.
+    In particular, ``nationality`` is not relabelled or inferred as ``country``.
+    """
     token = get_api_token(username, password)
-    resp = api_post(token, "/my-passport", {"sort": [], "page": {"limit": limit, "offset": 0}, "filter": {}})
-    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+    resp = api_post(token, "/my-passenger", {
+        "sort": [],
+        "page": {"limit": limit, "offset": 0},
+        "filter": {},
+    })
+    data = resp.get("data", resp)
+    passengers = data.get("items", []) if isinstance(data, dict) else data
+    passports: list[dict[str, Any]] = []
+    if isinstance(passengers, list):
+        for passenger in passengers:
+            if not isinstance(passenger, dict):
+                continue
+            passenger_ref = {
+                key: passenger[key]
+                for key in ("id", "firstName", "lastName")
+                if key in passenger
+            }
+            embedded = passenger.get("passports")
+            if not isinstance(embedded, list):
+                continue
+            for passport in embedded:
+                if not isinstance(passport, dict):
+                    continue
+                record = dict(passport)
+                record["passenger"] = passenger_ref
+                passports.append(record)
+    _out(passports, fmt, compact)
 
 
 @passport_app.command("get")

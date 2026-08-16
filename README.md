@@ -117,12 +117,20 @@ needed. `--us-touching` and `--not-us-touching` are explicit overrides.
 
 ### Passports
 
+`passport list` reads the exact embedded passport records returned by
+`POST /my-passenger`, because the API's `POST /my-passport` collection route
+returns 404. Output preserves AirSprint's `nationality` and
+`issuingAuthority` fields; it does not infer or rename `nationality` as a
+passport `country` field.
+
 Passport creation normalizes `dateOfBirth` and `expirationDate` to epoch
 milliseconds. For timezone-less dates, pass `--tz` (or set
 `AIRSPRINT_TIMEZONE`): Android converts `yyyy-MM-dd` from device-local midnight,
-and the CLI deliberately matches that behavior. The API may return stored
-values in seconds. Passport PATCH is not advertised because number/date
-updates do not persist.
+and the CLI deliberately matches that behavior. Passport dates are **not**
+fixed to AirSprint HQ/Calgary (`America/Edmonton`): use the timezone configured
+on the Android device at the time of entry, such as `America/Toronto` or
+`America/Edmonton`. The API may return stored values in seconds. Passport PATCH
+is not advertised because number/date updates do not persist.
 
 The app displays the first entry in `passportIds`; `selectedPassportId` does
 not persist:

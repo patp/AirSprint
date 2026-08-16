@@ -436,6 +436,44 @@ class AirSprintCliTests(unittest.TestCase):
         self.assertEqual(payload["dateOfBirth"], 315637200000)
         self.assertEqual(payload["expirationDate"], 1893456000000)
 
+    def test_passport_list_uses_exact_embedded_fields_without_country_inference(self) -> None:
+        response = {"data": {"items": [{
+            "id": "passenger-1",
+            "firstName": "Jane",
+            "lastName": "Doe",
+            "passports": [{
+                "id": "passport-1",
+                "passengerId": "passenger-1",
+                "nationality": "CA",
+                "issuingAuthority": "Ottawa",
+            }],
+        }]}}
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_post", return_value=response) as request,
+        ):
+            result = self.runner.invoke(cli.app, ["passport", "list", "--limit", "25"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/my-passenger", {
+            "sort": [],
+            "page": {"limit": 25, "offset": 0},
+            "filter": {},
+        })
+        records = json.loads(result.output)["data"]
+        self.assertEqual(records, [{
+            "id": "passport-1",
+            "passengerId": "passenger-1",
+            "nationality": "CA",
+            "issuingAuthority": "Ottawa",
+            "passenger": {
+                "id": "passenger-1",
+                "firstName": "Jane",
+                "lastName": "Doe",
+            },
+        }])
+        self.assertNotIn("country", records[0])
+
     def test_passport_create_matches_android_local_midnight(self) -> None:
         result = self.runner.invoke(cli.app, [
             "passport", "create",
@@ -451,6 +489,25 @@ class AirSprintCliTests(unittest.TestCase):
         payload = json.loads(result.output)["data"]["payload"]
         self.assertEqual(payload["dateOfBirth"], 11592000000)
         self.assertEqual(payload["expirationDate"], 2022382800000)
+
+    def test_passport_create_uses_device_zone_not_fixed_hq_zone(self) -> None:
+        body = json.dumps({"dateOfBirth": "1980-01-02"})
+        toronto = self.runner.invoke(cli.app, [
+            "passport", "create", "--body", body,
+            "--tz", "America/Toronto", "--dry-run",
+        ])
+        edmonton = self.runner.invoke(cli.app, [
+            "passport", "create", "--body", body,
+            "--tz", "America/Edmonton", "--dry-run",
+        ])
+
+        self.assertEqual(toronto.exit_code, 0, toronto.output)
+        self.assertEqual(edmonton.exit_code, 0, edmonton.output)
+        toronto_ms = json.loads(toronto.output)["data"]["payload"]["dateOfBirth"]
+        edmonton_ms = json.loads(edmonton.output)["data"]["payload"]["dateOfBirth"]
+        self.assertEqual(toronto_ms, 315637200000)
+        self.assertEqual(edmonton_ms, 315644400000)
+        self.assertNotEqual(toronto_ms, edmonton_ms)
 
     def test_passport_create_requires_timezone_for_naive_dates(self) -> None:
         result = self.runner.invoke(cli.app, [
