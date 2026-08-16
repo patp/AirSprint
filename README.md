@@ -130,7 +130,15 @@ and the CLI deliberately matches that behavior. Passport dates are **not**
 fixed to AirSprint HQ/Calgary (`America/Edmonton`): use the timezone configured
 on the Android device at the time of entry, such as `America/Toronto` or
 `America/Edmonton`. The API may return stored values in seconds. Passport PATCH
-is not advertised because number/date updates do not persist.
+for number/date fields is not advertised because those updates do not persist.
+The Android-supported authority-only update is available as a single PATCH:
+
+```bash
+python3 scripts/airsprint_cli.py passport update-authority \
+  --id PASSPORT_UUID --authority 'QUÉBEC' --dry-run
+python3 scripts/airsprint_cli.py passport update-authority \
+  --id PASSPORT_UUID --authority 'QUÉBEC' --confirm
+```
 
 The app displays the first entry in `passportIds`; `selectedPassportId` does
 not persist:

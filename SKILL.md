@@ -176,6 +176,18 @@ Android UI; the CLI refuses ambiguous input without it. This is the Android
 device timezone, not a fixed AirSprint HQ/Calgary timezone. Use
 `America/Edmonton` only when that is the device's configured timezone.
 
+Android 6.1.4 supports an authority-only update with one
+`PATCH /my-passport/{id}` and an `options.issuingAuthority` payload. Copy the
+printed `Authority/Autorité` exactly and use `passport update-authority`; do not
+extend this to passport numbers or dates, which have not persisted reliably:
+
+```bash
+python3 scripts/airsprint_cli.py passport update-authority \
+  --id PASSPORT_UUID --authority 'OTTAWA' --dry-run
+python3 scripts/airsprint_cli.py passport update-authority \
+  --id PASSPORT_UUID --authority 'OTTAWA' --confirm
+```
+
 The app displays the first UUID in a passenger's `passportIds` array;
 `selectedPassportId` does not persist. Use:
 

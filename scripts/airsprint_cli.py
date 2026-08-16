@@ -2686,6 +2686,35 @@ def passport_get(
     _out(api_get(token, f"/my-passport/{passport_id}"), fmt, compact)
 
 
+@passport_app.command("update-authority")
+def passport_update_authority(
+    passport_id: str = typer.Option(..., "--id", help="Passport UUID"),
+    authority: str = typer.Option(..., "--authority", help="Exact Authority/Autorité printed in the passport"),
+    confirm: bool = typer.Option(False, "--confirm"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Update only a passport's issuingAuthority with one PATCH.
+
+    Android 6.1.4 sends PATCH /my-passport/{id} with an ``options`` envelope.
+    Keep this command narrow: passport number and date updates are not exposed
+    because those fields have not persisted reliably in the owner API.
+    """
+    exact_authority = authority.strip()
+    if not exact_authority:
+        _die("--authority cannot be empty.", EXIT_VALIDATION)
+    path = f"/my-passport/{passport_id}"
+    payload = {"options": {"issuingAuthority": exact_authority}}
+    if dry_run:
+        _out({"dry_run": True, "method": "PATCH", "path": path, "payload": payload}, fmt, compact)
+        return
+    if not confirm:
+        _die("--confirm required to update a passport issuing authority.", EXIT_VALIDATION)
+    token = get_api_token(username, password)
+    _out(api_patch(token, path, payload), fmt, compact)
+
+
 @passport_app.command("create")
 def passport_create(
     body: str = typer.Option(..., "--body"),

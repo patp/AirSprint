@@ -474,6 +474,35 @@ class AirSprintCliTests(unittest.TestCase):
         }])
         self.assertNotIn("country", records[0])
 
+    def test_passport_update_authority_sends_one_narrow_patch(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_patch", return_value={"data": True}) as request,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "passport", "update-authority",
+                "--id", "passport-1",
+                "--authority", "  QUÉBEC  ",
+                "--confirm",
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/my-passport/passport-1", {
+            "options": {"issuingAuthority": "QUÉBEC"},
+        })
+
+    def test_passport_update_authority_requires_confirm(self) -> None:
+        with patch.object(cli, "api_patch") as request:
+            result = self.runner.invoke(cli.app, [
+                "passport", "update-authority",
+                "--id", "passport-1",
+                "--authority", "OTTAWA",
+            ])
+
+        self.assertEqual(result.exit_code, cli.EXIT_VALIDATION)
+        self.assertIn("--confirm required", result.output)
+        request.assert_not_called()
+
     def test_passport_create_matches_android_local_midnight(self) -> None:
         result = self.runner.invoke(cli.app, [
             "passport", "create",
