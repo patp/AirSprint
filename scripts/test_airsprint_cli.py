@@ -427,13 +427,40 @@ class AirSprintCliTests(unittest.TestCase):
                 "dateOfBirth": "1980-01-02",
                 "expirationDate": 1893456000,
             }),
+            "--tz", "America/Toronto",
             "--dry-run",
         ])
 
         self.assertEqual(result.exit_code, 0, result.output)
         payload = json.loads(result.output)["data"]["payload"]
-        self.assertEqual(payload["dateOfBirth"], 315619200000)
+        self.assertEqual(payload["dateOfBirth"], 315637200000)
         self.assertEqual(payload["expirationDate"], 1893456000000)
+
+    def test_passport_create_matches_android_local_midnight(self) -> None:
+        result = self.runner.invoke(cli.app, [
+            "passport", "create",
+            "--body", json.dumps({
+                "dateOfBirth": "1970-05-15",
+                "expirationDate": "2034-02-01",
+            }),
+            "--tz", "America/Toronto",
+            "--dry-run",
+        ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        payload = json.loads(result.output)["data"]["payload"]
+        self.assertEqual(payload["dateOfBirth"], 11592000000)
+        self.assertEqual(payload["expirationDate"], 2022382800000)
+
+    def test_passport_create_requires_timezone_for_naive_dates(self) -> None:
+        result = self.runner.invoke(cli.app, [
+            "passport", "create",
+            "--body", json.dumps({"dateOfBirth": "1980-01-02"}),
+            "--dry-run",
+        ], env={"AIRSPRINT_TIMEZONE": ""})
+
+        self.assertEqual(result.exit_code, cli.EXIT_VALIDATION)
+        self.assertIn("--timezone is required", result.output)
 
     def test_passport_make_primary_reorders_without_selected_id(self) -> None:
         with (

@@ -118,15 +118,19 @@ needed. `--us-touching` and `--not-us-touching` are explicit overrides.
 ### Passports
 
 Passport creation normalizes `dateOfBirth` and `expirationDate` to epoch
-milliseconds. The API may return stored values in seconds. Passport PATCH is
-not advertised because number/date updates do not persist.
+milliseconds. For timezone-less dates, pass `--tz` (or set
+`AIRSPRINT_TIMEZONE`): Android converts `yyyy-MM-dd` from device-local midnight,
+and the CLI deliberately matches that behavior. The API may return stored
+values in seconds. Passport PATCH is not advertised because number/date
+updates do not persist.
 
 The app displays the first entry in `passportIds`; `selectedPassportId` does
 not persist:
 
 ```bash
 python3 scripts/airsprint_cli.py passport create \
-  --passenger-id SAVED_PAX_UUID --body "$PASSPORT_JSON" --dry-run
+  --passenger-id SAVED_PAX_UUID --body "$PASSPORT_JSON" \
+  --tz America/Toronto --dry-run
 python3 scripts/airsprint_cli.py passport make-primary \
   --passenger-id SAVED_PAX_UUID --passport-id PASSPORT_UUID --confirm
 ```

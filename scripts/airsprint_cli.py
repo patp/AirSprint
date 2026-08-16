@@ -2543,8 +2543,14 @@ def passenger_delete(
 # ---------------------------------------------------------------------------
 
 
-def _passport_epoch_ms(value: Any, field: str) -> int:
-    """Normalize date text, epoch seconds, or epoch milliseconds to ms."""
+def _passport_epoch_ms(value: Any, field: str, timezone: str | None = None) -> int:
+    """Normalize date text, epoch seconds, or epoch milliseconds to ms.
+
+    The Android app parses ``yyyy-MM-dd`` in the device's local timezone before
+    reading ``millisecondsSinceEpoch``. Require the equivalent IANA timezone
+    for timezone-less CLI input so the same calendar date survives Android's
+    local-time display path.
+    """
     if isinstance(value, bool):
         _die(f'"{field}" must be an ISO date or epoch value.', EXIT_VALIDATION)
     if isinstance(value, (int, float)):
@@ -2559,7 +2565,18 @@ def _passport_epoch_ms(value: Any, field: str) -> int:
             except ValueError:
                 _die(f'"{field}" must be ISO-8601, epoch seconds, or epoch milliseconds.', EXIT_VALIDATION)
             if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=_tz_utc.utc)
+                if not timezone:
+                    _die(
+                        f'--timezone is required when "{field}" has no Z or UTC offset. '
+                        "Set AIRSPRINT_TIMEZONE or pass --tz to match the Android device.",
+                        EXIT_VALIDATION,
+                    )
+                if not ZoneInfo:
+                    _die("Cannot normalize local passport dates: zoneinfo is unavailable.", EXIT_ERROR)
+                try:
+                    parsed = parsed.replace(tzinfo=ZoneInfo(timezone))
+                except Exception:
+                    _die(f"Unknown timezone: {timezone}", EXIT_VALIDATION)
             epoch = parsed.timestamp() * 1000
         else:
             epoch = epoch * 1000 if abs(epoch) < EPOCH_MILLISECONDS_THRESHOLD else epoch
@@ -2576,14 +2593,17 @@ def _passport_epoch_ms(value: Any, field: str) -> int:
     return int(epoch)
 
 
-def _normalize_passport_create(payload: dict[str, Any]) -> dict[str, Any]:
+def _normalize_passport_create(
+    payload: dict[str, Any],
+    timezone: str | None = None,
+) -> dict[str, Any]:
     normalized = dict(payload)
     if isinstance(payload.get("options"), dict):
         normalized["options"] = dict(payload["options"])
     fields = normalized.get("options", normalized)
     for key in ("dateOfBirth", "expirationDate"):
         if key in fields:
-            fields[key] = _passport_epoch_ms(fields[key], key)
+            fields[key] = _passport_epoch_ms(fields[key], key, timezone)
     return normalized
 
 
@@ -2641,6 +2661,7 @@ def passport_create(
         "--passenger-id",
         help="Saved passenger UUID; makes the new passport first in passportIds.",
     ),
+    timezone: Optional[str] = Timezone,
     dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
@@ -2651,13 +2672,14 @@ def passport_create(
     --passenger-id is supplied, the passenger is read before creation and then
     patched once so the new passport becomes the first displayed passport.
     """
-    payload = _normalize_passport_create(_parse_json(body))
+    payload = _normalize_passport_create(_parse_json(body), timezone)
     if dry_run:
         _out({
             "dry_run": True,
             "payload": payload,
             "endpoint": "/my-passport/create",
             "dateUnits": "milliseconds on create; API responses may store seconds",
+            "dateTimezone": timezone,
             "makePrimaryForPassenger": passenger_id,
         }, fmt, compact)
         return

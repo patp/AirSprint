@@ -156,6 +156,10 @@ not supported and is not advertised.
 `POST /my-passport/create` expects `dateOfBirth` and `expirationDate` in epoch
 milliseconds, although later API responses may store seconds. `passport create`
 accepts ISO dates, epoch seconds, or epoch milliseconds and always sends ms.
+Android 6.1.4 parses `yyyy-MM-dd` at device-local midnight before taking
+`millisecondsSinceEpoch`. For timezone-less ISO input, always pass `--tz` (or
+set `AIRSPRINT_TIMEZONE`) so the CLI preserves the same calendar date in the
+Android UI; the CLI refuses ambiguous input without it.
 
 The app displays the first UUID in a passenger's `passportIds` array;
 `selectedPassportId` does not persist. Use:
@@ -165,6 +169,7 @@ The app displays the first UUID in a passenger's `passportIds` array;
 python3 scripts/airsprint_cli.py passport create \
   --passenger-id SAVED_PAX_UUID \
   --body '{"dateOfBirth":"1980-01-02","expirationDate":"2031-03-04"}' \
+  --tz America/Toronto \
   --dry-run
 
 # Reorder an existing passport to first. One passenger GET and one PATCH.
