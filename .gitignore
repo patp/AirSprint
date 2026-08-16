@@ -4,10 +4,9 @@
 # Allow these
 !.gitignore
 !README.md
+!SKILL.md
 !scripts/
 !scripts/**
-!skills/
-!skills/**
 
 # Re-exclude junk inside allowed dirs
 __pycache__/
