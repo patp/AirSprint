@@ -434,27 +434,41 @@ def _download_bytes(url: str, timeout: int = 60) -> bytes:
 
 
 def _manifest_text(pdf: bytes) -> str:
-    """Extract manifest text with the system pdftotext binary, if available."""
-    try:
-        result = subprocess.run(
-            ["pdftotext", "-layout", "-", "-"],
-            input=pdf,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=30,
+    """Convert a manifest with AnyDoc first, then fall back to Poppler."""
+    failures: list[str] = []
+    converters = (
+        ("AnyDoc", ["anydoc", "-", "--format", "pdf"]),
+        ("Poppler", ["pdftotext", "-layout", "-", "-"]),
+    )
+    for name, command in converters:
+        try:
+            result = subprocess.run(
+                command,
+                input=pdf,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=30,
+            )
+        except FileNotFoundError:
+            failures.append(f"{name}: executable not found")
+            continue
+        except subprocess.TimeoutExpired:
+            failures.append(f"{name}: timed out after 30 seconds")
+            continue
+        text = result.stdout.decode("utf-8", errors="replace").strip()
+        if result.returncode == 0 and text:
+            return text
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        failures.append(
+            f"{name}: {detail[:500] or f'exit {result.returncode} with no output'}"
         )
-    except FileNotFoundError:
-        _die("pdftotext is required for `trips show` (brew install poppler).", EXIT_ERROR)
-    except subprocess.TimeoutExpired:
-        _die("pdftotext timed out after 30 seconds.", EXIT_ERROR)
-    if result.returncode != 0:
-        _die(
-            "Could not extract the trip manifest: "
-            + result.stderr.decode("utf-8", errors="replace").strip(),
-            EXIT_ERROR,
-        )
-    return result.stdout.decode("utf-8", errors="replace").strip()
+    _die(
+        "Could not convert the trip manifest with AnyDoc or Poppler. "
+        "Install AnyDoc or `brew install poppler`. Attempts: "
+        + "; ".join(failures),
+        EXIT_ERROR,
+    )
 
 
 def _manifest_highlights(text: str) -> dict[str, Any]:

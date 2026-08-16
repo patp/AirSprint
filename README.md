@@ -25,8 +25,9 @@ python3 scripts/airsprint_cli.py --help
 Tokens are stored with mode 0600 at `~/.airsprint_api_token.json`. Airport and
 aircraft reference data is cached at `~/.airsprint_cache.json` for seven days;
 owner accounts are cached for 15 minutes and invalidated when the login changes.
-`trips show` uses the system `pdftotext` executable (`brew install poppler`) to
-turn the manifest into structured highlights and text.
+`trips show` converts manifests with AnyDoc first, preserving useful Markdown
+structure. If AnyDoc is unavailable or cannot convert a PDF, it automatically
+falls back to Poppler's `pdftotext` (`brew install poppler`).
 
 JSON is the default output. Use `--format human` for readable text or
 `--compact` for token-efficient JSON. `trips list --json` is accepted as an

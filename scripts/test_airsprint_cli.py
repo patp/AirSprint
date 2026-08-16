@@ -534,6 +534,44 @@ class AirSprintCliTests(unittest.TestCase):
         self.assertIn("Departure FBO: Example Aviation", highlights["fboLines"])
         self.assertIn("Martin Bouchard", highlights["passengerLines"])
 
+    def test_manifest_conversion_prefers_anydoc(self) -> None:
+        converted = cli.subprocess.CompletedProcess(
+            args=["anydoc"], returncode=0, stdout=b"# Trip Sheet\nC-GABC\n", stderr=b""
+        )
+        with patch.object(cli.subprocess, "run", return_value=converted) as run:
+            text = cli._manifest_text(b"%PDF test")
+
+        self.assertEqual(text, "# Trip Sheet\nC-GABC")
+        run.assert_called_once_with(
+            ["anydoc", "-", "--format", "pdf"],
+            input=b"%PDF test",
+            stdout=cli.subprocess.PIPE,
+            stderr=cli.subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+
+    def test_manifest_conversion_falls_back_to_poppler(self) -> None:
+        anydoc_failure = cli.subprocess.CompletedProcess(
+            args=["anydoc"], returncode=1, stdout=b"", stderr=b"unsupported PDF"
+        )
+        poppler_success = cli.subprocess.CompletedProcess(
+            args=["pdftotext"], returncode=0, stdout=b"Trip Sheet\nC-GABC\n", stderr=b""
+        )
+        with patch.object(
+            cli.subprocess,
+            "run",
+            side_effect=[anydoc_failure, poppler_success],
+        ) as run:
+            text = cli._manifest_text(b"%PDF test")
+
+        self.assertEqual(text, "Trip Sheet\nC-GABC")
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ["pdftotext", "-layout", "-", "-"],
+        )
+
     def test_skill_flag_prints_live_booking_rules(self) -> None:
         result = self.runner.invoke(cli.app, ["--skill"])
 

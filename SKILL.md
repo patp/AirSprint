@@ -17,8 +17,9 @@ python3 /Users/mb/src/AirSprintCLI/scripts/airsprint_cli.py --skill
 python3 /Users/mb/src/AirSprintCLI/scripts/airsprint_cli.py GROUP COMMAND [OPTIONS]
 ```
 
-Python dependencies are only `typer` and `truststore`. `trips show` additionally
-uses the system `pdftotext` executable from Poppler; this is not a Python package.
+Python dependencies are only `typer` and `truststore`. For manifest conversion,
+`trips show` prefers the `anydoc` executable and falls back automatically to
+Poppler's system `pdftotext`; these are not Python dependencies.
 
 Credentials come from `AIRSPRINT_USERNAME` and `AIRSPRINT_PASSWORD`, or the
 `--username` and `--password` options. The token is stored with mode 0600 in
