@@ -8,6 +8,8 @@ description: Use the local AirSprint owner CLI for trips, booking, passengers, p
 Use this CLI for AirSprint owner operations against `https://api.airsprint.com/api`.
 It follows the current AirSprint Android 6.1.4 API. Retired prod2, follower, and
 known-broken passport PATCH commands are intentionally absent.
+The source audit covers all 104 unique Android method/route contracts; see
+`ANDROID_CONTRACT.md` for the checksum and complete mapping.
 
 ## Invoke
 
@@ -50,8 +52,9 @@ is accepted as an explicit alias. Use `--format human` for human output and
 - A live booking PATCH is sent exactly once and the command stops.
 - Never perform a read-back after a write. Wait at least 8 seconds first.
 - The CLI records live booking writes in `~/.airsprint_last_booking_write.json`.
-- `trips get`, `trips show`, `trips tripsheet`, `leg update-passengers`, and
-  high-level `customs create` default to no probe during that cooldown.
+- `trips get`, `trips show`, `trips tripsheet`, `trips flight-get`, `trips
+  leg-get`, `leg update-passengers`, `leg update-required-info`, and high-level
+  `customs create` default to no probe during that cooldown.
 - Only use `--probe` to override the cooldown when the user explicitly wants an
   immediate read and understands that it can notify the app.
 - The first safe API read may retry once only for `WRONG_VERSION_NUMBER`.
@@ -100,6 +103,20 @@ python3 scripts/airsprint_cli.py leg update-passengers \
 The command refuses to PATCH if any existing leg passenger cannot be mapped to
 a saved passenger UUID. This prevents accidental passenger loss.
 
+For other Android leg-required-information fields, use the source-validated
+command below. If `passengers` appears in the body, it performs the same
+complete-list merge and prints `kept`, `updated`, and `dropped` before one
+PATCH:
+
+```bash
+python3 scripts/airsprint_cli.py leg update-required-info \
+  --leg-id LEG_UUID --body "$ANDROID_LEG_OPTIONS" --dry-run
+python3 scripts/airsprint_cli.py leg update-required-info \
+  --leg-id LEG_UUID --body "$ANDROID_LEG_OPTIONS" --confirm
+```
+
+Never use raw PATCH to send one passenger to either leg endpoint.
+
 ## Booking creation and US destination addresses
 
 The account is implicit in the auth token. Never send top-level `accountId`.
@@ -133,10 +150,13 @@ Cancellation is one confirmed request with no read-back:
 
 ```bash
 python3 scripts/airsprint_cli.py booking cancel \
-  --id BOOKING_CODE --reason "Plans changed" --dry-run
+  --leg-id LEG_UUID --reason "Plans changed" --dry-run
 python3 scripts/airsprint_cli.py booking cancel \
-  --id BOOKING_CODE --reason "Plans changed" --confirm
+  --leg-id LEG_UUID --reason "Plans changed" --confirm
 ```
+
+Android 6.1.4 sends only `legId` and `reason`; do not add a booking code,
+`tripId`, or a list of legs.
 
 ## Saved passengers and passports
 
@@ -165,6 +185,22 @@ python3 scripts/airsprint_cli.py passport delete --id PASSPORT_UUID --confirm
 Do not use `POST /my-passenger/{id}/delete` or
 `POST /my-passport/{id}/delete`; those return 404. Passport number/date PATCH is
 not supported and is not advertised.
+
+Use the complete Android document workflow when a local scan must be attached.
+It initializes the upload, performs one presigned multipart POST, and attaches
+the returned storage path. The limit is 20 MiB and the command never retries a
+storage write:
+
+```bash
+python3 scripts/airsprint_cli.py passport upload-document \
+  --id PASSPORT_UUID --file passport.pdf --dry-run
+python3 scripts/airsprint_cli.py passport upload-document \
+  --id PASSPORT_UUID --file passport.pdf --confirm
+
+python3 scripts/airsprint_cli.py pet upload-document \
+  --id PET_UUID --file vaccination.pdf \
+  --document-type vaccinationDocument --confirm
+```
 
 `POST /my-passport/create` expects `dateOfBirth` and `expirationDate` in epoch
 milliseconds, although later API responses may store seconds. `passport create`
@@ -248,6 +284,21 @@ owner to complete the signature in the app.
 - `raw api-patch` and `raw api-delete` require `--confirm` or `--dry-run`.
 - A raw trip/leg GET observes the same post-write no-probe cooldown.
 - Raw commands are escape hatches, not permission to bypass typed safeguards.
+
+## Other Android-backed functions
+
+- `auth status` is local cache status only; use `auth verify` for exactly one
+  live `POST /user/authenticate` validation.
+- Use `device register-token` and `device delete-token` for Android-compatible
+  notification registration payloads.
+- Use `trips flight-get` and `trips leg-get` for one guarded detail read; they
+  never retry or poll.
+- Use `booking baggage-types`, `quote aircraft-get`, `customs link-get`, and
+  `user get` for the matching Android detail functions.
+- Use `files resolve --application-url URL` for Android's bounded path lookup
+  plus avatar fallback. It is not an unbounded probe loop.
+- Use `content get`, `content faq-get`, and `content policy-get` for exact
+  source-backed detail routes.
 
 ## Exit codes
 

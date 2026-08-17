@@ -3,6 +3,10 @@
 Agent-safe command-line access to the current `api.airsprint.com` owner API,
 audited against AirSprint Android 6.1.4 (version code 127).
 
+The offline source audit found 111 Android repository calls and 104 unique
+method/route contracts. All 104 have CLI coverage; the complete matrix and APK
+checksum are in [ANDROID_CONTRACT.md](ANDROID_CONTRACT.md).
+
 The canonical agent instructions are in [SKILL.md](SKILL.md) and can also be
 printed directly:
 
@@ -99,6 +103,19 @@ python3 scripts/airsprint_cli.py leg update-passengers \
 The dry run shows `kept`, `added`, and `dropped`. If any current passenger
 cannot be safely mapped, the CLI refuses the PATCH.
 
+Android's broader required-information PATCH is also available. When
+`options.passengers` is supplied, it uses the same full-list merge protection:
+
+```bash
+python3 scripts/airsprint_cli.py leg update-required-info \
+  --leg-id LEG_UUID --body "$REQUIRED_INFO_JSON" --dry-run
+python3 scripts/airsprint_cli.py leg update-required-info \
+  --leg-id LEG_UUID --body "$REQUIRED_INFO_JSON" --confirm
+```
+
+It accepts only fields emitted by Android 6.1.4 and performs at most one
+guarded leg GET followed by one PATCH, with no read-back.
+
 ### US bookings
 
 The account is implicit in the token; top-level `accountId` is rejected. A
@@ -160,6 +177,20 @@ python3 scripts/airsprint_cli.py passport delete --id PASSPORT_UUID --confirm
 
 The old `POST .../{id}/delete` routes are not used.
 
+Complete document uploads use Android's three steps: API initialization, one
+presigned multipart storage POST, then API attachment. Files are capped at the
+same 20 MiB limit:
+
+```bash
+python3 scripts/airsprint_cli.py passport upload-document \
+  --id PASSPORT_UUID --file passport.pdf --dry-run
+python3 scripts/airsprint_cli.py passport upload-document \
+  --id PASSPORT_UUID --file passport.pdf --confirm
+python3 scripts/airsprint_cli.py pet upload-document \
+  --id PET_UUID --file vaccination.pdf \
+  --document-type vaccinationDocument --confirm
+```
+
 ### Canadian customs
 
 ```bash
@@ -188,8 +219,9 @@ AirSprint app.
 
 | Group | Purpose |
 |---|---|
-| `auth` | Login, status, logout, 2FA, reset |
-| `user` | Profile and preferences |
+| `auth` | Login, local status, one-shot live verification, logout, 2FA, reset |
+| `device` | Android-compatible notification-token registration and deletion |
+| `user`, `account` | Profiles, preferences, owner accounts and access users |
 | `booking` | Prep, create, cancel, empty/shared flights, holds |
 | `explore` | Empty and shared flights; use `flights --compact` |
 | `network` | Current connections and sharing groups |
@@ -197,6 +229,7 @@ AirSprint app.
 | `customs` | Canadian declarations and date correction |
 | `quote`, `hours` | Quotes, airports, aircraft, Hours Exchange |
 | `messages`, `feedback` | Notifications and feedback |
+| `files`, `content` | File resolution, FAQ, policy, system and concierge content |
 | `raw` | Current API escape hatches with PATCH/DELETE safeguards |
 
 Retired prod2, follower/social, duplicate booking, unsupported invoice,

@@ -1,4 +1,5 @@
 import json
+import re
 import stat
 import tempfile
 import threading
@@ -154,7 +155,7 @@ class AirSprintCliTests(unittest.TestCase):
 
         self.assertEqual(first, ["account-id"])
         self.assertEqual(second, ["account-id"])
-        request.assert_called_once_with("token", "/my-accounts", {})
+        request.assert_called_once_with("token", "/my-accounts")
 
     def test_personalized_cache_is_invalidated_for_a_different_token(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -258,6 +259,190 @@ class AirSprintCliTests(unittest.TestCase):
             "hours": 2.0,
             "type": "BUY",
         })
+
+    def test_notification_settings_match_android_get_and_patch_contract(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_get", return_value={"data": {}}) as read,
+            patch.object(cli, "api_patch", return_value={"data": {}}) as write,
+        ):
+            get_result = self.runner.invoke(cli.app, ["messages", "settings"])
+            update_result = self.runner.invoke(cli.app, [
+                "messages", "settings-update",
+                "--body", '{"weeklyDigest":true}',
+            ])
+
+        self.assertEqual(get_result.exit_code, 0, get_result.output)
+        self.assertEqual(update_result.exit_code, 0, update_result.output)
+        read.assert_called_once_with("token", "/my-notification-settings")
+        write.assert_called_once_with(
+            "token",
+            "/my-notification-settings/update",
+            {"options": {"weeklyDigest": True}},
+        )
+
+    def test_user_set_preferences_uses_same_android_patch_contract(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_patch", return_value={}) as request,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "user", "set-preferences",
+                "--body", '{"airsprintPromotions":false}',
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with(
+            "token",
+            "/my-notification-settings/update",
+            {"options": {"airsprintPromotions": False}},
+        )
+
+    def test_account_user_update_uses_patch(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_patch", return_value={}) as request,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "account", "user-update",
+                "--ids", "user-id",
+                "--roles", "OWNER",
+                "--confirm",
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/account-user/update", {
+            "ids": ["user-id"],
+            "options": {"roleNames": ["OWNER"]},
+        })
+
+    def test_reserved_days_is_read_only_android_list_request(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(
+                cli,
+                "api_post",
+                return_value={"data": {"items": [{"id": "day-1"}, {"id": "day-2"}]}},
+            ) as request,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "booking", "reserved-days", "--limit", "1",
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/reserve-day", {
+            "sort": [],
+            "page": {"limit": 1, "offset": 0},
+        })
+        self.assertEqual(json.loads(result.output)["data"], [{"id": "day-1"}])
+
+    def test_recent_leg_searches_use_get_and_limit_locally(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(
+                cli,
+                "api_get",
+                return_value={"data": {"items": [{"id": "one"}, {"id": "two"}]}},
+            ) as request,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "trips", "recent", "--limit", "1",
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/leg/recent/list")
+        self.assertEqual(json.loads(result.output)["data"], [{"id": "one"}])
+
+    def test_airport_nearest_uses_flat_android_payload(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_post", return_value={"data": {"items": []}}) as request,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "quote", "airport-nearest", "--lat", "45.5", "--lng", "-73.6",
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/airport/nearest", {
+            "latitude": 45.5,
+            "longitude": -73.6,
+        })
+
+    def test_saved_airports_use_airport_saved_filter(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_post", return_value={"data": {"items": []}}) as request,
+        ):
+            result = self.runner.invoke(cli.app, ["quote", "saved-airports"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/airport", {
+            "sort": [],
+            "page": {"limit": 100, "offset": 0},
+            "filter": {"saved": True},
+        })
+
+    def test_address_autocomplete_uses_android_field_names(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_post", return_value={"data": {"items": []}}) as request,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "address", "autocomplete",
+                "--query", " 1 Main ",
+                "--city", "Montreal",
+                "--state", "QC",
+                "--country-code", "CA",
+                "--session-token", "session-id",
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/address/autocomplete", {
+            "input": "1 Main",
+            "language": "en",
+            "city": "Montreal",
+            "stateOrProvince": "QC",
+            "sessionToken": "session-id",
+            "countryCode": "ca",
+        })
+
+    def test_customs_link_create_uses_exact_leg_id_payload(self) -> None:
+        result = self.runner.invoke(cli.app, [
+            "customs", "link-create", "--leg-id", "leg-id", "--dry-run",
+        ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.output)["data"]
+        self.assertEqual(data["path"], "/canadian-customs-declaration-link/create")
+        self.assertEqual(data["payload"], {"legId": "leg-id"})
+
+    def test_removed_routes_are_not_advertised(self) -> None:
+        removed = {
+            "account": "user-get",
+            "passport": "get",
+            "customs": "create-public",
+            "content": "required-info",
+            "network": "group-get",
+            "user": "me",
+        }
+        root_command = cli.typer.main.get_command(cli.app)
+        for group, command in removed.items():
+            with self.subTest(group=group, command=command):
+                group_command = root_command.commands[group]
+                self.assertNotIn(command, group_command.commands)
+
+    def test_all_booking_post_writes_set_the_probe_guard(self) -> None:
+        with (
+            patch.object(cli, "_record_booking_write") as record,
+            patch.object(cli, "_http", return_value={}),
+        ):
+            for path in sorted(cli._BOOKING_WRITE_POST_PATHS):
+                cli.api_post("token", path, {})
+
+        self.assertEqual(
+            [call.args[0] for call in record.call_args_list],
+            sorted(cli._BOOKING_WRITE_POST_PATHS),
+        )
 
     def test_network_group_create_dry_run_has_current_payload(self) -> None:
         result = self.runner.invoke(cli.app, [
@@ -691,6 +876,485 @@ class AirSprintCliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("Non-negotiable live-booking safety", result.output)
         self.assertIn("leg update-passengers", result.output)
+
+    def test_android_authenticate_uses_exact_body_without_auth_header(self) -> None:
+        with patch.object(cli, "_http", return_value={"data": {"active": True}}) as request:
+            response = cli.api_authenticate("auth-token")
+
+        self.assertEqual(response, {"data": {"active": True}})
+        self.assertEqual(request.call_args.args, (
+            "POST", f"{cli.API_BASE_URL}/user/authenticate",
+        ))
+        self.assertEqual(
+            json.loads(request.call_args.kwargs["data"]),
+            {"authToken": "auth-token"},
+        )
+        self.assertNotIn("x-airsprint-auth-token", request.call_args.kwargs["headers"])
+        self.assertTrue(request.call_args.kwargs["retry_first_ssl"])
+
+    def test_api_post_none_omits_body_like_android_baggage_request(self) -> None:
+        with patch.object(cli, "_http", return_value={}) as request:
+            cli.api_post("token", "/baggage-type")
+
+        self.assertIsNone(request.call_args.kwargs["data"])
+
+    def test_device_token_contracts_match_android(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_post", return_value={}) as request,
+        ):
+            registered = self.runner.invoke(cli.app, [
+                "device", "register-token",
+                "--registration-token", " push-token ",
+                "--device-type", " android ",
+                "--device-name", " Pixel ",
+            ])
+            deleted = self.runner.invoke(cli.app, [
+                "device", "delete-token",
+                "--registration-token", " push-token ",
+                "--confirm",
+            ])
+
+        self.assertEqual(registered.exit_code, 0, registered.output)
+        self.assertEqual(deleted.exit_code, 0, deleted.output)
+        self.assertEqual(request.call_args_list[0].args, (
+            "token", "/account-notification-registration-token-register", {
+                "registrationToken": "push-token",
+                "deviceType": "android",
+                "deviceName": "Pixel",
+            },
+        ))
+        self.assertEqual(request.call_args_list[1].args, (
+            "token", "/account-notification-registration-token-delete", {
+                "registrationToken": "push-token",
+            },
+        ))
+
+    def test_account_user_patch_matches_android_options_contract(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_patch", return_value={}) as request,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "account", "user-patch",
+                "--id", "account-user-id",
+                "--body", json.dumps({
+                    "firstName": "Jane",
+                    "savedAirportIds": ["airport-id"],
+                }),
+                "--confirm",
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with(
+            "token", "/my-account-user/account-user-id", {
+                "id": "account-user-id",
+                "options": {
+                    "firstName": "Jane",
+                    "savedAirportIds": ["airport-id"],
+                },
+            },
+        )
+
+    def test_required_info_merges_onto_full_passenger_list(self) -> None:
+        leg = {"data": {"passengers": [
+            {
+                "passengerId": "saved-1",
+                "firstName": "Jane",
+                "lastName": "Doe",
+                "customsDeclarationId": "customs-1",
+                "destinationAddress": {"city": "Las Vegas"},
+            },
+            {
+                "passenger": {"id": "saved-2", "firstName": "John", "lastName": "Doe"},
+                "passport": {"id": "passport-2"},
+            },
+        ]}}
+        update = {
+            "passengers": [{
+                "id": "saved-1",
+                "passport": {"id": "passport-1", "issuingAuthority": "CANADA"},
+            }],
+        }
+        with (
+            patch.object(cli, "_guard_booking_probe"),
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_get", return_value=leg) as read,
+            patch.object(cli, "api_patch", return_value={}) as write,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "leg", "update-required-info",
+                "--leg-id", "leg-id",
+                "--body", json.dumps(update),
+                "--confirm",
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        read.assert_called_once_with("token", "/leg/leg-id")
+        write.assert_called_once_with("token", "/leg/leg-id/required-info", {
+            "options": {
+                "passengers": [
+                    {
+                        "id": "saved-1",
+                        "customsDeclarationId": "customs-1",
+                        "destinationAddress": {"city": "Las Vegas"},
+                        "passport": {"id": "passport-1", "issuingAuthority": "CANADA"},
+                    },
+                    {"id": "saved-2", "passport": {"id": "passport-2"}},
+                ],
+            },
+        })
+        plan = json.loads(result.output)["data"]["plan"]
+        self.assertEqual(plan["dropped"], [])
+        self.assertEqual([item["id"] for item in plan["kept"]], ["saved-2"])
+
+    def test_android_detail_commands_use_verified_get_routes(self) -> None:
+        cases = [
+            (["user", "get", "--id", "user-id"], "/user/user-id"),
+            (["files", "get", "--id", "file-id"], "/my-file/file-id"),
+            (["files", "public-get", "--id", "file-id"], "/file-public/file-id"),
+            (["customs", "link-get", "--id", "link-id"], "/canadian-customs-declaration-link/link-id"),
+            (["quote", "aircraft-get", "--id", "aircraft-id"], "/aircraft/aircraft-id"),
+            (["content", "get", "--id", "content-id"], "/content/content-id"),
+            (["content", "faq-get", "--id", "faq-id"], "/faq/faq-id"),
+            (["content", "policy-get", "--id", "policy-id"], "/policy/policy-id"),
+        ]
+        for arguments, path in cases:
+            with self.subTest(arguments=arguments):
+                with (
+                    patch.object(cli, "get_api_token", return_value="token"),
+                    patch.object(cli, "api_get", return_value={}) as request,
+                ):
+                    result = self.runner.invoke(cli.app, arguments)
+                    self.assertEqual(result.exit_code, 0, result.output)
+                    request.assert_called_once_with("token", path)
+
+    def test_booked_android_detail_commands_guard_and_read_once(self) -> None:
+        cases = [
+            (["trips", "flight-get", "--id", "flight-id"], "/my-flight/flight-id"),
+            (["trips", "leg-get", "--id", "leg-id"], "/my-leg/leg-id"),
+        ]
+        for arguments, path in cases:
+            with self.subTest(arguments=arguments):
+                with (
+                    patch.object(cli, "_guard_booking_probe") as guard,
+                    patch.object(cli, "get_api_token", return_value="token"),
+                    patch.object(cli, "api_get", return_value={}) as request,
+                ):
+                    result = self.runner.invoke(cli.app, arguments)
+                    self.assertEqual(result.exit_code, 0, result.output)
+                    guard.assert_called_once_with(False)
+                    request.assert_called_once_with("token", path)
+
+    def test_booked_android_detail_gets_never_retry(self) -> None:
+        for path in ("/my-flight/flight-id", "/my-leg/leg-id"):
+            with self.subTest(path=path), patch.object(cli, "_http", return_value={}) as request:
+                cli.api_get("token", path)
+                self.assertFalse(request.call_args.kwargs["retry_first_ssl"])
+
+    def test_baggage_types_uses_bodyless_source_request(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_post", return_value={"data": {"items": []}}) as request,
+        ):
+            result = self.runner.invoke(cli.app, ["booking", "baggage-types"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/baggage-type")
+
+    def test_bodyless_android_collections_do_not_send_empty_json(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_post", return_value={"data": {"items": []}}) as request,
+        ):
+            accounts = self.runner.invoke(cli.app, ["user", "accounts"])
+            pets = self.runner.invoke(cli.app, ["pet", "list", "--limit", "10"])
+
+        self.assertEqual(accounts.exit_code, 0, accounts.output)
+        self.assertEqual(pets.exit_code, 0, pets.output)
+        self.assertEqual(request.call_args_list[0].args, ("token", "/my-accounts"))
+        self.assertEqual(request.call_args_list[1].args, ("token", "/my-pet"))
+
+    def test_airport_search_uses_android_name_filter(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_post", return_value={"data": {"items": []}}) as request,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "quote", "airports", "--query", "Toronto", "--no-cache",
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/airport", {
+            "sort": [],
+            "page": {"limit": 20, "offset": 0},
+            "filter": {"name": "Toronto"},
+        })
+
+    def test_pet_update_adds_android_options_envelope(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_patch", return_value={}) as request,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "pet", "update", "--id", "pet-id", "--body", '{"name":"Milo"}',
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/my-pet/pet-id", {
+            "options": {"name": "Milo"},
+        })
+
+    def test_cancel_uses_one_android_leg_request(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_post", return_value={}) as request,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "booking", "cancel",
+                "--leg-id", "leg-id",
+                "--reason", " Plans changed ",
+                "--confirm",
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/cancel-own", {
+            "legId": "leg-id", "reason": "Plans changed",
+        })
+
+    def test_booking_survey_uses_leg_id_not_trip_id(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_post", return_value={}) as request,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "trips", "flight-feedback",
+                "--leg-id", "leg-id",
+                "--body", '{"bookingExperience":5}',
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/booking-survey/create", {
+            "legId": "leg-id", "bookingExperience": 5,
+        })
+
+    def test_simple_quote_includes_android_pax_field(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "_parse_local_dt", return_value="2026-09-01T14:00:00Z"),
+            patch.object(cli, "_resolve_airport", side_effect=["dep-id", "arr-id"]),
+            patch.object(cli, "_get_default_aircraft", return_value="aircraft-id"),
+            patch.object(cli, "api_post", return_value={}) as request,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "quote", "flight",
+                "--from", "CYYZ", "--to", "KLAS",
+                "--date", "2026-09-01T10:00", "--pax", "3",
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/flight-quote", {"legs": [{
+            "aircraftId": "aircraft-id",
+            "departureAirportId": "dep-id",
+            "arrivalAirportId": "arr-id",
+            "departureDateUTC": "2026-09-01T14:00:00Z",
+            "pax": 3,
+        }]})
+
+    def test_avatar_reads_json_url_before_optional_download(self) -> None:
+        response = {"data": {"url": "https://example.invalid/avatar.jpg"}}
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_get", return_value=response) as request,
+            patch.object(cli, "_download_bytes") as download,
+        ):
+            result = self.runner.invoke(cli.app, ["user", "avatar", "--id", "user-id"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/my-user/avatar/user-id")
+        download.assert_not_called()
+        self.assertEqual(
+            json.loads(result.output)["data"]["url"],
+            "https://example.invalid/avatar.jpg",
+        )
+
+    def test_2fa_setup_and_disable_send_android_empty_json(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_post", return_value={}) as request,
+        ):
+            setup = self.runner.invoke(cli.app, ["auth", "2fa-setup"])
+            disabled = self.runner.invoke(
+                cli.app,
+                ["auth", "2fa-disable", "--confirm"],
+            )
+
+        self.assertEqual(setup.exit_code, 0, setup.output)
+        self.assertEqual(disabled.exit_code, 0, disabled.output)
+        self.assertEqual(
+            request.call_args_list[0].args,
+            ("token", "/user/2fa/setup", {}),
+        )
+        self.assertEqual(
+            request.call_args_list[1].args,
+            ("token", "/user/2fa/disable", {}),
+        )
+
+    def test_passport_document_upload_runs_android_three_step_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            document = Path(temporary) / "passport.pdf"
+            document.write_bytes(b"%PDF-test")
+            init = {
+                "data": {
+                    "presignedUpload": {
+                        "url": "https://storage.invalid/upload",
+                        "fields": {"key": "passport/key"},
+                    },
+                    "storagePath": "passport/key",
+                }
+            }
+            attached = {"data": {"attached": True}}
+            with (
+                patch.object(cli, "get_api_token", return_value="token"),
+                patch.object(cli, "api_post", side_effect=[init, attached]) as request,
+                patch.object(cli, "_post_presigned_multipart", return_value=204) as upload,
+            ):
+                result = self.runner.invoke(cli.app, [
+                    "passport", "upload-document",
+                    "--id", "passport-id",
+                    "--file", str(document),
+                    "--confirm",
+                ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(request.call_args_list[0].args, (
+            "token", "/my-passport/document/upload-init", {
+                "passportId": "passport-id",
+                "fileName": "passport.pdf",
+                "contentType": "application/pdf",
+                "maxFileSizeBytes": 20 * 1024 * 1024,
+            },
+        ))
+        upload.assert_called_once()
+        self.assertEqual(upload.call_args.args[0], "https://storage.invalid/upload")
+        self.assertEqual(upload.call_args.args[1], {"key": "passport/key"})
+        self.assertEqual(request.call_args_list[1].args, (
+            "token", "/my-passport/document/attach", {
+                "passportId": "passport-id",
+                "fileName": "passport.pdf",
+                "contentType": "application/pdf",
+                "storagePath": "passport/key",
+            },
+        ))
+
+    def test_pet_document_upload_uses_android_document_type_and_mime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            document = Path(temporary) / "receipt.png"
+            document.write_bytes(b"PNG-test")
+            init = {
+                "data": {
+                    "presignedUpload": {
+                        "url": "https://storage.invalid/upload",
+                        "fields": {"key": "pet/key"},
+                    },
+                    "storagePath": "pet/key",
+                }
+            }
+            with (
+                patch.object(cli, "get_api_token", return_value="token"),
+                patch.object(cli, "api_post", side_effect=[init, {}]) as request,
+                patch.object(cli, "_post_presigned_multipart", return_value=201),
+            ):
+                result = self.runner.invoke(cli.app, [
+                    "pet", "upload-document",
+                    "--id", "pet-id",
+                    "--file", str(document),
+                    "--document-type", "importFormReceipt",
+                    "--confirm",
+                ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(request.call_args_list[0].args[2], {
+            "petId": "pet-id",
+            "documentType": "importFormReceipt",
+            "fileName": "receipt.png",
+            "contentType": "image/png",
+            "maxFileSizeBytes": 20 * 1024 * 1024,
+        })
+        self.assertEqual(request.call_args_list[1].args[2], {
+            "petId": "pet-id",
+            "documentType": "importFormReceipt",
+            "fileName": "receipt.png",
+            "contentType": "image/png",
+            "storagePath": "pet/key",
+        })
+
+    def test_files_resolve_uses_android_path_filter_first(self) -> None:
+        response = {"data": {"items": [{"url": "https://files.invalid/item"}]}}
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_post", return_value=response) as request,
+            patch.object(cli, "api_get") as user_read,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "files", "resolve",
+                "--application-url", "https://app.invalid/documents/passport.pdf",
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_called_once_with("token", "/my-file", {
+            "filter": {"path": "documents/passport.pdf"},
+            "page": {"limit": 1, "offset": 0},
+        })
+        user_read.assert_not_called()
+
+    def test_files_resolve_uses_bounded_android_avatar_fallback(self) -> None:
+        responses = [
+            {"data": {"items": []}},
+            {"data": {"items": []}},
+            {"data": {"items": [{"applicationUrl": "https://files.invalid/default"}]}},
+        ]
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_post", side_effect=responses) as request,
+            patch.object(cli, "api_get", return_value={"data": {"id": "user-id"}}) as user_read,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "files", "resolve", "--application-url", "/missing/path",
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        user_read.assert_called_once_with("token", "/me")
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(request.call_args_list[1].args[2]["filter"]["role"], "user_picture")
+        self.assertEqual(request.call_args_list[2].args[2]["filter"]["role"], "default_file")
+
+    def test_android_contract_matrix_has_104_registered_command_mappings(self) -> None:
+        contract = (Path(__file__).resolve().parents[1] / "ANDROID_CONTRACT.md").read_text()
+        expected_counts = {"GET": 20, "PATCH": 11, "DELETE": 8, "POST": 65}
+        root = cli.typer.main.get_command(cli.app)
+        active_method = None
+        counts = {method: 0 for method in expected_counts}
+        for line in contract.splitlines():
+            heading = re.fullmatch(r"### (GET|PATCH|DELETE|POST) \(\d+\)", line)
+            if heading:
+                active_method = heading.group(1)
+                continue
+            if line.startswith("## "):
+                active_method = None
+            if not active_method or not line.startswith("| `/"):
+                continue
+            counts[active_method] += 1
+            columns = line.split("|")
+            for command_path in re.findall(r"`([^`]+)`", columns[2]):
+                parts = command_path.split()
+                self.assertEqual(len(parts), 2, command_path)
+                group = root.commands.get(parts[0])
+                self.assertIsNotNone(group, command_path)
+                self.assertIn(parts[1], group.commands, command_path)
+
+        self.assertEqual(counts, expected_counts)
+        self.assertEqual(sum(counts.values()), 104)
 
 
 if __name__ == "__main__":

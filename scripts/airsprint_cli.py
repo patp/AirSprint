@@ -25,6 +25,7 @@ if __name__ == "__main__" and sys.argv[1:] == ["--skill"]:
     raise SystemExit(0)
 
 import json
+import mimetypes
 import os
 import re
 import ssl
@@ -34,7 +35,7 @@ import time
 from datetime import datetime, timezone as _tz_utc
 from typing import Any, Callable, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 try:
@@ -49,6 +50,8 @@ import typer
 # ---------------------------------------------------------------------------
 
 API_BASE_URL = "https://api.airsprint.com/api"
+ANDROID_APP_VERSION = "6.1.4"
+ANDROID_APP_VERSION_CODE = 127
 API_TOKEN_CACHE = Path.home() / ".airsprint_api_token.json"
 DATA_CACHE = Path.home() / ".airsprint_cache.json"  # local mirror: airports, aircraft
 BOOKING_WRITE_GUARD = Path.home() / ".airsprint_last_booking_write.json"
@@ -56,6 +59,7 @@ BOOKING_READ_COOLDOWN_SECONDS = 8
 DATA_CACHE_TTL = 7 * 24 * 3600  # 7 days
 ACCOUNT_CACHE_TTL = 15 * 60
 EPOCH_MILLISECONDS_THRESHOLD = 10_000_000_000
+ANDROID_DOCUMENT_MAX_BYTES = 20 * 1024 * 1024
 
 _API_REQUEST_COUNT = 0
 _API_REQUEST_LOCK = threading.Lock()
@@ -66,20 +70,41 @@ _DATA_CACHE_MEMORY_MTIME_NS: int | None = None
 _DATA_CACHE_MEMORY_PATH: Path | None = None
 _AIRPORT_BY_ID: dict[str, tuple[str | None, str]] | None = None
 _READ_ONLY_POST_PATHS = frozenset({
+    "/account-user-role",
+    "/address/autocomplete",
     "/airport",
+    "/airport/nearest",
     "/aircraft",
+    "/baggage-type",
+    "/concierge",
+    "/faq",
+    "/faq-category",
+    "/flight-quote",
     "/my-accounts",
+    "/my-account-users",
     "/my-aircraft",
+    "/my-file",
     "/my-flights",
+    "/my-hours-exchange-listing",
     "/my-leg",
     "/my-notifications",
     "/my-passenger",
-    "/my-passport",
     "/my-pet",
-    "/my-user",
     "/my-user/connections",
     "/my-user/groups",
     "/myCanadianCustomsDeclaration",
+    "/policy",
+    "/policy-category",
+    "/reserve-day",
+    "/system-notice",
+    "/trip/misc-cost-estimate",
+})
+_BOOKING_WRITE_POST_PATHS = frozenset({
+    "/cancel-own",
+    "/empty-leg/book",
+    "/flight/lock",
+    "/shared-flight/book",
+    "/trip/book",
 })
 
 # Exit codes
@@ -183,6 +208,153 @@ def _http(
                 json.dumps({"status": "error", "message": msg})
             ) from exc
     raise AssertionError("unreachable")
+
+
+def _multipart_value(value: Any, field: str) -> str:
+    """Convert one presigned POST field without permitting header injection."""
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, separators=(",", ":"))
+    text = str(value)
+    if "\r" in text or "\n" in text:
+        _die(f'Presigned upload field "{field}" contains a newline.', EXIT_ERROR)
+    return text
+
+
+def _multipart_form_body(
+    fields: dict[str, Any],
+    file_name: str,
+    content_type: str,
+    content: bytes,
+) -> tuple[bytes, str]:
+    """Build the form POST used by Android for presigned storage uploads."""
+    boundary = f"----AirSprintCLI{os.getpid():x}{time.time_ns():x}"
+    chunks: list[bytes] = []
+    for raw_name, raw_value in fields.items():
+        name = _multipart_value(raw_name, "name").replace('"', "%22")
+        value = _multipart_value(raw_value, name)
+        chunks.extend([
+            f"--{boundary}\r\n".encode(),
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+            value.encode(),
+            b"\r\n",
+        ])
+    safe_name = Path(file_name).name.replace('"', "%22").replace("\r", "").replace("\n", "")
+    chunks.extend([
+        f"--{boundary}\r\n".encode(),
+        f'Content-Disposition: form-data; name="file"; filename="{safe_name}"\r\n'.encode(),
+        f"Content-Type: {content_type}\r\n\r\n".encode(),
+        content,
+        b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    ])
+    return b"".join(chunks), boundary
+
+
+def _post_presigned_multipart(
+    url: str,
+    fields: dict[str, Any],
+    file_path: Path,
+    content_type: str,
+) -> int:
+    """Send Android's one-shot multipart POST to presigned object storage."""
+    content = file_path.read_bytes()
+    body, boundary = _multipart_form_body(fields, file_path.name, content_type, content)
+    request = Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urlopen(request, timeout=60, context=_ssl_ctx()) as response:
+            status = int(getattr(response, "status", response.getcode()))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(json.dumps({
+            "status": "error",
+            "http_code": exc.code,
+            "message": f"Presigned storage upload failed: {detail}",
+        })) from exc
+    except (OSError, URLError, ssl.SSLError) as exc:
+        raise RuntimeError(json.dumps({
+            "status": "error",
+            "message": f"Presigned storage upload failed: {exc}",
+        })) from exc
+    if not 200 <= status < 300:
+        raise RuntimeError(json.dumps({
+            "status": "error",
+            "http_code": status,
+            "message": "Presigned storage upload failed",
+        }))
+    return status
+
+
+def _document_file(file_value: str, content_type: str | None) -> tuple[Path, str]:
+    path = Path(file_value).expanduser()
+    if not path.is_file():
+        _die(f"Document file not found: {path}", EXIT_NOT_FOUND)
+    size = path.stat().st_size
+    if size > ANDROID_DOCUMENT_MAX_BYTES:
+        _die(
+            f"Document is {size} bytes; Android limits uploads to "
+            f"{ANDROID_DOCUMENT_MAX_BYTES} bytes.",
+            EXIT_VALIDATION,
+        )
+    mime = (content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream").strip()
+    if not mime or "\r" in mime or "\n" in mime:
+        _die("Invalid document content type.", EXIT_VALIDATION)
+    return path, mime
+
+
+def _android_document_upload(
+    token: str,
+    *,
+    file_path: Path,
+    content_type: str,
+    init_path: str,
+    attach_path: str,
+    base_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Run Android's init -> presigned multipart POST -> attach workflow."""
+    init_payload = {
+        **base_payload,
+        "fileName": file_path.name,
+        "contentType": content_type,
+        "maxFileSizeBytes": ANDROID_DOCUMENT_MAX_BYTES,
+    }
+    init_response = api_post(token, init_path, init_payload)
+    init_data = _response_data(init_response)
+    if not isinstance(init_data, dict):
+        _die("Upload init returned no data object.", EXIT_ERROR)
+    presigned = init_data.get("presignedUpload")
+    storage_path = init_data.get("storagePath")
+    if not isinstance(presigned, dict) or not isinstance(storage_path, str):
+        _die("Upload init omitted presignedUpload or storagePath.", EXIT_ERROR)
+    upload_url = presigned.get("url")
+    upload_fields = presigned.get("fields")
+    if not isinstance(upload_url, str) or not isinstance(upload_fields, dict):
+        _die("Upload init returned an invalid presigned POST.", EXIT_ERROR)
+    upload_status = _post_presigned_multipart(
+        upload_url,
+        upload_fields,
+        file_path,
+        content_type,
+    )
+    attach_payload = {
+        **base_payload,
+        "fileName": file_path.name,
+        "contentType": content_type,
+        "storagePath": storage_path,
+    }
+    attached = api_post(token, attach_path, attach_payload)
+    return {
+        "result": attached,
+        "fileName": file_path.name,
+        "contentType": content_type,
+        "storagePath": storage_path,
+        "storageUploadStatus": upload_status,
+        "message": "Initialized, uploaded, and attached using the Android workflow.",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +468,12 @@ def api_get(
     if params:
         separator = "&" if "?" in path else "?"
         path = f"{path}{separator}{urlencode(params)}"
-    live_booking_read = path.startswith(("/trip/", "/leg/"))
+    live_booking_read = path.startswith((
+        "/trip/",
+        "/leg/",
+        "/my-flight/",
+        "/my-leg/",
+    ))
     return _http(
         "GET",
         f"{API_BASE_URL}{path}",
@@ -310,7 +487,7 @@ def api_get(
 
 
 def api_post(token: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
-    if path in {"/cancel-own", "/trip/book"}:
+    if path in _BOOKING_WRITE_POST_PATHS:
         _record_booking_write(path)
     result = _http(
         "POST",
@@ -320,11 +497,23 @@ def api_post(token: str, path: str, body: dict[str, Any] | None = None) -> dict[
             "Content-Type": "application/json",
             "Accept": "application/json",
         },
-        data=json.dumps(body or {}).encode("utf-8"),
+        data=json.dumps(body).encode("utf-8") if body is not None else None,
         api_request=True,
         retry_first_ssl=path in _READ_ONLY_POST_PATHS,
     )
     return result
+
+
+def api_authenticate(auth_token: str) -> dict[str, Any]:
+    """Validate an auth token exactly as Android does, without an auth header."""
+    return _http(
+        "POST",
+        f"{API_BASE_URL}/user/authenticate",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        data=json.dumps({"authToken": auth_token}).encode("utf-8"),
+        api_request=True,
+        retry_first_ssl=True,
+    )
 
 
 def api_patch(token: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -391,6 +580,19 @@ def _response_data(response: Any) -> Any:
     if isinstance(data, dict) and set(data) == {"data"}:
         return data["data"]
     return data
+
+
+def _response_items(response: Any, limit: int | None = None) -> list[Any]:
+    """Extract an API collection without assuming one response envelope shape."""
+    data = _response_data(response)
+    if isinstance(data, dict):
+        items = data.get("items", [])
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = []
+    result = list(items) if isinstance(items, list) else []
+    return result[:limit] if limit is not None else result
 
 
 def _resolve_trip_uuid(token: str, identifier: str) -> str:
@@ -655,6 +857,7 @@ hours_app = typer.Typer(help="Hours-exchange marketplace (estimate, power, listi
 files_app = typer.Typer(help="File uploads & retrieval", no_args_is_help=True)
 content_app = typer.Typer(help="Content: FAQ, policies, system notices, concierge", no_args_is_help=True)
 network_app = typer.Typer(help="My Network connections and flight-sharing groups", no_args_is_help=True)
+device_app = typer.Typer(help="Android-compatible notification-device registration", no_args_is_help=True)
 
 app.add_typer(auth_app, name="auth")
 app.add_typer(user_app, name="user")
@@ -677,6 +880,7 @@ app.add_typer(hours_app, name="hours")
 app.add_typer(files_app, name="files")
 app.add_typer(content_app, name="content")
 app.add_typer(network_app, name="network")
+app.add_typer(device_app, name="device")
 
 # Common options
 Username = typer.Option(None, "--username", "-u", envvar="AIRSPRINT_USERNAME", help="Login email")
@@ -746,16 +950,29 @@ def auth_logout():
 
 @auth_app.command("status")
 def auth_status(fmt: str = Format):
-    """Check if cached token is valid."""
+    """Report whether a token is cached locally; does not contact AirSprint."""
     api_token = _load_api_token()
     if api_token:
         _out({
             "authenticated": True,
             "token_cached": True,
-            "message": "A valid API token is cached.",
+            "verified_live": False,
+            "message": "An unexpired token is cached locally; use `auth verify` for one live validation.",
         }, fmt)
     else:
-        _out({"authenticated": False, "message": "No valid token cached"}, fmt)
+        _out({"authenticated": False, "token_cached": False, "message": "No unexpired token cached"}, fmt)
+
+
+@auth_app.command("verify")
+def auth_verify(
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Validate the current token once (POST /user/authenticate), as Android does."""
+    token = get_api_token(username, password)
+    _out(api_authenticate(token), fmt, compact)
 
 
 # ---------------------------------------------------------------------------
@@ -775,6 +992,19 @@ def user_profile(
     _out(resp.get("data", resp), fmt)
 
 
+@user_app.command("get")
+def user_get(
+    user_id: str = typer.Option(..., "--id", help="AirSprint user UUID"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Get another user by UUID (GET /user/{id}), as used by Android."""
+    token = get_api_token(username, password)
+    _out(api_get(token, f"/user/{user_id}"), fmt, compact)
+
+
 @user_app.command("accounts")
 def user_accounts(
     username: Optional[str] = Username,
@@ -783,7 +1013,7 @@ def user_accounts(
 ):
     """Get account info (shares, aircraft, access levels, hours)."""
     token = get_api_token(username, password)
-    resp = api_post(token, "/my-accounts", {})
+    resp = api_post(token, "/my-accounts")
     items = resp.get("data", {}).get("items", [])
     _out(items, fmt)
 
@@ -807,11 +1037,71 @@ def user_set_preferences(
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Update notification settings (POST /my-notification-settings)."""
+    """Update notification settings (PATCH /my-notification-settings/update)."""
     payload = _parse_json(body)
+    if "options" not in payload:
+        payload = {"options": payload}
     token = get_api_token(username, password)
-    data = api_post(token, "/my-notification-settings", payload)
+    data = api_patch(token, "/my-notification-settings/update", payload)
     _out(data, fmt)
+
+
+# ---------------------------------------------------------------------------
+# device — notification registration used by the Android app
+# ---------------------------------------------------------------------------
+
+
+@device_app.command("register-token")
+def device_register_token(
+    registration_token: str = typer.Option(..., "--registration-token", help="FCM/APNs registration token"),
+    device_type: Optional[str] = typer.Option(None, "--device-type", help="Optional Android device type string"),
+    device_name: Optional[str] = typer.Option(None, "--device-name", help="Optional device display name"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Register a notification token using Android's exact POST payload."""
+    registration_token = registration_token.strip()
+    if not registration_token:
+        _die("--registration-token must not be empty.", EXIT_VALIDATION)
+    payload = {"registrationToken": registration_token}
+    if device_type and device_type.strip():
+        payload["deviceType"] = device_type.strip()
+    if device_name and device_name.strip():
+        payload["deviceName"] = device_name.strip()
+    path = "/account-notification-registration-token-register"
+    if dry_run:
+        _out({"dry_run": True, "method": "POST", "path": path, "payload": payload}, fmt, compact)
+        return
+    token = get_api_token(username, password)
+    _out(api_post(token, path, payload), fmt, compact)
+
+
+@device_app.command("delete-token")
+def device_delete_token(
+    registration_token: str = typer.Option(..., "--registration-token", help="FCM/APNs registration token"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    confirm: bool = typer.Option(False, "--confirm", help="Required before deleting the registration"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Delete a notification token using Android's exact POST payload."""
+    path = "/account-notification-registration-token-delete"
+    registration_token = registration_token.strip()
+    if not registration_token:
+        _die("--registration-token must not be empty.", EXIT_VALIDATION)
+    payload = {"registrationToken": registration_token}
+    if dry_run:
+        _out({"dry_run": True, "method": "POST", "path": path, "payload": payload}, fmt, compact)
+        return
+    if not confirm:
+        _die("--confirm required to delete a notification registration token.", EXIT_VALIDATION)
+    token = get_api_token(username, password)
+    _out(api_post(token, path, payload), fmt, compact)
 
 
 @user_app.command("update")
@@ -976,16 +1266,18 @@ def trips_tripsheet(
 
 @trips_app.command("flight-feedback")
 def trips_flight_feedback(
-    trip_id: str = typer.Option(..., "--id", help="Trip ID"),
+    leg_id: str = typer.Option(..., "--leg-id", help="Completed-leg UUID"),
     body: str = typer.Option(..., "--body", help="JSON feedback body"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Submit flight feedback for a completed trip."""
+    """Submit Android's booking-experience survey for one completed leg."""
     payload = _parse_json(body)
+    if "tripId" in payload:
+        _die('Android booking surveys use "legId", not "tripId".', EXIT_VALIDATION)
     token = get_api_token(username, password)
-    payload.setdefault("tripId", trip_id)
+    payload.setdefault("legId", leg_id)
     data = api_post(token, "/booking-survey/create", payload)
     _out(data, fmt)
 
@@ -1009,7 +1301,7 @@ def booking_info(
     """
     token = get_api_token(username, password)
     responses = _parallel_read_calls({
-        "aircraft": lambda: api_post(token, "/my-aircraft", {}),
+        "aircraft": lambda: api_post(token, "/my-aircraft"),
         "passengers": lambda: api_post(token, "/my-passenger", {
             "sort": [],
             "page": {"limit": 200, "offset": 0},
@@ -1245,10 +1537,7 @@ def booking_create(
 
 @booking_app.command("cancel")
 def booking_cancel(
-    booking_id: Optional[str] = typer.Option(None, "--id", help="Booking code (e.g. BAKEW) — resolved to tripId"),
-    trip_id: Optional[str] = typer.Option(None, "--trip-id", help="Trip UUID (alternative to --id)"),
-    leg_id: Optional[str] = typer.Option(None, "--leg-id", help="Cancel a single leg by leg UUID"),
-    leg_ids: Optional[str] = typer.Option(None, "--leg-ids", help="Comma-separated leg UUIDs"),
+    leg_id: str = typer.Option(..., "--leg-id", help="Booked-leg UUID"),
     reason: str = typer.Option(..., "--reason", help="Cancellation reason (required by API)"),
     confirm: bool = typer.Option(False, "--confirm", help="Required before the single live cancellation request."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show payload without submitting"),
@@ -1256,30 +1545,21 @@ def booking_cancel(
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Cancel a trip or specific legs (POST /cancel-own).
+    """Cancel one leg using Android's exact POST /cancel-own contract.
 
-    One of --id, --trip-id, --leg-id, or --leg-ids is required.
-    --id resolves a booking code (e.g. BAKEW) to its tripId via /my-leg.
+    Android 6.1.4 sends only legId and reason. The CLI intentionally does not
+    loop over a trip or issue a multi-leg cancellation.
     """
-    if not any([booking_id, trip_id, leg_id, leg_ids]):
-        _die("Provide one of --id, --trip-id, --leg-id, --leg-ids", EXIT_VALIDATION)
-
-    payload: dict[str, Any] = {"reason": reason}
-    if leg_id:
-        payload["legId"] = leg_id
-    elif leg_ids:
-        payload["legIds"] = [s.strip() for s in leg_ids.split(",") if s.strip()]
-    elif trip_id:
-        payload["tripId"] = trip_id
-    elif booking_id:
-        token_for_lookup = get_api_token(username, password)
-        payload["tripId"] = _resolve_trip_uuid(token_for_lookup, booking_id)
+    reason = reason.strip()
+    if not reason:
+        _die("--reason must not be empty.", EXIT_VALIDATION)
+    payload = {"legId": leg_id, "reason": reason}
 
     if dry_run:
         _out({"dry_run": True, "payload": payload, "message": "Would POST /cancel-own exactly once"}, fmt)
         return
     if not confirm:
-        _die("--confirm required to cancel a booking or leg.", EXIT_VALIDATION)
+        _die("--confirm required to cancel a leg.", EXIT_VALIDATION)
 
     token = get_api_token(username, password)
     data = api_post(token, "/cancel-own", payload)
@@ -1350,7 +1630,15 @@ def _leg_passenger_payload(row: Any) -> dict[str, Any] | None:
             ),
             {},
         )
-        for key in ("passportIds", "destinationAddress"):
+        # Android 6.1.4's LegPassengerUpdate fields are id,
+        # customsDeclarationId, destinationAddress, and passport. passportIds
+        # is retained as a live-API compatibility field used by older records.
+        for key in (
+            "customsDeclarationId",
+            "destinationAddress",
+            "passport",
+            "passportIds",
+        ):
             value = row.get(key, nested.get(key))
             if value not in (None, "", [], {}):
                 payload[key] = value
@@ -1437,6 +1725,144 @@ def leg_update_passengers(
         return
     if not confirm:
         _die("--confirm required for the single leg passenger PATCH.", EXIT_VALIDATION)
+    result = api_patch(token, path, payload)
+    _out({
+        "result": result,
+        "plan": plan,
+        "message": "PATCH sent exactly once; no read-back performed. Wait at least 8 seconds before probing.",
+    }, fmt, compact)
+
+
+@leg_app.command("update-required-info")
+def leg_update_required_info(
+    leg_id: str = typer.Option(..., "--leg-id", help="Booked-leg UUID"),
+    body: str = typer.Option(
+        ...,
+        "--body",
+        help=(
+            "Android LegUpdateOptions JSON. If passengers are present, each item must use "
+            "the saved passenger UUID in id and is merged onto the current full list."
+        ),
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    confirm: bool = typer.Option(False, "--confirm", help="Required before the single PATCH"),
+    probe: bool = typer.Option(False, "--probe/--no-probe", help="Override recent-booking-write cooldown"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Patch Android required information once, preserving the full passenger list."""
+    parsed = _parse_json(body)
+    options = parsed.get("options", parsed)
+    if not isinstance(options, dict) or not options:
+        _die("--body must contain non-empty LegUpdateOptions.", EXIT_VALIDATION)
+
+    # Fields emitted by Android 6.1.4 LegUpdateOptions.toJson. Keeping this
+    # allowlist prevents a typo from becoming an opaque live-booking mutation.
+    allowed = {
+        "departureAirportId", "arrivalAirportId", "aircraftId", "date",
+        "numberOfSeats", "passengers", "petIds", "baggage",
+        "requestSettings", "dogFormSubmitted", "shareSettings",
+    }
+    unsupported = sorted(set(options) - allowed)
+    if unsupported:
+        _die(
+            "Android does not emit these LegUpdateOptions fields: " + ", ".join(unsupported),
+            EXIT_VALIDATION,
+        )
+
+    plan: dict[str, Any] | None = None
+    passenger_updates = options.get("passengers")
+    if passenger_updates is not None:
+        if not isinstance(passenger_updates, list) or not passenger_updates:
+            _die('"options.passengers" must be a non-empty array.', EXIT_VALIDATION)
+        update_by_id: dict[str, dict[str, Any]] = {}
+        allowed_passenger = {
+            "id", "customsDeclarationId", "destinationAddress", "passport", "passportIds",
+        }
+        for index, item in enumerate(passenger_updates):
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
+                _die(
+                    f'options.passengers[{index}].id must be a saved passenger UUID.',
+                    EXIT_VALIDATION,
+                )
+            bad_fields = sorted(set(item) - allowed_passenger)
+            if bad_fields:
+                _die(
+                    f'options.passengers[{index}] has fields Android does not emit: '
+                    + ", ".join(bad_fields),
+                    EXIT_VALIDATION,
+                )
+            if item["id"] in update_by_id:
+                _die(f'Duplicate passenger update for {item["id"]}.', EXIT_VALIDATION)
+            update_by_id[item["id"]] = dict(item)
+
+        _guard_booking_probe(probe)
+        token = get_api_token(username, password)
+        leg = _response_data(api_get(token, f"/leg/{leg_id}"))
+        if not isinstance(leg, dict):
+            _die(f"Unexpected leg response for {leg_id}; no PATCH sent.", EXIT_ERROR)
+        current: list[dict[str, Any]] = []
+        labels: dict[str, str] = {}
+        unresolved: list[str] = []
+        for row in _leg_passenger_rows(leg):
+            item = _leg_passenger_payload(row)
+            if item is None:
+                unresolved.append(_passenger_name(row))
+                continue
+            if item["id"] not in labels:
+                current.append(item)
+                labels[item["id"]] = _passenger_name(row)
+        if unresolved:
+            _die(
+                "Could not resolve saved passenger UUIDs for: " + ", ".join(unresolved)
+                + ". No PATCH sent.",
+                EXIT_VALIDATION,
+            )
+        current_ids = {item["id"] for item in current}
+        unknown_ids = sorted(set(update_by_id) - current_ids)
+        if unknown_ids:
+            _die(
+                "Required-info updates may not add/drop passengers; unknown saved IDs: "
+                + ", ".join(unknown_ids),
+                EXIT_VALIDATION,
+            )
+        merged: list[dict[str, Any]] = []
+        for current_item in current:
+            passenger_id = current_item["id"]
+            merged.append({**current_item, **update_by_id.get(passenger_id, {})})
+        options = dict(options)
+        options["passengers"] = merged
+        plan = {
+            "kept": [
+                {"id": item["id"], "name": labels.get(item["id"], item["id"])}
+                for item in current if item["id"] not in update_by_id
+            ],
+            "updated": [
+                {"id": item["id"], "name": labels.get(item["id"], item["id"])}
+                for item in current if item["id"] in update_by_id
+            ],
+            "dropped": [],
+        }
+    else:
+        token = None
+
+    path = f"/leg/{leg_id}/required-info"
+    payload = {"options": options}
+    if dry_run:
+        _out({
+            "dry_run": True,
+            "method": "PATCH",
+            "path": path,
+            "plan": plan,
+            "payload": payload,
+            "message": "No PATCH was sent; at most one pre-write GET was made.",
+        }, fmt, compact)
+        return
+    if not confirm:
+        _die("--confirm required for the single required-info PATCH.", EXIT_VALIDATION)
+    token = token or get_api_token(username, password)
     result = api_patch(token, path, payload)
     _out({
         "result": result,
@@ -1673,7 +2099,7 @@ def _prepare_cache_for_token(cache: dict[str, Any], token: str) -> bool:
 
 
 def _refresh_accounts(token: str, cache: dict[str, Any]) -> list[dict[str, Any]]:
-    response = api_post(token, "/my-accounts", {})
+    response = api_post(token, "/my-accounts")
     items = response.get("data", {}).get("items", []) or []
     accounts = [item for item in items if isinstance(item, dict)]
     cache["accounts"] = {"_cached_at": int(time.time()), "items": accounts}
@@ -1859,6 +2285,7 @@ def quote_flight(
     arrival: Optional[str] = typer.Option(None, "--to", help="Arrival ICAO code (e.g. KTEB). Resolved to UUID automatically."),
     date: Optional[str] = typer.Option(None, "--date", help="Departure date/time in local time (e.g. 2026-04-15T10:00, 2026-04-15). Converted to UTC using --timezone."),
     body: Optional[str] = typer.Option(None, "--body", help="Full JSON body (overrides --from/--to/--date)"),
+    pax: int = typer.Option(1, "--pax", min=1, help="Passenger count sent in each Android quote leg"),
     timezone: Optional[str] = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
@@ -1894,6 +2321,7 @@ def quote_flight(
                 "departureAirportId": dep_id,
                 "arrivalAirportId": arr_id,
                 "departureDateUTC": date_utc,
+                "pax": pax,
             }]
         }
     else:
@@ -1912,6 +2340,7 @@ def quote_roundtrip(
     arrival: str = typer.Option(..., "--to", help="Arrival ICAO (e.g. KTEB)"),
     out_date: str = typer.Option(..., "--out", help="Outbound date/time (local; needs --tz)"),
     return_date: str = typer.Option(..., "--return", help="Return date/time (local; needs --tz)"),
+    pax: int = typer.Option(1, "--pax", min=1, help="Passenger count sent on both legs"),
     timezone: Optional[str] = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
@@ -1936,12 +2365,14 @@ def quote_roundtrip(
                 "departureAirportId": dep_id,
                 "arrivalAirportId": arr_id,
                 "departureDateUTC": out_utc,
+                "pax": pax,
             },
             {
                 "aircraftId": ac_id,
                 "departureAirportId": arr_id,
                 "arrivalAirportId": dep_id,
                 "departureDateUTC": ret_utc,
+                "pax": pax,
             },
         ]
     }
@@ -2039,7 +2470,8 @@ def quote_airports(
     token = get_api_token(username, password)
     filt: dict[str, Any] = {}
     if query:
-        filt["query"] = query
+        # Android 6.1.4 AirportSearchFilterModel calls this field `name`.
+        filt["name"] = query
     if saved:
         filt["saved"] = True
     resp = api_post(token, "/airport", {
@@ -2086,6 +2518,19 @@ def quote_aircraft(
     by_id = cache["aircraft"]["by_id"]
     results = [{"id": k, "name": v.get("name", "")} for k, v in by_id.items()]
     _out(results, fmt)
+
+
+@quote_app.command("aircraft-get")
+def quote_aircraft_get(
+    aircraft_id: str = typer.Option(..., "--id", help="Aircraft type UUID"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Get one aircraft type (GET /aircraft/{id}), as used by Android."""
+    token = get_api_token(username, password)
+    _out(api_get(token, f"/aircraft/{aircraft_id}"), fmt, compact)
 
 
 # ---------------------------------------------------------------------------
@@ -2294,7 +2739,7 @@ def raw_api_get(
     compact: bool = Compact,
 ):
     """GET against api.airsprint.com."""
-    if path.startswith(("/trip/", "/leg/")):
+    if path.startswith(("/trip/", "/leg/", "/my-flight/", "/my-leg/")):
         _guard_booking_probe(probe)
     token = get_api_token(username, password)
     _out(api_get(token, path), fmt, compact)
@@ -2372,19 +2817,11 @@ def account_users(
 ):
     """List users on the account (POST /my-account-users)."""
     token = get_api_token(username, password)
-    resp = api_post(token, "/my-account-users", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
+    resp = api_post(token, "/my-account-users", {
+        "sort": [],
+        "page": {"limit": 100, "offset": 0},
+    })
     _out(resp.get("data", resp), fmt, compact)
-
-
-@account_app.command("user-get")
-def account_user_get(
-    user_id: str = typer.Option(..., "--id", help="Account-user ID"),
-    username: Optional[str] = Username, password: Optional[str] = Password,
-    fmt: str = Format, compact: bool = Compact,
-):
-    """Get an account-user by ID (GET /my-account-user/{id})."""
-    token = get_api_token(username, password)
-    _out(api_get(token, f"/my-account-user/{user_id}"), fmt, compact)
 
 
 @account_app.command("invite")
@@ -2405,18 +2842,72 @@ def account_invite(
 
 @account_app.command("user-update")
 def account_user_update(
-    body: str = typer.Option(..., "--body", help="JSON body"),
+    user_ids: str = typer.Option(..., "--ids", help="Comma-separated account-user UUIDs"),
+    role_names: str = typer.Option(..., "--roles", help="Comma-separated Android role names"),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    confirm: bool = typer.Option(False, "--confirm"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Update an account-user (POST /account-user/update)."""
-    payload = _parse_json(body)
+    """Batch-update account roles using Android's exact options envelope."""
+    payload = {
+        "ids": _parse_ids(user_ids, "--ids"),
+        "options": {"roleNames": _parse_ids(role_names, "--roles")},
+    }
     if dry_run:
-        _out({"dry_run": True, "payload": payload, "endpoint": "/account-user/update"}, fmt, compact)
+        _out({
+            "dry_run": True,
+            "method": "PATCH",
+            "payload": payload,
+            "endpoint": "/account-user/update",
+        }, fmt, compact)
         return
+    if not confirm:
+        _die("--confirm required to update account roles.", EXIT_VALIDATION)
     token = get_api_token(username, password)
-    _out(api_post(token, "/account-user/update", payload), fmt, compact)
+    _out(api_patch(token, "/account-user/update", payload), fmt, compact)
+
+
+@account_app.command("user-patch")
+def account_user_patch(
+    user_id: str = typer.Option(..., "--id", help="Account-user UUID"),
+    body: str = typer.Option(
+        ...,
+        "--body",
+        help=(
+            "JSON fields: firstName, lastName, email, accountUserRoleId, "
+            "savedAirportIds; wrapped in options automatically"
+        ),
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    confirm: bool = typer.Option(False, "--confirm"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Patch one account user using Android's PATCH /my-account-user/{id}."""
+    parsed = _parse_json(body)
+    options = parsed.get("options", parsed)
+    if not isinstance(options, dict) or not options:
+        _die("--body must contain at least one account-user field.", EXIT_VALIDATION)
+    allowed = {"firstName", "lastName", "email", "accountUserRoleId", "savedAirportIds"}
+    unsupported = sorted(set(options) - allowed)
+    if unsupported:
+        _die(
+            "Android does not send these account-user fields: " + ", ".join(unsupported),
+            EXIT_VALIDATION,
+        )
+    path = f"/my-account-user/{user_id}"
+    payload = {"id": user_id, "options": options}
+    if dry_run:
+        _out({"dry_run": True, "method": "PATCH", "path": path, "payload": payload}, fmt, compact)
+        return
+    if not confirm:
+        _die("--confirm required to patch account access.", EXIT_VALIDATION)
+    token = get_api_token(username, password)
+    result = api_patch(token, path, payload)
+    _out({"result": result, "message": "PATCH sent exactly once; no read-back performed."}, fmt, compact)
 
 
 @account_app.command("user-delete")
@@ -2445,7 +2936,10 @@ def account_roles(
 ):
     """List account-user roles (POST /account-user-role)."""
     token = get_api_token(username, password)
-    resp = api_post(token, "/account-user-role", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
+    resp = api_post(token, "/account-user-role", {
+        "sort": [],
+        "page": {"limit": 100, "offset": 0},
+    })
     _out(resp.get("data", resp), fmt, compact)
 
 
@@ -2675,17 +3169,6 @@ def passport_list(
     _out(passports, fmt, compact)
 
 
-@passport_app.command("get")
-def passport_get(
-    passport_id: str = typer.Option(..., "--id"),
-    username: Optional[str] = Username, password: Optional[str] = Password,
-    fmt: str = Format, compact: bool = Compact,
-):
-    """Get a saved passport (GET /my-passport/{id})."""
-    token = get_api_token(username, password)
-    _out(api_get(token, f"/my-passport/{passport_id}"), fmt, compact)
-
-
 @passport_app.command("update-authority")
 def passport_update_authority(
     passport_id: str = typer.Option(..., "--id", help="Passport UUID"),
@@ -2821,6 +3304,49 @@ def passport_upload_init(
     _out(api_post(token, "/my-passport/document/upload-init", _parse_json(body)), fmt, compact)
 
 
+@passport_app.command("upload-document")
+def passport_upload_document(
+    passport_id: str = typer.Option(..., "--id", help="Passport UUID"),
+    file_value: str = typer.Option(..., "--file", help="Local document path"),
+    content_type: Optional[str] = typer.Option(None, "--content-type", help="MIME type; inferred from the filename by default"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    confirm: bool = typer.Option(False, "--confirm", help="Required before uploading and attaching the document"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Upload and attach a passport document using Android's full workflow."""
+    file_path, mime = _document_file(file_value, content_type)
+    base_payload = {"passportId": passport_id}
+    init_payload = {
+        **base_payload,
+        "fileName": file_path.name,
+        "contentType": mime,
+        "maxFileSizeBytes": ANDROID_DOCUMENT_MAX_BYTES,
+    }
+    if dry_run:
+        _out({
+            "dry_run": True,
+            "steps": [
+                {"method": "POST", "path": "/my-passport/document/upload-init", "payload": init_payload},
+                {"method": "POST", "path": "presignedUpload.url", "multipartFile": file_path.name},
+                {"method": "POST", "path": "/my-passport/document/attach", "payload": {**base_payload, "fileName": file_path.name, "contentType": mime, "storagePath": "<from upload-init>"}},
+            ],
+            "sizeBytes": file_path.stat().st_size,
+        }, fmt, compact)
+        return
+    if not confirm:
+        _die("--confirm required to upload and attach a passport document.", EXIT_VALIDATION)
+    token = get_api_token(username, password)
+    _out(_android_document_upload(
+        token,
+        file_path=file_path,
+        content_type=mime,
+        init_path="/my-passport/document/upload-init",
+        attach_path="/my-passport/document/attach",
+        base_payload=base_payload,
+    ), fmt, compact)
+
+
 @passport_app.command("attach")
 def passport_attach(
     body: str = typer.Option(..., "--body", help="JSON body — references the uploaded file"),
@@ -2862,10 +3388,10 @@ def pet_list(
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """List saved pets (POST /my-pet)."""
+    """List saved pets (bodyless POST /my-pet, matching Android)."""
     token = get_api_token(username, password)
-    resp = api_post(token, "/my-pet", {"sort": [], "page": {"limit": limit, "offset": 0}, "filter": {}})
-    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+    resp = api_post(token, "/my-pet")
+    _out(_response_items(resp, limit), fmt, compact)
 
 
 @pet_app.command("get")
@@ -2906,6 +3432,60 @@ def pet_upload_init(
     _out(api_post(token, "/my-pet/document/upload-init", _parse_json(body)), fmt, compact)
 
 
+@pet_app.command("upload-document")
+def pet_upload_document(
+    pet_id: str = typer.Option(..., "--id", help="Pet UUID"),
+    file_value: str = typer.Option(..., "--file", help="Local PDF, JPEG, or PNG path"),
+    document_type: str = typer.Option(..., "--document-type", help="vaccinationDocument or importFormReceipt"),
+    content_type: Optional[str] = typer.Option(None, "--content-type", help="MIME type; inferred from the filename by default"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    confirm: bool = typer.Option(False, "--confirm", help="Required before uploading and attaching the document"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Upload and attach a pet document using Android's full workflow."""
+    if document_type not in {"vaccinationDocument", "importFormReceipt"}:
+        _die(
+            "--document-type must be vaccinationDocument or importFormReceipt.",
+            EXIT_VALIDATION,
+        )
+    file_path, mime = _document_file(file_value, content_type)
+    if mime not in {"application/pdf", "image/jpeg", "image/png"}:
+        _die(
+            "Android pet documents support application/pdf, image/jpeg, or image/png.",
+            EXIT_VALIDATION,
+        )
+    base_payload = {"petId": pet_id, "documentType": document_type}
+    init_payload = {
+        **base_payload,
+        "fileName": file_path.name,
+        "contentType": mime,
+        "maxFileSizeBytes": ANDROID_DOCUMENT_MAX_BYTES,
+    }
+    if dry_run:
+        _out({
+            "dry_run": True,
+            "steps": [
+                {"method": "POST", "path": "/my-pet/document/upload-init", "payload": init_payload},
+                {"method": "POST", "path": "presignedUpload.url", "multipartFile": file_path.name},
+                {"method": "POST", "path": "/my-pet/document/attach", "payload": {**base_payload, "fileName": file_path.name, "contentType": mime, "storagePath": "<from upload-init>"}},
+            ],
+            "sizeBytes": file_path.stat().st_size,
+        }, fmt, compact)
+        return
+    if not confirm:
+        _die("--confirm required to upload and attach a pet document.", EXIT_VALIDATION)
+    token = get_api_token(username, password)
+    _out(_android_document_upload(
+        token,
+        file_path=file_path,
+        content_type=mime,
+        init_path="/my-pet/document/upload-init",
+        attach_path="/my-pet/document/attach",
+        base_payload=base_payload,
+    ), fmt, compact)
+
+
 @pet_app.command("attach")
 def pet_attach(
     body: str = typer.Option(..., "--body"),
@@ -2928,6 +3508,8 @@ def pet_update(
     """Update a saved pet (PATCH /my-pet/{id})."""
     path = f"/my-pet/{pet_id}"
     payload = _parse_json(body)
+    if "options" not in payload:
+        payload = {"options": payload}
     if dry_run:
         _out({"dry_run": True, "method": "PATCH", "path": path, "payload": payload}, fmt, compact)
         return
@@ -3068,17 +3650,6 @@ def customs_list(
     _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
 
 
-@customs_app.command("declaration")
-def customs_declaration(
-    body: str = typer.Option("{}", "--body", help="Optional filter body"),
-    username: Optional[str] = Username, password: Optional[str] = Password,
-    fmt: str = Format, compact: bool = Compact,
-):
-    """Get the customs-declaration form/template (POST /canadian-custom-declaration)."""
-    token = get_api_token(username, password)
-    _out(api_post(token, "/canadian-custom-declaration", _parse_json(body)), fmt, compact)
-
-
 @customs_app.command("create")
 def customs_create(
     body: Optional[str] = typer.Option(None, "--body", help="Validated raw JSON alternative to the ergonomic flags"),
@@ -3202,27 +3773,38 @@ def customs_update_date(
     }, fmt, compact)
 
 
-@customs_app.command("create-public")
-def customs_create_public(
-    body: str = typer.Option(..., "--body"),
-    fmt: str = Format, compact: bool = Compact,
-):
-    """Create a public (link-based) customs declaration — no auth required (POST /canadianCustomsDeclaration/create-public)."""
-    payload = _parse_json(body)
-    _out(_http("POST", f"{API_BASE_URL}/canadianCustomsDeclaration/create-public",
-               headers={"Content-Type": "application/json", "Accept": "application/json"},
-               data=json.dumps(payload).encode("utf-8")), fmt, compact)
-
-
 @customs_app.command("link-create")
 def customs_link_create(
-    body: str = typer.Option(..., "--body"),
+    leg_id: str = typer.Option(..., "--leg-id", help="Booked-leg UUID"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
     """Create a customs-declaration link to share with a passenger (POST /canadian-customs-declaration-link/create)."""
+    payload = {"legId": leg_id}
+    if dry_run:
+        _out({
+            "dry_run": True,
+            "method": "POST",
+            "path": "/canadian-customs-declaration-link/create",
+            "payload": payload,
+        }, fmt, compact)
+        return
     token = get_api_token(username, password)
-    _out(api_post(token, "/canadian-customs-declaration-link/create", _parse_json(body)), fmt, compact)
+    _out(api_post(token, "/canadian-customs-declaration-link/create", payload), fmt, compact)
+
+
+@customs_app.command("link-get")
+def customs_link_get(
+    link_id: str = typer.Option(..., "--id", help="Customs declaration link UUID"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Get a customs-declaration link (GET /canadian-customs-declaration-link/{id})."""
+    token = get_api_token(username, password)
+    _out(api_get(token, f"/canadian-customs-declaration-link/{link_id}"), fmt, compact)
 
 
 # ---------------------------------------------------------------------------
@@ -3278,20 +3860,30 @@ def booking_lock(
     _out(api_post(token, "/flight/lock", payload), fmt, compact)
 
 
-@booking_app.command("reserve-day")
-def booking_reserve_day(
-    body: str = typer.Option(..., "--body"),
-    dry_run: bool = typer.Option(False, "--dry-run"),
+@booking_app.command("reserved-days")
+def booking_reserved_days(
+    limit: int = typer.Option(90, "--limit", min=1, max=500),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Reserve a day on the calendar (POST /reserve-day)."""
-    payload = _parse_json(body)
-    if dry_run:
-        _out({"dry_run": True, "payload": payload, "endpoint": "/reserve-day"}, fmt, compact)
-        return
+    """List reserved calendar days (read-only POST /reserve-day)."""
+    payload = {"sort": [], "page": {"limit": limit, "offset": 0}}
     token = get_api_token(username, password)
-    _out(api_post(token, "/reserve-day", payload), fmt, compact)
+    response = api_post(token, "/reserve-day", payload)
+    _out(_response_items(response, limit), fmt, compact)
+
+
+@booking_app.command("baggage-types")
+def booking_baggage_types(
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """List baggage types (POST /baggage-type with no request body), as Android does."""
+    token = get_api_token(username, password)
+    response = api_post(token, "/baggage-type")
+    _out(_response_items(response), fmt, compact)
 
 
 @booking_app.command("survey")
@@ -3335,10 +3927,40 @@ def trips_recent(
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """List recent legs (POST /leg/recent/list)."""
+    """List recent leg searches (GET /leg/recent/list)."""
     token = get_api_token(username, password)
-    resp = api_post(token, "/leg/recent/list", {"sort": [], "page": {"limit": limit, "offset": 0}, "filter": {}})
-    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+    response = api_get(token, "/leg/recent/list")
+    _out(_response_items(response, limit), fmt, compact)
+
+
+@trips_app.command("flight-get")
+def trips_flight_get(
+    flight_id: str = typer.Option(..., "--id", help="Booked-flight UUID"),
+    probe: bool = typer.Option(False, "--probe/--no-probe", help="Override recent-booking-write cooldown"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Read one booked flight once (GET /my-flight/{id}); never polls."""
+    _guard_booking_probe(probe)
+    token = get_api_token(username, password)
+    _out(api_get(token, f"/my-flight/{flight_id}"), fmt, compact)
+
+
+@trips_app.command("leg-get")
+def trips_leg_get(
+    leg_id: str = typer.Option(..., "--id", help="Booked-leg UUID"),
+    probe: bool = typer.Option(False, "--probe/--no-probe", help="Override recent-booking-write cooldown"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Read one booked leg once (GET /my-leg/{id}); never polls."""
+    _guard_booking_probe(probe)
+    token = get_api_token(username, password)
+    _out(api_get(token, f"/my-leg/{leg_id}"), fmt, compact)
 
 
 @trips_app.command("recent-save")
@@ -3359,19 +3981,19 @@ def trips_recent_save(
 
 @quote_app.command("airport-nearest")
 def quote_airport_nearest(
-    lat: float = typer.Option(..., "--lat", help="Latitude"),
-    lng: float = typer.Option(..., "--lng", help="Longitude"),
-    limit: int = typer.Option(5, "--limit"),
+    lat: float = typer.Option(..., "--lat", min=-90, max=90, help="Latitude"),
+    lng: float = typer.Option(..., "--lng", min=-180, max=180, help="Longitude"),
+    limit: int = typer.Option(5, "--limit", min=1, max=100),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
     """Find airports nearest a coordinate (POST /airport/nearest)."""
     token = get_api_token(username, password)
-    resp = api_post(token, "/airport/nearest", {
-        "sort": [], "page": {"limit": limit, "offset": 0},
-        "filter": {"latitude": lat, "longitude": lng},
+    response = api_post(token, "/airport/nearest", {
+        "latitude": lat,
+        "longitude": lng,
     })
-    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+    _out(_response_items(response, limit), fmt, compact)
 
 
 @quote_app.command("saved-airports")
@@ -3379,10 +4001,14 @@ def quote_saved_airports(
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """List my saved/favourite airports (POST /my-saved-airports/)."""
+    """List saved/favourite airports using the app's saved airport filter."""
     token = get_api_token(username, password)
-    resp = api_post(token, "/my-saved-airports/", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
-    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+    response = api_post(token, "/airport", {
+        "sort": [],
+        "page": {"limit": 100, "offset": 0},
+        "filter": {"saved": True},
+    })
+    _out(_response_items(response), fmt, compact)
 
 
 @quote_app.command("saved-airport-delete")
@@ -3412,17 +4038,33 @@ def quote_saved_airport_delete(
 @address_app.command("autocomplete")
 def address_autocomplete(
     query: str = typer.Option(..., "--query", "-q", help="Partial address text"),
-    limit: int = typer.Option(10, "--limit"),
+    city: Optional[str] = typer.Option(None, "--city"),
+    state_or_province: Optional[str] = typer.Option(None, "--state", "--state-or-province"),
+    country_code: Optional[str] = typer.Option(None, "--country-code", help="Two-letter code such as ca or us"),
+    session_token: Optional[str] = typer.Option(None, "--session-token"),
+    limit: int = typer.Option(10, "--limit", min=1, max=100),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
     """Address autocomplete (POST /address/autocomplete)."""
+    input_value = query.strip()
+    if not input_value:
+        _die("--query cannot be empty.", EXIT_VALIDATION)
+    payload: dict[str, Any] = {"input": input_value, "language": "en"}
+    if city:
+        payload["city"] = city.strip()
+    if state_or_province:
+        payload["stateOrProvince"] = state_or_province.strip()
+    if session_token:
+        payload["sessionToken"] = session_token.strip()
+    if country_code:
+        normalized_country = country_code.strip().lower()
+        if not re.fullmatch(r"[a-z]{2}", normalized_country):
+            _die("--country-code must be a two-letter code such as ca or us.", EXIT_VALIDATION)
+        payload["countryCode"] = normalized_country
     token = get_api_token(username, password)
-    resp = api_post(token, "/address/autocomplete", {
-        "sort": [], "page": {"limit": limit, "offset": 0},
-        "filter": {"query": query},
-    })
-    _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
+    response = api_post(token, "/address/autocomplete", payload)
+    _out(_response_items(response, limit), fmt, compact)
 
 
 @address_app.command("create")
@@ -3520,6 +4162,83 @@ def files_list(
     _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
 
 
+@files_app.command("resolve")
+def files_resolve(
+    application_url: str = typer.Option(..., "--application-url", help="AirSprint application URL or path"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Resolve an application file URL using Android's bounded fallback logic."""
+    raw_url = application_url.strip()
+    parsed = urlparse(raw_url)
+    application_path = (parsed.path or raw_url).lstrip("/")
+    if not application_path:
+        _die("--application-url must contain a non-empty path.", EXIT_VALIDATION)
+    token = get_api_token(username, password)
+    direct = api_post(token, "/my-file", {
+        "filter": {"path": application_path},
+        "page": {"limit": 1, "offset": 0},
+    })
+    direct_items = _response_items(direct, 1)
+    if direct_items and isinstance(direct_items[0], dict):
+        resolved = direct_items[0].get("url") or direct_items[0].get("applicationUrl")
+        if isinstance(resolved, str) and resolved:
+            _out({"url": resolved, "source": "path", "path": application_path}, fmt, compact)
+            return
+
+    current_user = _response_data(api_get(token, "/me"))
+    user_id = current_user.get("id") if isinstance(current_user, dict) else None
+    if not isinstance(user_id, str) or not user_id:
+        _die("Could not resolve the current AirSprint user ID.", EXIT_NOT_FOUND)
+    image_types = ["image/jpeg", "image/png", "image/webp", "image/gif"]
+    for role in ("user_picture", "default_file"):
+        fallback = api_post(token, "/my-file", {
+            "filter": {
+                "userId": user_id,
+                "role": role,
+                "contentType": image_types,
+            },
+            "sort": [{"createdAt": "DESC"}],
+            "page": {"limit": 1, "offset": 0},
+        })
+        fallback_items = _response_items(fallback, 1)
+        if not fallback_items or not isinstance(fallback_items[0], dict):
+            continue
+        resolved = fallback_items[0].get("url") or fallback_items[0].get("applicationUrl")
+        if isinstance(resolved, str) and resolved:
+            _out({"url": resolved, "source": role, "path": application_path}, fmt, compact)
+            return
+    _die(f"No file URL resolved for {application_url}.", EXIT_NOT_FOUND)
+
+
+@files_app.command("get")
+def files_get(
+    file_id: str = typer.Option(..., "--id", help="Private file UUID"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Get a private file record (GET /my-file/{id})."""
+    token = get_api_token(username, password)
+    _out(api_get(token, f"/my-file/{file_id}"), fmt, compact)
+
+
+@files_app.command("public-get")
+def files_public_get(
+    file_id: str = typer.Option(..., "--id", help="Public file UUID"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Get a public-file record (GET /file-public/{id})."""
+    token = get_api_token(username, password)
+    _out(api_get(token, f"/file-public/{file_id}"), fmt, compact)
+
+
 @files_app.command("public-create")
 def files_public_create(
     body: str = typer.Option(..., "--body"),
@@ -3547,6 +4266,19 @@ def content_faq(
     _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
 
 
+@content_app.command("faq-get")
+def content_faq_get(
+    faq_id: str = typer.Option(..., "--id", help="FAQ UUID"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Get one FAQ entry (GET /faq/{id})."""
+    token = get_api_token(username, password)
+    _out(api_get(token, f"/faq/{faq_id}"), fmt, compact)
+
+
 @content_app.command("faq-categories")
 def content_faq_categories(
     username: Optional[str] = Username, password: Optional[str] = Password,
@@ -3554,7 +4286,10 @@ def content_faq_categories(
 ):
     """List FAQ categories (POST /faq-category)."""
     token = get_api_token(username, password)
-    resp = api_post(token, "/faq-category", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
+    resp = api_post(token, "/faq-category", {
+        "sort": [],
+        "page": {"limit": 100, "offset": 0},
+    })
     _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
 
 
@@ -3569,6 +4304,19 @@ def content_policies(
     _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
 
 
+@content_app.command("policy-get")
+def content_policy_get(
+    policy_id: str = typer.Option(..., "--id", help="Policy UUID"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Get one policy (GET /policy/{id})."""
+    token = get_api_token(username, password)
+    _out(api_get(token, f"/policy/{policy_id}"), fmt, compact)
+
+
 @content_app.command("policy-categories")
 def content_policy_categories(
     username: Optional[str] = Username, password: Optional[str] = Password,
@@ -3576,7 +4324,10 @@ def content_policy_categories(
 ):
     """List policy categories (POST /policy-category)."""
     token = get_api_token(username, password)
-    resp = api_post(token, "/policy-category", {"sort": [], "page": {"limit": 100, "offset": 0}, "filter": {}})
+    resp = api_post(token, "/policy-category", {
+        "sort": [],
+        "page": {"limit": 100, "offset": 0},
+    })
     _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
 
 
@@ -3587,17 +4338,11 @@ def content_system_notice(
 ):
     """Get current system notice (POST /system-notice)."""
     token = get_api_token(username, password)
-    _out(api_post(token, "/system-notice", {}), fmt, compact)
-
-
-@content_app.command("required-info")
-def content_required_info(
-    username: Optional[str] = Username, password: Optional[str] = Password,
-    fmt: str = Format, compact: bool = Compact,
-):
-    """Get required-info prompts (POST /required-info)."""
-    token = get_api_token(username, password)
-    _out(api_post(token, "/required-info", {}), fmt, compact)
+    response = api_post(token, "/system-notice", {
+        "sort": [],
+        "page": {"limit": 90, "offset": 0},
+    })
+    _out(_response_items(response), fmt, compact)
 
 
 @content_app.command("concierge")
@@ -3607,7 +4352,24 @@ def content_concierge(
 ):
     """Get concierge contact info (POST /concierge)."""
     token = get_api_token(username, password)
-    _out(api_post(token, "/concierge", {}), fmt, compact)
+    response = api_post(token, "/concierge", {
+        "sort": [],
+        "page": {"limit": 100, "offset": 0},
+    })
+    _out(_response_items(response), fmt, compact)
+
+
+@content_app.command("get")
+def content_get(
+    content_id: str = typer.Option(..., "--id", help="Content UUID"),
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
+):
+    """Get one content record (GET /content/{id})."""
+    token = get_api_token(username, password)
+    _out(api_get(token, f"/content/{content_id}"), fmt, compact)
 
 
 # ---------------------------------------------------------------------------
@@ -3641,17 +4403,6 @@ def network_groups(
         "sort": [], "page": {"limit": limit, "offset": 0}, "filter": {},
     })
     _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
-
-
-@network_app.command("group-get")
-def network_group_get(
-    group_id: str = typer.Option(..., "--id", help="Group UUID"),
-    username: Optional[str] = Username, password: Optional[str] = Password,
-    fmt: str = Format, compact: bool = Compact,
-):
-    """Get a My Network group (GET /my-user/groups/{id})."""
-    token = get_api_token(username, password)
-    _out(api_get(token, f"/my-user/groups/{group_id}"), fmt, compact)
 
 
 @network_app.command("connect")
@@ -3800,18 +4551,8 @@ def network_group_delete(
 
 
 # ---------------------------------------------------------------------------
-# user — me / change-password / avatar (additional)
+# user — password and avatar (additional)
 # ---------------------------------------------------------------------------
-
-
-@user_app.command("me")
-def user_me(
-    username: Optional[str] = Username, password: Optional[str] = Password,
-    fmt: str = Format, compact: bool = Compact,
-):
-    """Get my full user record (POST /my-user). Richer than `user profile`."""
-    token = get_api_token(username, password)
-    _out(api_post(token, "/my-user", {}), fmt, compact)
 
 
 @user_app.command("change-password")
@@ -3834,22 +4575,18 @@ def user_avatar(
     output: str = typer.Option("-", "--output", "-o", help="Output file path or - for metadata only"),
     username: Optional[str] = Username, password: Optional[str] = Password,
 ):
-    """Download a user avatar (GET /my-user/avatar/{id})."""
+    """Get Android's avatar URL and optionally download the presigned file."""
     token = get_api_token(username, password)
-    url = f"{API_BASE_URL}/my-user/avatar/{user_id}"
-    req = Request(url, method="GET", headers={
-        "x-airsprint-auth-token": token, "Accept": "*/*",
-    })
-    try:
-        with urlopen(req, timeout=60, context=_ssl_ctx()) as resp:
-            content = resp.read()
-            if output == "-":
-                _out({"size_bytes": len(content), "content_type": resp.headers.get("Content-Type", "")})
-            else:
-                Path(output).write_bytes(content)
-                _out({"message": f"Saved to {output}", "size_bytes": len(content)})
-    except HTTPError as e:
-        _die(f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')}", EXIT_ERROR)
+    envelope = api_get(token, f"/my-user/avatar/{user_id}")
+    avatar_url = _manifest_url(envelope)
+    if not avatar_url:
+        _die(f"No avatar URL returned for user {user_id}.", EXIT_NOT_FOUND)
+    if output == "-":
+        _out({"url": avatar_url, "message": "Use --output FILE to download the avatar."})
+        return
+    content = _download_bytes(avatar_url)
+    Path(output).write_bytes(content)
+    _out({"message": f"Saved to {output}", "size_bytes": len(content)})
 
 
 # ---------------------------------------------------------------------------
@@ -3862,9 +4599,9 @@ def messages_settings(
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Get notification settings (POST /my-notification-settings)."""
+    """Get notification settings (GET /my-notification-settings)."""
     token = get_api_token(username, password)
-    _out(api_post(token, "/my-notification-settings", {}), fmt, compact)
+    _out(api_get(token, "/my-notification-settings"), fmt, compact)
 
 
 @messages_app.command("settings-update")
@@ -3873,9 +4610,12 @@ def messages_settings_update(
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Update notification settings (POST /my-notification-settings/update)."""
+    """Update notification settings (PATCH /my-notification-settings/update)."""
+    payload = _parse_json(body)
+    if "options" not in payload:
+        payload = {"options": payload}
     token = get_api_token(username, password)
-    _out(api_post(token, "/my-notification-settings/update", _parse_json(body)), fmt, compact)
+    _out(api_patch(token, "/my-notification-settings/update", payload), fmt, compact)
 
 
 @messages_app.command("update")
@@ -3896,13 +4636,12 @@ def messages_update(
 
 @auth_app.command("2fa-setup")
 def auth_2fa_setup(
-    body: str = typer.Option("{}", "--body"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Begin 2FA setup (POST /user/2fa/setup)."""
+    """Begin 2FA setup with Android's empty JSON payload."""
     token = get_api_token(username, password)
-    _out(api_post(token, "/user/2fa/setup", _parse_json(body)), fmt, compact)
+    _out(api_post(token, "/user/2fa/setup", {}), fmt, compact)
 
 
 @auth_app.command("2fa-verify")
@@ -3929,7 +4668,6 @@ def auth_2fa_sign_in(
 
 @auth_app.command("2fa-disable")
 def auth_2fa_disable(
-    body: str = typer.Option("{}", "--body"),
     confirm: bool = typer.Option(False, "--confirm", help="Required — disabling 2FA reduces account security"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
@@ -3938,7 +4676,7 @@ def auth_2fa_disable(
     if not confirm:
         _die("--confirm required to disable 2FA.", EXIT_VALIDATION)
     token = get_api_token(username, password)
-    _out(api_post(token, "/user/2fa/disable", _parse_json(body)), fmt, compact)
+    _out(api_post(token, "/user/2fa/disable", {}), fmt, compact)
 
 
 @auth_app.command("reset-request")
