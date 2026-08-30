@@ -2057,24 +2057,84 @@ def _booking_route_check(
     }
 
 
-def _require_passports_for_international_trip(payload: dict[str, Any], check: dict[str, Any]) -> None:
-    """Refuse an international booking when any passenger has no passport on file."""
+def _passenger_passports(passenger: Any) -> list[dict[str, Any]]:
+    """Full passport records embedded in a `/my-passenger/{id}` read, if present.
+
+    The passenger detail model carries `passports` objects alongside the
+    `passportIds` ordering list; a thin response may carry only the ids, in
+    which case a scan cannot be verified and this returns an empty list.
+    """
+    data = _response_data(passenger)
+    if not isinstance(data, dict):
+        return []
+    records = data.get("passports")
+    if not isinstance(records, list):
+        options = data.get("options")
+        records = options.get("passports") if isinstance(options, dict) else None
+    return [record for record in records if isinstance(record, dict)] if isinstance(records, list) else []
+
+
+def _passport_scan_attached(passport: dict[str, Any]) -> bool:
+    """True when a passport record has its photo/scan on file (`image` non-empty).
+
+    Mirrors how the CLI presents the field as `scanAttached` (`bool(image)`):
+    the API stores the uploaded document's path in `image` and leaves it empty
+    until one is attached.
+    """
+    return bool(passport.get("image"))
+
+
+def _require_international_travel_documents(
+    payload: dict[str, Any],
+    check: dict[str, Any],
+    read_passenger: Callable[[str], Any],
+) -> None:
+    """Refuse a border-crossing booking when a passenger's travel documents are incomplete.
+
+    Stricter than Android 6.1.4, which only warns. Every passenger on an
+    international trip needs a passport on file, and — because AirSprint requires
+    the passport photo before departure — that passport must have its scan/photo
+    uploaded. The scan is checked only when the passenger read returned the full
+    passport records; a thin response (passport ids only) still enforces the
+    on-file rule. The destination (US) address is enforced separately by
+    `_apply_booking_destination_address`.
+    """
     if not check.get("international"):
         return
-    missing: list[str] = []
+    missing_passport: list[str] = []
+    missing_scan: list[str] = []
     for leg in payload.get("legs", []):
         for passenger in leg.get("passengers") or []:
+            passenger_id = passenger.get("id")
             passport = passenger.get("passport")
-            has_passport = isinstance(passport, dict) and bool(passport.get("id"))
-            if not has_passport and passenger.get("id") not in missing:
-                missing.append(passenger.get("id"))
-    if missing:
-        _die(
-            "This trip crosses a border; passengers without a passport on file: " + ", ".join(missing)
-            + ". Add one with `passport create --passenger-id ...` (then `passport list`) or answer "
-            "--passport PASSENGER_ID=PASSPORT_ID. No booking was sent.",
-            EXIT_VALIDATION,
+            passport_id = passport.get("id") if isinstance(passport, dict) else None
+            if not passport_id:
+                if passenger_id not in missing_passport:
+                    missing_passport.append(passenger_id)
+                continue
+            records = _passenger_passports(read_passenger(passenger_id))
+            if not records:
+                continue
+            selected = next((record for record in records if record.get("id") == passport_id), None)
+            if (selected is None or not _passport_scan_attached(selected)) and passenger_id not in missing_scan:
+                missing_scan.append(passenger_id)
+    clauses: list[str] = []
+    if missing_passport:
+        clauses.append("passengers without a passport on file: " + ", ".join(missing_passport))
+    if missing_scan:
+        clauses.append("passengers whose passport has no photo/scan uploaded: " + ", ".join(missing_scan))
+    if not clauses:
+        return
+    message = "This trip crosses a border; " + "; ".join(clauses) + ". "
+    if missing_passport:
+        message += (
+            "Add a passport with `passport create --passenger-id ...` (then `passport list`) "
+            "or answer --passport PASSENGER_ID=PASSPORT_ID. "
         )
+    if missing_scan:
+        message += "Attach the photo/scan with `passport upload-document --id PASSPORT_ID --file ...`. "
+    message += "No booking was sent."
+    _die(message, EXIT_VALIDATION)
 
 
 def _apply_booking_destination_address(
@@ -2101,13 +2161,13 @@ def _apply_booking_destination_address(
             passenger["destinationAddress"] = dict(address)
 
 
-def _passenger_default_passport_id(token: str, passenger_id: str) -> str | None:
+def _passenger_default_passport_id(passenger: Any) -> str | None:
     """Android passportIdForPassenger: the selected passport, else the first saved one.
 
     The live owner API does not persist a selected passport, so the first
-    saved passport is used.
+    saved passport is used. Reads nothing itself; pass a `/my-passenger/{id}`
+    response so the caller can share one read with the document guard.
     """
-    passenger = api_get(token, f"/my-passenger/{passenger_id}")
     ids = _passenger_passport_ids(passenger)
     return ids[0] if ids else None
 
@@ -2177,9 +2237,10 @@ def booking_create(
     `booking info` first for aircraft, passenger, and airport IDs.
 
     Guard rails (nothing is sent when one fails): baggage must be answered
-    (`--baggage none` for no bags); a trip that crosses a border needs a
-    passport on file for every passenger; US-touching or international trips
-    need a destination address (hotel, residence, ...).
+    (`--baggage none` for no bags); a trip that crosses a border needs, for
+    every passenger, a passport on file whose photo/scan has been uploaded
+    (AirSprint requires the passport image before departure); US-touching or
+    international trips need a destination address (hotel, residence, ...).
     """
     catering_flag = _yes_no(catering, "--catering")
     ground_flag = _yes_no(ground_transportation, "--ground-transportation")
@@ -2231,9 +2292,22 @@ def booking_create(
         return code if _UUID_RE.match(code) else _resolve_airport(auth(), code)
 
     resolved_aircraft = aircraft_id or _get_default_aircraft(auth())
+
+    passenger_reads: dict[str, Any] = {}
+
+    def read_passenger(passenger_id: str) -> Any:
+        # One /my-passenger/{id} read per passenger, shared between default
+        # passport resolution and the border-crossing document guard.
+        if passenger_id not in passenger_reads:
+            passenger_reads[passenger_id] = api_get(auth(), f"/my-passenger/{passenger_id}")
+        return passenger_reads[passenger_id]
+
     passport_ids: dict[str, str | None] = {}
     for passenger_id in passenger_ids:
-        passport_ids[passenger_id] = passport_by_passenger.get(passenger_id) or _passenger_default_passport_id(auth(), passenger_id)
+        passport_ids[passenger_id] = (
+            passport_by_passenger.get(passenger_id)
+            or _passenger_default_passport_id(read_passenger(passenger_id))
+        )
 
     legs: list[dict[str, Any]] = []
     summary: list[dict[str, Any]] = []
@@ -2271,7 +2345,7 @@ def booking_create(
         ),
     )
     route_check = _booking_route_check(payload, typed_routes, us_touching, international)
-    _require_passports_for_international_trip(payload, route_check)
+    _require_international_travel_documents(payload, route_check, read_passenger)
     _apply_booking_destination_address(payload, destination, route_check)
 
     if dry_run:

@@ -137,11 +137,14 @@ and destination checks first read airports and passengers; nothing is written):
 
 - **Baggage must be answered.** Repeat `--baggage NAME=QUANTITY`, or say
   `--baggage none` when travelling without bags. A forgotten answer is refused.
-- **Border crossings need passports.** When any leg crosses a border, every
-  passenger must have a passport on file (`passport list`). The CLI uses each
-  passenger's first saved passport, as the app does; pick another with
-  `--passport PAX_UUID=PASSPORT_UUID`. Create missing ones with
-  `passport create` first.
+- **Border crossings need passports with photos.** When any leg crosses a
+  border, every passenger must have a passport on file (`passport list`), and
+  that passport must have its photo/scan uploaded — AirSprint requires the
+  passport image before departure, so a passport with no scan is refused. The
+  CLI uses each passenger's first saved passport, as the app does; pick another
+  with `--passport PAX_UUID=PASSPORT_UUID`. Create missing ones with
+  `passport create` (which requires the photo) or attach a scan to an existing
+  passport with `passport upload-document --id PASSPORT_UUID --file ...`.
 - **US-touching and international trips need a destination address** (hotel,
   residence, ...): `--destination-street/-city/-state/-zip`, plus
   `--destination-street2` for a unit. It is copied to every passenger on every

@@ -894,6 +894,87 @@ class AirSprintCliTests(unittest.TestCase):
         self.assertIn("No booking was sent", result.output)
         post.assert_not_called()
 
+    def international_document_patches(self, passenger):
+        """Patches for a Canada->US booking whose passenger read is `passenger`."""
+        return (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "_resolve_airport", side_effect=lambda token, code: f"{code.lower()}-id"),
+            patch.object(cli, "_get_default_aircraft", return_value="aircraft-id"),
+            patch.object(cli, "_airport_country", side_effect=self.airport_country_by_id),
+            patch.object(cli, "api_get", **passenger),
+        )
+
+    def test_international_booking_refuses_a_passport_without_a_photo_scan(self) -> None:
+        passenger = {"data": {"passportIds": ["passport-1"], "passports": [{"id": "passport-1", "image": ""}]}}
+        patches = self.international_document_patches({"return_value": passenger})
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(cli, "api_post") as post:
+            result = self.runner.invoke(cli.app, [
+                "booking", "create", "--leg", "CYUL>KTEB@2026-09-01T16:00",
+                "--passengers", "saved-1", "--baggage", "none",
+                "--destination-street", "1 Main St", "--destination-city", "New York",
+                "--destination-state", "NY", "--destination-zip", "10001",
+            ])
+
+        self.assertEqual(result.exit_code, cli.EXIT_VALIDATION, result.output)
+        self.assertIn("no photo/scan uploaded: saved-1", result.output)
+        self.assertIn("passport upload-document", result.output)
+        self.assertIn("No booking was sent", result.output)
+        post.assert_not_called()
+
+    def test_international_booking_accepts_a_passport_with_a_photo_scan(self) -> None:
+        passenger = {"data": {"passportIds": ["passport-1"], "passports": [{"id": "passport-1", "image": "passport/scan.jpg"}]}}
+        patches = self.international_document_patches({"return_value": passenger})
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(cli, "api_post") as post:
+            result = self.runner.invoke(cli.app, [
+                "booking", "create", "--leg", "CYUL>KTEB@2026-09-01T16:00",
+                "--passengers", "saved-1", "--baggage", "none",
+                "--destination-street", "1 Main St", "--destination-city", "New York",
+                "--destination-state", "NY", "--destination-zip", "10001", "--dry-run",
+            ])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.output)["data"]
+        self.assertIs(data["routeCheck"]["international"], True)
+        post.assert_not_called()
+
+    def test_international_booking_verifies_scan_for_a_passport_answered_passenger(self) -> None:
+        # --passport answers the id, so the passenger read is needed only for the
+        # scan check; passport-9 has no image, so the booking is still refused.
+        passenger = {"data": {"passportIds": ["passport-9"], "passports": [{"id": "passport-9", "image": ""}]}}
+        patches = self.international_document_patches({"return_value": passenger})
+        with patches[0], patches[1], patches[2], patches[3], patches[4] as read, patch.object(cli, "api_post") as post:
+            result = self.runner.invoke(cli.app, [
+                "booking", "create", "--leg", "CYUL>KTEB@2026-09-01T16:00",
+                "--passengers", "saved-1", "--passport", "saved-1=passport-9", "--baggage", "none",
+                "--destination-street", "1 Main St", "--destination-city", "New York",
+                "--destination-state", "NY", "--destination-zip", "10001",
+            ])
+
+        self.assertEqual(result.exit_code, cli.EXIT_VALIDATION, result.output)
+        self.assertIn("no photo/scan uploaded: saved-1", result.output)
+        read.assert_called_once_with("token", "/my-passenger/saved-1")
+        post.assert_not_called()
+
+    def test_international_booking_reports_missing_passport_and_missing_scan_together(self) -> None:
+        def read(token, path):
+            if path.endswith("saved-1"):
+                return {"data": {"passportIds": ["passport-1"], "passports": [{"id": "passport-1", "image": ""}]}}
+            return {"data": {"passportIds": [], "passports": []}}
+
+        patches = self.international_document_patches({"side_effect": read})
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(cli, "api_post") as post:
+            result = self.runner.invoke(cli.app, [
+                "booking", "create", "--leg", "CYUL>KTEB@2026-09-01T16:00",
+                "--passengers", "saved-1,saved-2", "--baggage", "none",
+                "--destination-street", "1 Main St", "--destination-city", "New York",
+                "--destination-state", "NY", "--destination-zip", "10001",
+            ])
+
+        self.assertEqual(result.exit_code, cli.EXIT_VALIDATION, result.output)
+        self.assertIn("without a passport on file: saved-2", result.output)
+        self.assertIn("no photo/scan uploaded: saved-1", result.output)
+        post.assert_not_called()
+
     def test_international_booking_requires_a_destination_even_outside_the_us(self) -> None:
         countries = {"cyul-id": ("Canada", "CYUL"), "mmmx-id": ("Mexico", "MMMX")}
         with (

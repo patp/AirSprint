@@ -217,7 +217,11 @@ lookups (airport mirror, `GET /my-passenger/{id}` for passports):
   `--baggage none`); the app allows silently sending an empty list.
 - A trip whose legs cross a border refuses to book a passenger without a
   passport on file (the app only warns). Each passenger's first passport is
-  used, as the app does; `--passport PAX=PASSPORT` overrides.
+  used, as the app does; `--passport PAX=PASSPORT` overrides. When the
+  `GET /my-passenger/{id}` read returns the full passport records, a selected
+  passport with no photo/scan uploaded (`image` empty) is refused too, since
+  AirSprint requires the passport image before departure; a thin response that
+  carries only `passportIds` still enforces the on-file rule.
 - US-touching and international trips require a destination address on every
   passenger of every leg.
 - Airport countries come from the local airport mirror (ICAO prefix as a
