@@ -1,6 +1,6 @@
 ---
 name: airsprint-cli
-description: Use the local AirSprint owner CLI for trips, booking, passengers, passports, Canadian customs, My Network, hours exchange, quotes, and current Android-app-backed operations. Apply the live-booking no-probe rules before any trip or leg access.
+description: Use the local AirSprint owner CLI for trips, booking, passengers, passports, Canadian customs, My Network, hours exchange, quotes, and current Android-app-backed operations. Every write is a typed form (options), never JSON. Apply the live-booking no-probe rules before any trip or leg access.
 ---
 
 # AirSprint CLI agent guide
@@ -27,9 +27,29 @@ Credentials come from `AIRSPRINT_USERNAME` and `AIRSPRINT_PASSWORD`, or the
 `--username` and `--password` options. The token is stored with mode 0600 in
 `~/.airsprint_api_token.json`. Set `AIRSPRINT_TIMEZONE` for local date input.
 
-JSON is the default output. Do not add `--json` except on `trips list`, where it
-is accepted as an explicit alias. Use `--format human` for human output and
-`--compact` for token-efficient JSON.
+JSON is the default output; there is no `--json` flag. Use `--format human`
+for human output and `--compact` for token-efficient JSON.
+
+## Forms, not JSON
+
+Every command that writes to AirSprint is a form: you answer questions with
+options (`--leg`, `--passengers`, `--catering yes`, ...) and the CLI builds the
+exact Android 6.1.4 request body itself. No public command accepts JSON, a
+`--body`, or any API field name. You never need to know the wire format.
+
+- IDs are the only internals you handle: passenger, passport, pet, flight,
+  trip, leg, airport, and aircraft UUIDs. Get them from list/info commands.
+- Yes/no questions take `yes` or `no`. Choice questions take lowercase words
+  with hyphens (`strongly-agree`, `suv-and-driver`); `--help` lists them.
+- Repeatable answers are written as `KEY=VALUE` and repeated
+  (`--baggage "Golf bag=2" --baggage Suitcase=1`, `--passport PAX_ID=PASSPORT_ID`).
+- Addresses are either separate options (`--destination-street/-city/-state/-zip`)
+  or one string `"STREET; CITY; STATE; ZIP[; UNIT]"` for ground-transport stops.
+- `--dry-run` prints `payload` — the exact request — so you can show the owner
+  what will be sent. Read it, never edit it. `--compact` trims API responses
+  but never a dry-run preview.
+- If a form has no option for what the owner wants, say so; do not look for a
+  raw or JSON way around it.
 
 ## Efficient agent usage
 
@@ -65,9 +85,8 @@ is accepted as an explicit alias. Use `--format human` for human output and
 ## Trips
 
 ```bash
-# JSON is already the default; --json is an accepted explicit alias here.
 python3 scripts/airsprint_cli.py trips list --upcoming --compact
-python3 scripts/airsprint_cli.py trips list --past --limit 20 --json
+python3 scripts/airsprint_cli.py trips list --past --limit 20
 
 # One trip GET. During the post-write cooldown, this exits without probing.
 python3 scripts/airsprint_cli.py trips get --id BOOKING_OR_TRIP_UUID
@@ -78,17 +97,111 @@ python3 scripts/airsprint_cli.py trips show --id TRIP_UUID --compact
 
 # Download or obtain the manifest PDF URL.
 python3 scripts/airsprint_cli.py trips tripsheet --id TRIP_UUID --output trip.pdf
+
+# Email the manifest (one POST; --confirm required).
+python3 scripts/airsprint_cli.py trips manifest-send \
+  --trip-id TRIP_UUID --to "owner@example.com,assistant@example.com" --confirm
 ```
 
 Prefer a trip UUID for `get`, `show`, or `tripsheet`. A booking code requires a
 bounded `/my-leg` lookup first. `trips show` is the operations view; `trips get`
 returns only the API trip object.
 
+## Booking a trip
+
+`booking create` is the app's booking form. Run `booking info` first for the
+aircraft, saved-passenger, pet, and airport IDs; `booking baggage-types` lists
+the baggage names. Airports may be ICAO codes or airport UUIDs. Leg times are
+the local wall-clock time at the departure airport, `YYYY-MM-DDTHH:MM`, exactly
+as typed in the app (no timezone suffix).
+
+```bash
+python3 scripts/airsprint_cli.py booking create \
+  --leg "CYUL>KTEB@2026-09-01T09:00" \
+  --leg "KTEB>CYUL@2026-09-03T17:30" \
+  --passengers SAVED_PAX_UUID_1,SAVED_PAX_UUID_2 \
+  --pets PET_UUID \
+  --baggage "Golf bag=2" --baggage Suitcase=2 \
+  --catering yes --catering-request "Light lunch for two" \
+  --ground-transportation yes --ground-transportation-when arrival \
+  --ground-transportation-method sedan-and-driver \
+  --ground-dropoff-address "1 Main St; New York; NY; 10001" \
+  --destination-street "1 Main St" --destination-city "New York" \
+  --destination-state NY --destination-zip 10001 \
+  --note "Owner prefers early boarding" \
+  --dry-run
+```
+
+Form rules the CLI enforces before the booking request is sent (the passport
+and destination checks first read airports and passengers; nothing is written):
+
+- **Baggage must be answered.** Repeat `--baggage NAME=QUANTITY`, or say
+  `--baggage none` when travelling without bags. A forgotten answer is refused.
+- **Border crossings need passports.** When any leg crosses a border, every
+  passenger must have a passport on file (`passport list`). The CLI uses each
+  passenger's first saved passport, as the app does; pick another with
+  `--passport PAX_UUID=PASSPORT_UUID`. Create missing ones with
+  `passport create` first.
+- **US-touching and international trips need a destination address** (hotel,
+  residence, ...): `--destination-street/-city/-state/-zip`, plus
+  `--destination-street2` for a unit. It is copied to every passenger on every
+  leg, including the return to Canada.
+- Airport countries come from the local mirror. Run `cache refresh` when they
+  are missing, or answer `--us-touching/--not-us-touching` and
+  `--international/--domestic` explicitly.
+- Catering, ground transportation, and `--note` apply to every leg. Adjust a
+  single leg afterwards with `leg update-required-info`.
+- Seats default to the number of passengers. `--aircraft-id` defaults to the
+  account's aircraft.
+- Sharing is off by default. `--open-to-share yes` with `--share-network
+  my-network|airsprint-network`, `--share-seats`, `--share-groups`,
+  `--share-pets-allowed`, `--share-children-allowed`, and
+  `--share-cost-percentage` (30–80, app default 50) mirrors the app's share
+  settings. `--special-requests` is the free-text field shown with the trip.
+- `--dog-form-submitted yes` only when the CDC dog-import form is already
+  submitted (dogs entering the US).
+
+The account is implicit in the auth token; nothing account-related is sent.
+The dry run's `routeCheck` shows the detected countries, `usTouching`, and
+`international` so you can confirm them with the owner.
+
+Booking an existing flight from `explore flights` uses the same vocabulary but
+a shorter form (no arrival-side transport, no note, no passports — the app does
+not send them for these flights):
+
+```bash
+python3 scripts/airsprint_cli.py booking empty-leg \
+  --flight-id FLIGHT_UUID --passengers SAVED_PAX_UUID --baggage none --dry-run
+python3 scripts/airsprint_cli.py booking shared-flight \
+  --flight-id FLIGHT_UUID --passengers SAVED_PAX_UUID_1,SAVED_PAX_UUID_2 \
+  --baggage Suitcase=1 \
+  --destination-street "1 Main St" --destination-city "New York" \
+  --destination-state NY --destination-zip 10001
+python3 scripts/airsprint_cli.py booking lock --flight-id FLIGHT_UUID            # hold
+python3 scripts/airsprint_cli.py booking lock --flight-id FLIGHT_UUID --release  # release
+```
+
+An existing-flight booking never carries a customs declaration: the app's
+`BookSharedPassenger` sends only `id` and `destinationAddress`. Declare customs
+with `customs create` and attach the declaration afterwards with
+`leg update-required-info --customs`.
+
+Cancellation is one confirmed request with no read-back:
+
+```bash
+python3 scripts/airsprint_cli.py booking cancel \
+  --leg-id LEG_UUID --reason "Plans changed" --dry-run
+python3 scripts/airsprint_cli.py booking cancel \
+  --leg-id LEG_UUID --reason "Plans changed" --confirm
+```
+
+Android 6.1.4 sends only `legId` and `reason`; do not add a booking code,
+`tripId`, or a list of legs.
+
 ## Updating passengers on a booked leg
 
-`PATCH /leg/{id}` replaces `options.passengers` completely. Never construct a
-one-passenger payload. The identifier sent as each passenger `id` must be the
-saved passenger UUID, never `legPassenger.id`.
+`PATCH /leg/{id}` replaces the passenger list completely. The CLI always sends
+the full current list, keyed by saved passenger UUID, never `legPassenger.id`.
 
 ```bash
 # Makes one GET and prints the complete kept/added/dropped plan; no PATCH.
@@ -103,60 +216,31 @@ python3 scripts/airsprint_cli.py leg update-passengers \
 The command refuses to PATCH if any existing leg passenger cannot be mapped to
 a saved passenger UUID. This prevents accidental passenger loss.
 
-For other Android leg-required-information fields, use the source-validated
-command below. If `passengers` appears in the body, it performs the same
-complete-list merge and prints `kept`, `updated`, and `dropped` before one
-PATCH:
+## Completing a booked leg's required information
+
+`leg update-required-info` is the app's "required information" form for one
+leg: passports, customs declarations, destination address, seats, pets,
+baggage, catering, ground transportation, note, and the CDC dog form. Only the
+sections you answer are sent. Passenger answers (`--passport`, `--customs`,
+`--destination-*`) trigger one guarded leg GET so the complete passenger list
+is preserved; the dry run prints `kept`/`updated`/`dropped`.
 
 ```bash
 python3 scripts/airsprint_cli.py leg update-required-info \
-  --leg-id LEG_UUID --body "$ANDROID_LEG_OPTIONS" --dry-run
+  --leg-id LEG_UUID \
+  --passport SAVED_PAX_UUID=PASSPORT_UUID \
+  --customs SAVED_PAX_UUID=DECLARATION_UUID \
+  --destination-street "1 Main St" --destination-city "New York" \
+  --destination-state NY --destination-zip 10001 \
+  --dry-run
 python3 scripts/airsprint_cli.py leg update-required-info \
-  --leg-id LEG_UUID --body "$ANDROID_LEG_OPTIONS" --confirm
+  --leg-id LEG_UUID --pets PET_UUID --baggage Suitcase=2 \
+  --ground-transportation yes --ground-transportation-when departure \
+  --ground-transportation-method taxi --confirm
 ```
 
-Never use raw PATCH to send one passenger to either leg endpoint.
-
-## Booking creation and US destination addresses
-
-The account is implicit in the auth token. Never send top-level `accountId`.
-Every leg requires `departureAirportId`, `arrivalAirportId`, `aircraftId`,
-`date`, `numberOfSeats`, `passengers`, `petIds`, and `requestSettings` with both
-`cateringRequired` and `groundTransportationRequired`.
-
-For any US-touching trip, provide one destination address containing exactly
-the required fields. The CLI copies it to every passenger object on every leg,
-including the Canadian return leg, and refuses to publish if it is missing.
-
-```bash
-ADDRESS='{"street":"1 Main St","city":"New York","state":"NY","zip":"10001","country":"United States"}'
-
-python3 scripts/airsprint_cli.py booking create \
-  --body "$BOOKING_JSON" --destination-address "$ADDRESS" --dry-run
-
-python3 scripts/airsprint_cli.py booking create \
-  --body "$BOOKING_JSON" --destination-address "$ADDRESS"
-```
-
-Airport-country detection uses the local mirror. Run `cache refresh` when IDs
-are missing. Use `--us-touching` or `--not-us-touching` only when explicitly
-overriding unresolved cache data.
-
-`shareSettings` is required. `networkType` is `MY_NETWORK` or
-`AIRSPRINT_NETWORK`. `joinerVariableCostPercentage`, when present, must be
-between 30 and 80. If `specificGroupsOnly` is true, `groupIds` is required.
-
-Cancellation is one confirmed request with no read-back:
-
-```bash
-python3 scripts/airsprint_cli.py booking cancel \
-  --leg-id LEG_UUID --reason "Plans changed" --dry-run
-python3 scripts/airsprint_cli.py booking cancel \
-  --leg-id LEG_UUID --reason "Plans changed" --confirm
-```
-
-Android 6.1.4 sends only `legId` and `reason`; do not add a booking code,
-`tripId`, or a list of legs.
+Passengers cannot be added or dropped here; use `leg update-passengers`.
+Airports, aircraft, date, and share settings are not editable through this form.
 
 ## Saved passengers and passports
 
@@ -173,6 +257,34 @@ printed three-letter issuing-country code (for example, `CAN`) as though it
 were the API's two-letter `nationality` value (for example, `CA`). Visually
 verify the scan before proposing any saved-passport replacement.
 
+Creating a passenger is the app's "Add New Person" form. Answer the form's
+questions with options; `--save-profile yes|no` is required, with no default:
+
+- `--save-profile yes` — add the person to Saved Passengers (web default).
+- `--save-profile no` — this booking only; the person is created (a leg needs
+  the UUID) but hidden from the saved list.
+
+```bash
+python3 scripts/airsprint_cli.py passenger create \
+  --first-name Jean --last-name Tremblay --gender male --category adult \
+  --save-profile no --dry-run
+python3 scripts/airsprint_cli.py passenger create \
+  --first-name Jean --last-name Tremblay --gender male --category adult \
+  --save-profile no
+python3 scripts/airsprint_cli.py leg update-passengers --leg-id LEG_UUID --add NEW_PAX_UUID --confirm
+```
+
+First name, last name, and `--gender` are mandatory, exactly as in the app
+(`male`, `female`, or `x` — the app asks for gender to estimate aircraft weight
+and balance; `x` is "prefer not to specify"). `--category` is `adult` (12+),
+`child` (2–11), or `infant` (<2; default adult); `--middle-name` and `--email`
+are optional (the form has no flight-preferences field; the app sends it
+empty). `passenger update --id UUID` edits the profile the way the app's form
+does: pass only what changes, and the CLI reads the current profile and sends
+the complete form back (`--dry-run` still does that read). The saved-passenger
+choice is made once, at creation; `passenger list` reports it as `isActive` —
+read it as "saved profile", the app never changes it afterwards.
+
 Working deletion routes use HTTP DELETE:
 
 ```bash
@@ -186,10 +298,36 @@ Do not use `POST /my-passenger/{id}/delete` or
 `POST /my-passport/{id}/delete`; those return 404. Passport number/date PATCH is
 not supported and is not advertised.
 
-Use the complete Android document workflow when a local scan must be attached.
-It initializes the upload, performs one presigned multipart POST, and attaches
-the returned storage path. The limit is 20 MiB and the command never retries a
-storage write:
+AirSprint's concierge says a passport photo is not mandatory but is highly
+recommended to avoid customs-clearance delays. The CLI intentionally makes it
+mandatory for `passport create`: agents must supply `--file` and the command
+must create the record, initialize one upload, perform one presigned multipart
+POST, and attach the returned storage path. Accept only a real JPEG, PNG, or
+PDF scan up to 20 MiB. Validate its signature before authentication or any API
+write. Require `--confirm` for a real run. Never retry a create, upload, attach,
+or automatically read back. If creation succeeds but upload fails, report the
+new passport UUID and direct the agent to `passport upload-document`; never
+rerun `passport create`.
+
+```bash
+python3 scripts/airsprint_cli.py passport create \
+  --passenger-id SAVED_PAX_UUID \
+  --passport-number AB123456 \
+  --date-of-birth 1980-01-02 --expiration-date 2031-03-04 \
+  --nationality CA --issuing-authority "QUÉBEC" \
+  --file passport.pdf --timezone America/Toronto \
+  --dry-run
+python3 scripts/airsprint_cli.py passport create \
+  --passenger-id SAVED_PAX_UUID \
+  --passport-number AB123456 \
+  --date-of-birth 1980-01-02 --expiration-date 2031-03-04 \
+  --nationality CA --issuing-authority "QUÉBEC" \
+  --file passport.pdf --timezone America/Toronto \
+  --confirm
+```
+
+For an already-created passport, use the same complete Android document
+workflow. The storage write is never retried:
 
 ```bash
 python3 scripts/airsprint_cli.py passport upload-document \
@@ -202,20 +340,17 @@ python3 scripts/airsprint_cli.py pet upload-document \
   --document-type vaccinationDocument --confirm
 ```
 
-`POST /my-passport/create` expects `dateOfBirth` and `expirationDate` in epoch
-milliseconds, although later API responses may store seconds. `passport create`
-accepts ISO dates, epoch seconds, or epoch milliseconds and always sends ms.
-Android 6.1.4 parses `yyyy-MM-dd` at device-local midnight before taking
-`millisecondsSinceEpoch`. For timezone-less ISO input, always pass `--tz` (or
-set `AIRSPRINT_TIMEZONE`) so the CLI preserves the same calendar date in the
-Android UI; the CLI refuses ambiguous input without it. This is the Android
-device timezone, not a fixed AirSprint HQ/Calgary timezone. Use
-`America/Edmonton` only when that is the device's configured timezone.
+Android 6.1.4 parses `yyyy-MM-dd` passport dates at device-local midnight. For
+timezone-less ISO input, always pass `--timezone` (or set `AIRSPRINT_TIMEZONE`)
+so the CLI preserves the same calendar date in the Android UI; the CLI refuses
+ambiguous input without it. This is the Android device timezone, not a fixed
+AirSprint HQ/Calgary timezone. Use `America/Edmonton` only when that is the
+device's configured timezone.
 
 Android 6.1.4 supports an authority-only update with one
-`PATCH /my-passport/{id}` and an `options.issuingAuthority` payload. Copy the
-printed `Authority/Autorité` exactly and use `passport update-authority`; do not
-extend this to passport numbers or dates, which have not persisted reliably:
+`PATCH /my-passport/{id}`. Copy the printed `Authority/Autorité` exactly and use
+`passport update-authority`; do not extend this to passport numbers or dates,
+which have not persisted reliably:
 
 ```bash
 python3 scripts/airsprint_cli.py passport update-authority \
@@ -224,18 +359,11 @@ python3 scripts/airsprint_cli.py passport update-authority \
   --id PASSPORT_UUID --authority 'OTTAWA' --confirm
 ```
 
-The app displays the first UUID in a passenger's `passportIds` array;
-`selectedPassportId` does not persist. Use:
+The app displays the first passport of a passenger and uses it when booking;
+`selectedPassportId` does not persist. Reorder with one passenger GET and one
+PATCH:
 
 ```bash
-# Create and then place the returned passport first for this passenger.
-python3 scripts/airsprint_cli.py passport create \
-  --passenger-id SAVED_PAX_UUID \
-  --body '{"dateOfBirth":"1980-01-02","expirationDate":"2031-03-04"}' \
-  --tz America/Toronto \
-  --dry-run
-
-# Reorder an existing passport to first. One passenger GET and one PATCH.
 python3 scripts/airsprint_cli.py passport make-primary \
   --passenger-id SAVED_PAX_UUID --passport-id PASSPORT_UUID --dry-run
 python3 scripts/airsprint_cli.py passport make-primary \
@@ -244,24 +372,38 @@ python3 scripts/airsprint_cli.py passport make-primary \
 
 ## Canadian customs
 
-Use `POST /canadianCustomsDeclaration/create`. The required IDs are
-`legPassenger.id` values from the booked leg, not saved passenger IDs.
-`purposeOfTravel` is `BUSINESS` or `PLEASURE`. There is one `date` field: the
-outbound departure leaving Canada. It is not the return or signature date.
+`customs create` is the app's "Canadian Customs Declaration" form. Name the
+passengers of one leg leaving Canada (max 4 per declaration, same address);
+the CLI resolves their leg-passenger IDs, creates the declaration link the app
+creates when the form opens, and submits one declaration per person.
 
 ```bash
 python3 scripts/airsprint_cli.py customs create \
   --booking BOOKING_CODE \
   --passengers "Jane Doe,John Doe" \
   --purpose PLEASURE \
-  --description "Family visit" \
+  --date 2026-09-01 --timezone America/Montreal \
+  --has-pet no \
+  --has-alcohol-or-tobacco yes --alcohol-type wine --alcohol-volume "2 x 750 ml" --alcohol-value-cad 45.50 \
+  --has-imported-goods no \
+  --has-high-value-currency no \
+  --souvenir-items "Maple syrup" \
   --dry-run
 ```
 
-This resolves names to legPassenger UUIDs and defaults `date` from the outbound
-leg. One request containing several IDs creates one declaration per person.
-Optional flags cover pets, alcohol/tobacco, imported goods, US-imported goods,
-high-value currency, and souvenir items.
+- Every yes/no question must be answered; the details behind a "yes" are
+  required, exactly as the app validates: alcohol/tobacco needs type, volume
+  and CAD value; imported goods need a description, `--imported-goods-currency`
+  (`CAD | USD`) and `--imported-goods-from-us yes|no`; high-value currency
+  needs a description. `--description` is required for `BUSINESS`.
+- `--date` is the form's "Date" (the Traveller Declaration Form section), a
+  calendar day. It needs `--timezone`/`AIRSPRINT_TIMEZONE` because the app
+  sends that day's local midnight in UTC. The departure date is not part of
+  the request; the server already knows it from the leg.
+- `--link-id` reuses a link from `customs link-create`; omit it and the CLI
+  creates one for the leg first, as the app does.
+- Payment-authorization card details are deliberately not accepted;
+  certification/signature stays in the AirSprint app.
 
 ```bash
 python3 scripts/airsprint_cli.py customs update-date \
@@ -274,16 +416,39 @@ python3 scripts/airsprint_cli.py customs update-date \
 returns 400. Signature/certification is not exposed by the API. Always tell the
 owner to complete the signature in the app.
 
-## Empty legs, network, hours, and raw access
+## Surveys and feedback
+
+Both are the app's questionnaires for one completed leg (never a trip ID):
+
+```bash
+python3 scripts/airsprint_cli.py booking survey --leg-id LEG_UUID \
+  --booking-experience strongly-agree --response-time agree \
+  --concierge-interest agree --concierge-help yes --itinerary-on-time yes \
+  --comments "Smooth as always" --dry-run
+
+python3 scripts/airsprint_cli.py feedback submit --leg-id LEG_UUID \
+  --snacks-and-amenities very-satisfied --aircraft-condition excellent \
+  --crew exceptional --fbo satisfied --catering-and-transport good \
+  --contact-me no --dry-run
+```
+
+`feedback submit` derives the app's overall score from the five answers.
+`--contact-me` is optional; when unanswered the app sends no `contact` key.
+
+## Empty legs, network, hours, and quotes
 
 - Use `explore flights --compact` for empty legs. Snapshot/diff belongs to the
   caller; the CLI does not maintain snapshots.
 - Use `network connections` and `network groups`; follower/social commands are
   retired and intentionally absent.
 - `hours estimate` and `hours power` are GET calls with query parameters.
-- `raw api-patch` and `raw api-delete` require `--confirm` or `--dry-run`.
-- A raw trip/leg GET observes the same post-write no-probe cooldown.
-- Raw commands are escape hatches, not permission to bypass typed safeguards.
+  `hours listing-create --action buy|sell --hours 10` lists hours on the
+  exchange (one POST; the account aircraft is resolved automatically).
+- `quote flight` / `quote roundtrip` price a route. `quote cost --aircraft
+  citation-cj3-plus --quote-price 12345 --flight-minutes 95` estimates one
+  leg's miscellaneous costs; run it once per leg. Answer `--owned-aircraft`
+  (and optionally `--flown-aircraft`) only when pricing an interchange —
+  flying a type other than the one owned.
 
 ## Other Android-backed functions
 

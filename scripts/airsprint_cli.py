@@ -60,6 +60,11 @@ DATA_CACHE_TTL = 7 * 24 * 3600  # 7 days
 ACCOUNT_CACHE_TTL = 15 * 60
 EPOCH_MILLISECONDS_THRESHOLD = 10_000_000_000
 ANDROID_DOCUMENT_MAX_BYTES = 20 * 1024 * 1024
+PASSPORT_SCAN_CONTENT_TYPES = frozenset({
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+})
 
 _API_REQUEST_COUNT = 0
 _API_REQUEST_LOCK = threading.Lock()
@@ -306,6 +311,31 @@ def _document_file(file_value: str, content_type: str | None) -> tuple[Path, str
     return path, mime
 
 
+def _passport_scan_file(file_value: str, content_type: str | None) -> tuple[Path, str]:
+    """Validate a passport photo/scan before any AirSprint write is sent."""
+    path, mime = _document_file(file_value, content_type)
+    if mime not in PASSPORT_SCAN_CONTENT_TYPES:
+        _die(
+            "Passport photo/scan must be JPEG, PNG, or PDF; "
+            f"got {mime or 'an unknown content type'}.",
+            EXIT_VALIDATION,
+        )
+    signatures = {
+        "application/pdf": b"%PDF-",
+        "image/jpeg": b"\xff\xd8\xff",
+        "image/png": b"\x89PNG\r\n\x1a\n",
+    }
+    expected = signatures[mime]
+    with path.open("rb") as stream:
+        header = stream.read(len(expected))
+    if header != expected:
+        _die(
+            f"Passport file contents do not match declared content type {mime}.",
+            EXIT_VALIDATION,
+        )
+    return path, mime
+
+
 def _android_document_upload(
     token: str,
     *,
@@ -325,15 +355,24 @@ def _android_document_upload(
     init_response = api_post(token, init_path, init_payload)
     init_data = _response_data(init_response)
     if not isinstance(init_data, dict):
-        _die("Upload init returned no data object.", EXIT_ERROR)
+        raise RuntimeError(json.dumps({
+            "status": "error",
+            "message": "Upload init returned no data object.",
+        }))
     presigned = init_data.get("presignedUpload")
     storage_path = init_data.get("storagePath")
     if not isinstance(presigned, dict) or not isinstance(storage_path, str):
-        _die("Upload init omitted presignedUpload or storagePath.", EXIT_ERROR)
+        raise RuntimeError(json.dumps({
+            "status": "error",
+            "message": "Upload init omitted presignedUpload or storagePath.",
+        }))
     upload_url = presigned.get("url")
     upload_fields = presigned.get("fields")
     if not isinstance(upload_url, str) or not isinstance(upload_fields, dict):
-        _die("Upload init returned an invalid presigned POST.", EXIT_ERROR)
+        raise RuntimeError(json.dumps({
+            "status": "error",
+            "message": "Upload init returned an invalid presigned POST.",
+        }))
     upload_status = _post_presigned_multipart(
         upload_url,
         upload_fields,
@@ -731,9 +770,122 @@ def _compact(value: Any) -> Any:
     return value
 
 
+# ---------------------------------------------------------------------------
+# Output presentation — the agent-facing view of AirSprint records
+# ---------------------------------------------------------------------------
+#
+# AirSprint responses carry backend mechanics: type discriminators, reverse
+# link tables, S3 URLs, FL3XX references, raw epoch integers and transport
+# envelopes. Agents need identifiers (passenger, leg, trip, passport, pet,
+# airport IDs, booking codes) and human-readable facts, nothing else, so every
+# API-derived value goes through _present() before printing. Dry-run previews
+# are printed verbatim: they show the exact request the CLI would send. The
+# one placeholder is `customs create` without --link-id, whose link ID only
+# exists once the app-style link POST has run (the preview says so).
+#
+# To extend: add backend-only keys to _INTERNAL_KEYS, add record-scoped
+# renames to _RECORD_RENAMES (keyed by AirSprint's "object" discriminator),
+# add whole-day fields to _DATE_ONLY_KEYS. Never hide or rename identifiers.
+
+_PRESENT_OUTPUT = True  # cleared by the hidden --internal root option
+_OUTPUT_TIMEZONE: str | None = None  # set by commands that accept --timezone
+
+_INTERNAL_KEYS = frozenset({
+    "object",
+    "accountUserIds", "legPassengerIds", "notificationIds", "notificationSettingId",
+    "legDraftGroupIds", "bookingSurveyItemIds", "feedbackSubmissionIds",
+    "activityLogIds", "hourExchangeListingIds", "accessLevelId",
+    "fl3xxDocumentId", "fl3xxExternalReference",
+    "icon",  # JSON-string duplicate of a notification's "data"
+    "airportImage", "backgroundImage", "featuredImage",
+    "arrivalAirportFeaturedImage", "departureAirportFeaturedImage",
+})
+_RECORD_RENAMES: dict[str, dict[str, str]] = {
+    "passenger": {"isActive": "savedProfile", "age": "category"},
+    "pet": {"isActive": "savedProfile"},
+    "passport": {
+        "dateOfBirthTimestamp": "dateOfBirth",
+        "expirationDateTimestamp": "expirationDate",
+        "image": "scanAttached",
+    },
+}
+_BOOLEAN_PRESENCE_KEYS = frozenset({"scanAttached"})
+_DATE_ONLY_KEYS = frozenset({"dateOfBirthTimestamp", "expirationDateTimestamp"})
+_EPOCH_KEY_RE = re.compile(r"(At|Time|Timestamp|Deadline|LastFlight)$|^time$")
+_EPOCH_MIN_SECONDS = 100_000_000  # 1973; anything smaller is a duration/count
+_GENDERS = ("MALE", "FEMALE", "NONE")
+# Android's passenger form shows Male / Female / X and maps X to GenderEnum.NONE
+# on the wire (AddNewPersonController::submit). The form's isValid requires
+# first name, last name, and a gender.
+_GENDER_ALIASES = {"X": "NONE"}
+
+
+def _gender(value: str, option: str = "--gender") -> str:
+    normalized = value.strip().upper()
+    return _enum(_GENDER_ALIASES.get(normalized, normalized), option, _GENDERS)
+_CATEGORIES = ("ADULT", "CHILD", "INFANT")
+
+
+def _output_timezone() -> str | None:
+    return _OUTPUT_TIMEZONE or os.environ.get("AIRSPRINT_TIMEZONE") or None
+
+
+def _present_epoch(value: int | float, key: str) -> str:
+    seconds = value / 1000 if value >= EPOCH_MILLISECONDS_THRESHOLD else value
+    try:
+        moment = datetime.fromtimestamp(seconds, tz=_tz_utc.utc)
+    except (OverflowError, OSError, ValueError):
+        return str(value)
+    tz = _output_timezone()
+    if tz and ZoneInfo:
+        try:
+            moment = moment.astimezone(ZoneInfo(tz))
+        except Exception:
+            pass
+    if key in _DATE_ONLY_KEYS:
+        return moment.strftime("%Y-%m-%d")
+    return moment.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _present(value: Any, key: str | None = None) -> Any:
+    """Return the agent-facing view of an AirSprint value (see section note)."""
+    if isinstance(value, dict):
+        if {"status", "httpStatusCode", "data"} <= set(value):
+            return _present(value["data"], key)
+        record = value.get("object")
+        renames = _RECORD_RENAMES.get(record, {}) if isinstance(record, str) else {}
+        shown: dict[str, Any] = {}
+        for field, item in value.items():
+            if field in _INTERNAL_KEYS:
+                continue
+            name = renames.get(field, field)
+            if field == "age" and item in _CATEGORIES:
+                name = "category"
+            if name in _BOOLEAN_PRESENCE_KEYS:
+                shown[name] = bool(item)
+                continue
+            shown[name] = _present(item, field)
+        return shown
+    if isinstance(value, list):
+        return [_present(item) for item in value]
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and key:
+        if key in _DATE_ONLY_KEYS:
+            return _present_epoch(value, key)
+        if _EPOCH_KEY_RE.search(key) and value >= _EPOCH_MIN_SECONDS:
+            return _present_epoch(value, key)
+    return value
+
+
 def _out(data: Any, fmt: str = "json", compact: bool = False) -> None:
-    """Print data as JSON (default) or human-readable. `compact` strips noise."""
-    if compact:
+    """Print data as JSON (default) or human-readable. `compact` strips noise.
+
+    API-derived data is passed through _present(); dry-run previews (top-level
+    "dry_run": true) are printed exactly as they would be sent.
+    """
+    is_dry_run = isinstance(data, dict) and data.get("dry_run") is True
+    if _PRESENT_OUTPUT and not is_dry_run:
+        data = _present(data)
+    if compact and not is_dry_run:
         data = _compact(data)
     if fmt == "json":
         indent = None if compact else 2
@@ -764,6 +916,87 @@ def _print_dict(d: dict[str, Any], indent: int = 0) -> None:
 def _die(message: str, code: int = EXIT_ERROR) -> None:
     print(json.dumps({"status": "error", "message": message}), file=sys.stderr)
     raise typer.Exit(code)
+
+
+# ---------------------------------------------------------------------------
+# Form-input helpers — every write command is a typed form
+# ---------------------------------------------------------------------------
+#
+# Agents answer questions the way the AirSprint app asks them (yes/no, a
+# choice from a list, a comma-separated list of IDs). The CLI alone turns those
+# answers into the request bodies Android 6.1.4 sends. Public commands must not
+# accept raw JSON bodies; test_public_commands_do_not_accept_raw_json enforces
+# that. Maintainers keep the hidden `raw` group for anything else.
+
+
+def _yes_no(value: str | None, option: str) -> bool:
+    normalized = (value or "").strip().lower()
+    if normalized in ("yes", "y", "true"):
+        return True
+    if normalized in ("no", "n", "false"):
+        return False
+    _die(f'{option} must be "yes" or "no".', EXIT_VALIDATION)
+
+
+def _optional_yes_no(value: str | None, option: str) -> bool | None:
+    return None if value is None else _yes_no(value, option)
+
+
+def _enum(value: str, option: str, allowed: tuple[str, ...]) -> str:
+    normalized = value.strip().upper().replace("-", "_").replace(" ", "_")
+    if normalized not in allowed:
+        _die(f"{option} must be one of: " + ", ".join(allowed), EXIT_VALIDATION)
+    return normalized
+
+
+def _optional_enum(value: str | None, option: str, allowed: tuple[str, ...]) -> str | None:
+    return None if value is None else _enum(value, option, allowed)
+
+
+def _csv(value: str | None, option: str, *, required: bool = False) -> list[str]:
+    items = [item.strip() for item in (value or "").split(",") if item.strip()]
+    if required and not items:
+        _die(f"{option} must contain at least one value.", EXIT_VALIDATION)
+    seen: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.append(item)
+    return seen
+
+
+def _required_text(value: str | None, option: str) -> str:
+    if value is None or not value.strip():
+        _die(f"{option} is required.", EXIT_VALIDATION)
+    return value.strip()
+
+
+def _int_between(value: int | float | None, option: str, low: int, high: int) -> int | float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not low <= value <= high:
+        _die(f"{option} must be between {low} and {high}.", EXIT_VALIDATION)
+    return value
+
+
+def _key_value_pairs(values: list[str] | None, option: str) -> dict[str, str]:
+    """Parse repeated KEY=VALUE options into a dict, refusing duplicates."""
+    pairs: dict[str, str] = {}
+    for raw in values or []:
+        key, sep, item = raw.partition("=")
+        key, item = key.strip(), item.strip()
+        if not sep or not key or not item:
+            _die(f"{option} expects KEY=VALUE, got: {raw}", EXIT_VALIDATION)
+        if key in pairs:
+            _die(f"{option} lists {key} twice.", EXIT_VALIDATION)
+        pairs[key] = item
+    return pairs
+
+
+def _use_timezone(timezone: str | None) -> None:
+    """Make --timezone also govern how timestamps are displayed."""
+    global _OUTPUT_TIMEZONE
+    if timezone:
+        _OUTPUT_TIMEZONE = timezone
 
 
 def _parse_local_dt(value: str, tz: str | None) -> str:
@@ -846,7 +1079,11 @@ messages_app = typer.Typer(help="In-app message commands", no_args_is_help=True)
 feedback_app = typer.Typer(help="Feedback commands", no_args_is_help=True)
 quote_app = typer.Typer(help="Quotes & cost estimates (via api.airsprint.com)", no_args_is_help=True)
 cache_app = typer.Typer(help="Local data mirror (airports, aircraft) at ~/.airsprint_cache.json", no_args_is_help=True)
-raw_app = typer.Typer(help="Raw api.airsprint.com escape hatches. Use when no typed command exists.", no_args_is_help=True)
+raw_app = typer.Typer(
+    help="Maintainer-only raw api.airsprint.com access. Hidden from agents; every command needs --allow-raw.",
+    no_args_is_help=True,
+    hidden=True,
+)
 account_app = typer.Typer(help="Account-user management (invite, update, roles)", no_args_is_help=True)
 passenger_app = typer.Typer(help="Saved passengers", no_args_is_help=True)
 passport_app = typer.Typer(help="Saved passports & passport documents", no_args_is_help=True)
@@ -869,7 +1106,7 @@ app.add_typer(messages_app, name="messages")
 app.add_typer(feedback_app, name="feedback")
 app.add_typer(quote_app, name="quote")
 app.add_typer(cache_app, name="cache")
-app.add_typer(raw_app, name="raw")
+app.add_typer(raw_app, name="raw", hidden=True)
 app.add_typer(account_app, name="account")
 app.add_typer(passenger_app, name="passenger")
 app.add_typer(passport_app, name="passport")
@@ -913,8 +1150,17 @@ def app_options(
         is_eager=True,
         help="Print the canonical SKILL.md agent guide and exit.",
     ),
+    internal: bool = typer.Option(
+        False,
+        "--internal",
+        hidden=True,
+        help="Maintainers: print AirSprint responses verbatim instead of the agent-facing view.",
+    ),
 ):
     """AirSprint owner operations. Use --skill for agent-safe workflows."""
+    global _PRESENT_OUTPUT
+    if internal:
+        _PRESENT_OUTPUT = False
 
 
 # ---------------------------------------------------------------------------
@@ -1030,20 +1276,67 @@ def user_preferences(
     _out(data, fmt)
 
 
+_NOTIFICATION_SETTINGS = (
+    # Toggle names shown by `messages settings`, as stored by AirSprint.
+    "emptyLegConfirmed", "bookingConfirmed", "bookingSurveyRequest",
+    "feedbackSurveyRequest", "flightCompleted", "upcomingTripTomorrow",
+    "itineraryUploaded", "itineraryUpdated", "bookingStatusUpdates",
+    "flightItineraryAvailable", "flightManifestAvailable",
+    "sharedFlightJoinStatus", "sharedFlightStatusYouShared",
+    "networkSharedNewFlight", "hoursExchangeMatchFound",
+    "hoursExchangeOfferAccepted", "roleChanges", "newUserAddedToAccount",
+    "accessRevoked", "billingProfileChanges", "aircraftAssignmentChanges",
+    "weeklyDigest", "airsprintPromotions",
+)
+
+
+def _build_notification_settings_body(on: str | None, off: str | None) -> dict[str, Any]:
+    """PATCH /my-notification-settings/update body: {"options": {<toggle>: bool}}."""
+    changes: dict[str, bool] = {}
+    for option, values, state in (("--on", on, True), ("--off", off, False)):
+        for name in _csv(values, option):
+            if name not in _NOTIFICATION_SETTINGS:
+                _die(
+                    f"{option}: unknown notification toggle {name!r}. Choose from: "
+                    + ", ".join(_NOTIFICATION_SETTINGS),
+                    EXIT_VALIDATION,
+                )
+            if name in changes and changes[name] != state:
+                _die(f"{name} is listed in both --on and --off.", EXIT_VALIDATION)
+            changes[name] = state
+    if not changes:
+        _die("Pass --on and/or --off with notification toggle names (see --help).", EXIT_VALIDATION)
+    return {"options": changes}
+
+
+def _notification_settings_update(
+    on: str | None, off: str | None, dry_run: bool,
+    username: str | None, password: str | None, fmt: str, compact: bool,
+) -> None:
+    payload = _build_notification_settings_body(on, off)
+    if dry_run:
+        _out({"dry_run": True, "method": "PATCH", "path": "/my-notification-settings/update", "payload": payload}, fmt, compact)
+        return
+    token = get_api_token(username, password)
+    _out(api_patch(token, "/my-notification-settings/update", payload), fmt, compact)
+
+
+NotificationsOn = typer.Option(None, "--on", help="Comma-separated toggles to enable (names from `messages settings`)")
+NotificationsOff = typer.Option(None, "--off", help="Comma-separated toggles to disable")
+
+
 @user_app.command("set-preferences")
 def user_set_preferences(
-    body: str = typer.Option(..., "--body", help="JSON body with notification-setting fields"),
+    on: Optional[str] = NotificationsOn,
+    off: Optional[str] = NotificationsOff,
+    dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
+    compact: bool = Compact,
 ):
-    """Update notification settings (PATCH /my-notification-settings/update)."""
-    payload = _parse_json(body)
-    if "options" not in payload:
-        payload = {"options": payload}
-    token = get_api_token(username, password)
-    data = api_patch(token, "/my-notification-settings/update", payload)
-    _out(data, fmt)
+    """Turn notification toggles on/off (same as `messages settings-update`)."""
+    _notification_settings_update(on, off, dry_run, username, password, fmt, compact)
 
 
 # ---------------------------------------------------------------------------
@@ -1104,20 +1397,80 @@ def device_delete_token(
     _out(api_post(token, path, payload), fmt, compact)
 
 
+
+_CONTACT_METHODS = ("EMAIL", "PHONE", "SMS")
+
+
+def _build_user_update_body(
+    *,
+    first_name: str | None,
+    middle_name: str | None,
+    last_name: str | None,
+    email: str | None,
+    phone: str | None,
+    mobile: str | None,
+    gender: str | None,
+    nationality: str | None,
+    preferred_contact_method: str | None,
+) -> dict[str, Any]:
+    """Android updateUser(): {"options": {<only the fields being changed>}}."""
+    fields = {
+        "firstName": first_name,
+        "middleName": middle_name,
+        "lastName": last_name,
+        "email": email,
+        "phone": phone,
+        "mobile": mobile,
+        "gender": _optional_enum(gender, "--gender", _GENDERS),
+        "nationality": _optional_country_code(nationality, "--nationality"),
+        "preferredContactMethod": _optional_enum(
+            preferred_contact_method, "--preferred-contact-method", _CONTACT_METHODS
+        ),
+    }
+    options = {key: value for key, value in fields.items() if value is not None}
+    if not options:
+        _die("Pass at least one field to change (see --help).", EXIT_VALIDATION)
+    return {"options": options}
+
+
+def _optional_country_code(value: str | None, option: str) -> str | None:
+    if value is None:
+        return None
+    code = value.strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", code):
+        _die(f"{option} must be a two-letter country code such as CA or US.", EXIT_VALIDATION)
+    return code
+
+
 @user_app.command("update")
 def user_update(
-    body: str = typer.Option(..., "--body", help='JSON body — fields to update, e.g. {"firstName":"X","phone":"5551234"}. Wrapped in {"options":...} automatically; pass {"options":...} to override.'),
+    first_name: Optional[str] = typer.Option(None, "--first-name"),
+    middle_name: Optional[str] = typer.Option(None, "--middle-name"),
+    last_name: Optional[str] = typer.Option(None, "--last-name"),
+    email: Optional[str] = typer.Option(None, "--email"),
+    phone: Optional[str] = typer.Option(None, "--phone"),
+    mobile: Optional[str] = typer.Option(None, "--mobile"),
+    gender: Optional[str] = typer.Option(None, "--gender", help="MALE, FEMALE, or NONE"),
+    nationality: Optional[str] = typer.Option(None, "--nationality", help="Two-letter country code, e.g. CA"),
+    preferred_contact_method: Optional[str] = typer.Option(
+        None, "--preferred-contact-method", help="EMAIL, PHONE, or SMS"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Update user profile (PATCH /my-user)."""
-    payload = _parse_json(body)
-    if "options" not in payload:
-        payload = {"options": payload}
+    """Edit your own profile. Only the fields you pass are changed."""
+    payload = _build_user_update_body(
+        first_name=first_name, middle_name=middle_name, last_name=last_name,
+        email=email, phone=phone, mobile=mobile, gender=gender,
+        nationality=nationality, preferred_contact_method=preferred_contact_method,
+    )
+    if dry_run:
+        _out({"dry_run": True, "method": "PATCH", "path": "/my-user", "payload": payload}, fmt)
+        return
     token = get_api_token(username, password)
-    data = api_patch(token, "/my-user", payload)
-    _out(data, fmt)
+    _out(api_patch(token, "/my-user", payload), fmt)
 
 
 # ---------------------------------------------------------------------------
@@ -1129,7 +1482,6 @@ def user_update(
 def trips_list(
     upcoming: bool = typer.Option(True, "--upcoming/--past", help="Show upcoming (default) or past trips"),
     limit: int = typer.Option(25, "--limit", "-n", help="Max trips to return"),
-    json_output: bool = typer.Option(False, "--json", help="Explicit JSON output alias (JSON is already the default)"),
     timezone: Optional[str] = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
@@ -1159,8 +1511,6 @@ def trips_list(
     }
     resp = api_post(token, "/my-leg", payload)
     items = resp.get("data", {}).get("items", [])
-    if json_output:
-        fmt = "json"
     _out(items, fmt, compact)
 
 
@@ -1264,24 +1614,6 @@ def trips_tripsheet(
     _out({"message": f"Saved to {output}", "size_bytes": len(content)})
 
 
-@trips_app.command("flight-feedback")
-def trips_flight_feedback(
-    leg_id: str = typer.Option(..., "--leg-id", help="Completed-leg UUID"),
-    body: str = typer.Option(..., "--body", help="JSON feedback body"),
-    username: Optional[str] = Username,
-    password: Optional[str] = Password,
-    fmt: str = Format,
-):
-    """Submit Android's booking-experience survey for one completed leg."""
-    payload = _parse_json(body)
-    if "tripId" in payload:
-        _die('Android booking surveys use "legId", not "tripId".', EXIT_VALIDATION)
-    token = get_api_token(username, password)
-    payload.setdefault("legId", leg_id)
-    data = api_post(token, "/booking-survey/create", payload)
-    _out(data, fmt)
-
-
 # ---------------------------------------------------------------------------
 # booking
 # ---------------------------------------------------------------------------
@@ -1323,15 +1655,328 @@ def booking_info(
     }, fmt)
 
 
-_DESTINATION_ADDRESS_FIELDS = ("street", "city", "state", "zip", "country")
+# ---------------------------------------------------------------------------
+# Booking forms — typed answers become the exact Android 6.1.4 booking bodies
+# ---------------------------------------------------------------------------
+#
+# Source of truth: blutter output of base.apk 6.1.4 (package airsprint_dxp).
+#   app/features/trips/data/booking_api_models.dart
+#     TripBookRequestPayload, TripLegPayload, PassengerPayload, PassportPayload,
+#     AddressPayload, RequestSettingsPayload, ShareSettingsPayload,
+#     BaggageItemPayload, legIsoDate, passengerPayloadFor, passportIdForPassenger
+#   app/features/trips/domain/model/book_shared_request_model.dart
+#     BookSharedRequest, BookSharedRequestOptions, BookSharedPassenger,
+#     BookSharedRequestSettings
+#   app/shared/model/flight_lock_request_model.dart  FlightLockRequestModel
+# Every key name below is copied from those toJson functions; nothing is
+# invented. Agents never see these keys: they answer form questions.
+
+_GROUND_TRANSPORTATION_TYPES = ("DEPARTURE", "ARRIVAL", "BOTH")
+_GROUND_TRANSPORTATION_METHODS = (
+    "TAXI",
+    "SUBURBAN_RENTAL_CAR",
+    "SUV_RENTAL_CAR",
+    "FULL_SIZE_RENTAL_CAR",
+    "MID_SIZE_RENTAL_CAR",
+    "COMPACT_RENTAL_CAR",
+    "LIMO_AND_DRIVER",
+    "SUV_AND_DRIVER",
+    "SEDAN_AND_DRIVER",
+)
+_SHARE_NETWORK_TYPES = ("MY_NETWORK", "AIRSPRINT_NETWORK")
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_ADDRESS_TEXT_HELP = 'Address written as "STREET; CITY; STATE; ZIP" (add "; UNIT" for a suite or apartment).'
+_GROUND_METHOD_HELP = (
+    "taxi | suburban-rental-car | suv-rental-car | full-size-rental-car | mid-size-rental-car | "
+    "compact-rental-car | limo-and-driver | suv-and-driver | sedan-and-driver"
+)
 
 
-def _destination_address(value: Any) -> dict[str, str] | None:
-    if not isinstance(value, dict):
+def _address_payload(
+    street: str | None,
+    street2: str | None,
+    city: str | None,
+    state: str | None,
+    zip_code: str | None,
+    option_prefix: str,
+) -> dict[str, str] | None:
+    """Android AddressPayload.toJson: street, city, state, zip, then street2 only when set.
+
+    All-or-nothing: leave every option empty for "no address", otherwise
+    street, city, state, and zip are all required. There is no country key.
+    """
+    parts = {"street": street, "city": city, "state": state, "zip": zip_code}
+    filled = {key: value.strip() for key, value in parts.items() if value and value.strip()}
+    unit = (street2 or "").strip()
+    if not filled and not unit:
         return None
-    if not all(isinstance(value.get(key), str) and value[key].strip() for key in _DESTINATION_ADDRESS_FIELDS):
+    missing = [f"{option_prefix}-{key}" for key in parts if key not in filled]
+    if missing:
+        _die(
+            f"{option_prefix}-street, -city, -state, and -zip go together; missing: " + ", ".join(missing),
+            EXIT_VALIDATION,
+        )
+    if unit:
+        filled["street2"] = unit
+    return filled
+
+
+def _address_text(value: str | None, option: str) -> dict[str, str] | None:
+    """Parse "STREET; CITY; STATE; ZIP[; UNIT]" into an Android AddressPayload."""
+    if value is None or not value.strip():
         return None
-    return {key: value[key].strip() for key in _DESTINATION_ADDRESS_FIELDS}
+    parts = [part.strip() for part in value.split(";")]
+    if len(parts) not in (4, 5) or not all(parts[:4]):
+        _die(f'{option} must look like "STREET; CITY; STATE; ZIP" (optionally "; UNIT").', EXIT_VALIDATION)
+    return _address_payload(parts[0], parts[4] if len(parts) == 5 else None, parts[1], parts[2], parts[3], option)
+
+
+def _leg_wall_clock(value: str, option: str) -> str:
+    """Android legIsoDate: DateTime(y, m, d, h, min) with isUtc=false, then toIso8601String().
+
+    The app sends the wall-clock departure time at the departure airport with
+    no zone suffix, e.g. 2026-09-01T16:00:00.000.
+    """
+    try:
+        parsed = datetime.strptime(value.strip().replace(" ", "T"), "%Y-%m-%dT%H:%M")
+    except ValueError:
+        _die(f"{option} must be YYYY-MM-DDTHH:MM, the local time at the departure airport.", EXIT_VALIDATION)
+    return parsed.strftime("%Y-%m-%dT%H:%M:%S.000")
+
+
+def _parse_leg_spec(value: str) -> tuple[str, str, str]:
+    """--leg "FROM>TO@YYYY-MM-DDTHH:MM" → (from, to, Android leg date)."""
+    route, separator, when = value.partition("@")
+    departure, arrow, arrival = route.partition(">")
+    departure, arrival = departure.strip(), arrival.strip()
+    if not separator or not arrow or not departure or not arrival:
+        _die(f'--leg must look like "CYUL>KTEB@2026-09-01T09:00", got: {value}', EXIT_VALIDATION)
+    return departure, arrival, _leg_wall_clock(when, "--leg time")
+
+
+_BAGGAGE_HELP = 'NAME=QUANTITY, repeatable (names from `booking baggage-types`), or "none" when travelling without baggage.'
+
+
+def _baggage_items(values: list[str] | None, option: str = "--baggage", *, required: bool = True) -> list[dict[str, Any]]:
+    """Android BaggageItemPayload: {"name", "quantity"}; names come from `booking baggage-types`.
+
+    Booking commands require an explicit answer: itemized bags, or the word
+    "none" for an empty baggage list. Silence is refused so a booking is never
+    sent with baggage that was simply forgotten.
+    """
+    entries = [item.strip() for item in (values or []) if item and item.strip()]
+    if any(item.lower() == "none" for item in entries):
+        if len(entries) > 1:
+            _die(f'{option} none cannot be combined with itemized baggage.', EXIT_VALIDATION)
+        return []
+    if not entries:
+        if required:
+            _die(
+                f'Baggage must be stated: {option} NAME=QUANTITY (repeatable, names from `booking baggage-types`) '
+                f'or {option} none. Nothing was sent.',
+                EXIT_VALIDATION,
+            )
+        return []
+    items: list[dict[str, Any]] = []
+    for name, quantity in _key_value_pairs(entries, option).items():
+        if not quantity.isdigit() or int(quantity) < 1:
+            _die(f"{option} {name}={quantity}: quantity must be a whole number of at least 1.", EXIT_VALIDATION)
+        items.append({"name": name, "quantity": int(quantity)})
+    return items
+
+
+def _email_list(value: str | None, option: str) -> list[str]:
+    emails = _csv(value, option, required=True)
+    invalid = [email for email in emails if not _EMAIL_RE.match(email)]
+    if invalid:
+        _die(f"{option} has invalid email addresses: " + ", ".join(invalid), EXIT_VALIDATION)
+    return emails
+
+
+def _build_request_settings(
+    *,
+    catering: bool,
+    catering_request: str | None,
+    ground_transportation: bool,
+    ground_transportation_type: str | None,
+    ground_transportation_method: str | None,
+    pickup_address: dict[str, str] | None,
+    dropoff_address: dict[str, str] | None,
+    arrival_method: str | None = None,
+    arrival_pickup_address: dict[str, str] | None = None,
+    arrival_dropoff_address: dict[str, str] | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Android RequestSettingsPayload.toJson and BookSharedRequestSettings.toJson.
+
+    Both start from the literal {cateringRequired, groundTransportationRequired}
+    and append each other key only when it holds a value, in this order. The
+    shared-flight model stops after groundTransportationDropOffAddress; callers
+    for that route simply never pass the arrival* keys or note.
+    """
+    if catering_request and not catering:
+        _die("--catering-request needs --catering yes.", EXIT_VALIDATION)
+    ground_details = (
+        ground_transportation_type, ground_transportation_method, pickup_address, dropoff_address,
+        arrival_method, arrival_pickup_address, arrival_dropoff_address,
+    )
+    if any(ground_details) and not ground_transportation:
+        _die("Ground transportation details need --ground-transportation yes.", EXIT_VALIDATION)
+    body: dict[str, Any] = {
+        "cateringRequired": catering,
+        "groundTransportationRequired": ground_transportation,
+    }
+    optional = (
+        ("cateringRequest", catering_request),
+        ("groundTransportationType", ground_transportation_type),
+        ("groundTransportationMethod", ground_transportation_method),
+        ("groundTransportationPickUpAddress", pickup_address),
+        ("groundTransportationDropOffAddress", dropoff_address),
+        ("arrivalGroundTransportationMethod", arrival_method),
+        ("arrivalGroundTransportationPickUpAddress", arrival_pickup_address),
+        ("arrivalGroundTransportationDropOffAddress", arrival_dropoff_address),
+        ("note", note),
+    )
+    for key, value in optional:
+        if value not in (None, "", {}):
+            body[key] = value
+    return body
+
+
+def _build_share_settings(
+    *,
+    special_requests: str,
+    open_to_share: bool,
+    network_type: str,
+    group_ids: list[str],
+    seats: int,
+    pets_allowed: bool,
+    children_allowed: bool,
+    cost_percentage: int,
+) -> dict[str, Any]:
+    """Android ShareSettingsPayload.toJson: all nine keys, always present.
+
+    Defaults are Android's own (ShareSettingsPayload.fromShareSettings):
+    "" / false / MY_NETWORK / false / [] / 0 / false / false / 50.
+    """
+    return {
+        "specialRequests": special_requests,
+        "openToShare": open_to_share,
+        "networkType": network_type,
+        "specificGroupsOnly": bool(group_ids),
+        "groupIds": group_ids,
+        "seats": seats,
+        "petsAllowed": pets_allowed,
+        "childrenAllowed": children_allowed,
+        "joinerVariableCostPercentage": cost_percentage,
+    }
+
+
+def _build_trip_passenger(
+    passenger_id: str,
+    passport_id: str | None,
+    destination_address: dict[str, str] | None,
+) -> dict[str, Any]:
+    """Android PassengerPayload.toJson after removeWhere(null): id, destinationAddress?, passport: {id}?.
+
+    passengerPayloadFor never sets customsDeclarationId when booking a trip;
+    passportIdForPassenger picks the passenger's selected passport, else the
+    first saved one.
+    """
+    payload: dict[str, Any] = {"id": passenger_id}
+    if destination_address:
+        payload["destinationAddress"] = dict(destination_address)
+    if passport_id:
+        payload["passport"] = {"id": passport_id}
+    return payload
+
+
+def _build_trip_leg(
+    *,
+    departure_airport_id: str,
+    arrival_airport_id: str,
+    aircraft_id: str,
+    date: str,
+    number_of_seats: int,
+    passengers: list[dict[str, Any]],
+    pet_ids: list[str],
+    request_settings: dict[str, Any],
+) -> dict[str, Any]:
+    """Android TripLegPayload.toJson, in key order."""
+    return {
+        "departureAirportId": departure_airport_id,
+        "arrivalAirportId": arrival_airport_id,
+        "aircraftId": aircraft_id,
+        "date": date,
+        "numberOfSeats": number_of_seats,
+        "passengers": passengers,
+        "petIds": pet_ids,
+        "requestSettings": request_settings,
+    }
+
+
+def _build_trip_book_body(
+    *,
+    legs: list[dict[str, Any]],
+    dog_form_submitted: bool,
+    baggage: list[dict[str, Any]],
+    share_settings: dict[str, Any],
+) -> dict[str, Any]:
+    """Android TripBookRequestPayload.toJson (POST /trip/book): legs, dogFormSubmitted, baggage, shareSettings.
+
+    dogFormSubmitted is Android's `cdcNotice == CdcNoticeOption.ALREADY_SUBMITTED`.
+    The account is implicit in the token; no accountId is ever sent.
+    """
+    return {
+        "legs": legs,
+        "dogFormSubmitted": dog_form_submitted,
+        "baggage": baggage,
+        "shareSettings": share_settings,
+    }
+
+
+def _build_shared_passenger(
+    passenger_id: str,
+    destination_address: dict[str, str] | None,
+) -> dict[str, Any]:
+    """Android BookSharedPassenger.toJson (0x70760c): id, then destinationAddress only when set.
+
+    The model's customsDeclarationId gate tests a constant "" (0x707658), so
+    the app never sends that key when booking an existing flight; customs
+    declarations are attached later with `leg update-required-info --customs`.
+    """
+    payload: dict[str, Any] = {"id": passenger_id}
+    if destination_address:
+        payload["destinationAddress"] = dict(destination_address)
+    return payload
+
+
+def _build_shared_booking_body(
+    *,
+    flight_id: str,
+    passengers: list[dict[str, Any]],
+    request_settings: dict[str, Any],
+    pet_ids: list[str],
+    baggage: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Android BookSharedRequest.toJson (POST /empty-leg/book and /shared-flight/book).
+
+    {"flightId", "options": {"passengers", "requestSettings", ["petIds"], ["baggage"]}}
+    BookSharedRequestOptions.toJson adds petIds and baggage only when the
+    lists are non-empty (the trip form, by contrast, always sends them).
+    """
+    options: dict[str, Any] = {"passengers": passengers, "requestSettings": request_settings}
+    if pet_ids:
+        options["petIds"] = pet_ids
+    if baggage:
+        options["baggage"] = baggage
+    return {"flightId": flight_id, "options": options}
+
+
+def _build_flight_lock_body(flight_id: str, lock: bool) -> dict[str, Any]:
+    """Android FlightLockRequestModel.toJson (POST /flight/lock): {"id", "lock"}."""
+    return {"id": flight_id, "lock": lock}
 
 
 def _airport_country(airport_id: Any) -> tuple[str | None, str | None]:
@@ -1347,192 +1992,303 @@ def _is_us_country(country: str | None) -> bool:
     return normalized in {"us", "usa", "unitedstates", "unitedstatesofamerica"}
 
 
-def _prepare_booking_destination_addresses(
+_ICAO_RE = re.compile(r"^[A-Za-z]{4}$")
+
+
+def _normalized_country(country: str | None) -> str:
+    return re.sub(r"[^a-z]", "", (country or "").lower())
+
+
+def _booking_route_check(
     payload: dict[str, Any],
-    address: dict[str, str] | None,
+    typed_routes: list[tuple[str, str]],
     us_touching_override: bool | None,
+    international_override: bool | None,
 ) -> dict[str, Any]:
-    countries: list[dict[str, Any]] = []
+    """Classify the trip: does it touch the US, and does any leg cross a border?
+
+    Countries come from the local airport mirror (`cache refresh`); ICAO
+    prefixes (K/P = US, C = Canada, ...) are the fallback when a country is
+    missing. When the mirror cannot answer, the caller must state
+    --us-touching/--not-us-touching and --international/--domestic.
+    """
+    airports: list[dict[str, Any]] = []
     unresolved: list[str] = []
     us_detected = False
-    for leg in payload.get("legs", []):
-        for field in ("departureAirportId", "arrivalAirportId"):
+    international_detected = False
+    for leg, (typed_departure, typed_arrival) in zip(payload.get("legs", []), typed_routes):
+        prefixes: list[str | None] = []
+        countries: list[str | None] = []
+        for field, typed in (("departureAirportId", typed_departure), ("arrivalAirportId", typed_arrival)):
             airport_id = leg.get(field)
             country, icao = _airport_country(airport_id)
-            countries.append({"airportId": airport_id, "icao": icao, "country": country})
+            if not icao and _ICAO_RE.match(typed):
+                icao = typed.upper()
+            airports.append({"airportId": airport_id, "icao": icao, "country": country})
             if country is None:
                 unresolved.append(str(airport_id))
-            if _is_us_country(country) or (
-                country is None and icao and icao.startswith(("K", "P"))
-            ):
+            if _is_us_country(country) or (country is None and icao and icao.startswith(("K", "P"))):
                 us_detected = True
+            countries.append(_normalized_country(country) or None)
+            prefixes.append(icao[0] if icao else None)
+        if all(countries):
+            if countries[0] != countries[1]:
+                international_detected = True
+        elif all(prefixes) and prefixes[0] != prefixes[1]:
+            international_detected = True
 
-    if us_touching_override is None and unresolved and not us_detected:
+    if unresolved:
+        if us_touching_override is None and not us_detected:
+            _die(
+                "Could not determine every airport country from the local mirror. "
+                "Run `cache refresh`, or pass --us-touching/--not-us-touching explicitly.",
+                EXIT_VALIDATION,
+            )
+        if international_override is None and not international_detected:
+            _die(
+                "Could not determine every airport country from the local mirror. "
+                "Run `cache refresh`, or pass --international/--domestic explicitly.",
+                EXIT_VALIDATION,
+            )
+    return {
+        "usTouching": us_detected if us_touching_override is None else us_touching_override,
+        "international": international_detected if international_override is None else international_override,
+        "airports": airports,
+    }
+
+
+def _require_passports_for_international_trip(payload: dict[str, Any], check: dict[str, Any]) -> None:
+    """Refuse an international booking when any passenger has no passport on file."""
+    if not check.get("international"):
+        return
+    missing: list[str] = []
+    for leg in payload.get("legs", []):
+        for passenger in leg.get("passengers") or []:
+            passport = passenger.get("passport")
+            has_passport = isinstance(passport, dict) and bool(passport.get("id"))
+            if not has_passport and passenger.get("id") not in missing:
+                missing.append(passenger.get("id"))
+    if missing:
         _die(
-            "Could not determine every airport country from the local mirror. "
-            "Run `cache refresh`, or pass --us-touching/--not-us-touching explicitly.",
+            "This trip crosses a border; passengers without a passport on file: " + ", ".join(missing)
+            + ". Add one with `passport create --passenger-id ...` (then `passport list`) or answer "
+            "--passport PASSENGER_ID=PASSPORT_ID. No booking was sent.",
             EXIT_VALIDATION,
         )
-    us_touching = us_detected if us_touching_override is None else us_touching_override
 
+
+def _apply_booking_destination_address(
+    payload: dict[str, Any],
+    address: dict[str, str] | None,
+    check: dict[str, Any],
+) -> None:
+    """US-touching and international trips need where the passengers will stay (hotel, residence, ...)."""
+    needs_destination = bool(check.get("usTouching") or check.get("international"))
+    if needs_destination and address is None:
+        _die(
+            "US-touching and international bookings require a destination address (hotel, residence, ...): "
+            "--destination-street, --destination-city, --destination-state, --destination-zip. "
+            "No booking was sent.",
+            EXIT_VALIDATION,
+        )
     if address is None:
-        for leg in payload.get("legs", []):
-            for passenger in leg.get("passengers", []):
-                if isinstance(passenger, dict):
-                    address = _destination_address(passenger.get("destinationAddress"))
-                    if address:
-                        break
-            if address:
-                break
+        return
+    for index, leg in enumerate(payload.get("legs", [])):
+        passengers = leg.get("passengers") or []
+        if not passengers and needs_destination:
+            _die(f"Leg {index + 1} has no passengers; a US or international trip needs at least one.", EXIT_VALIDATION)
+        for passenger in passengers:
+            passenger["destinationAddress"] = dict(address)
 
-    if us_touching and address is None:
-        _die(
-            "US-touching bookings require --destination-address with street, city, "
-            "state, zip, and country. No booking was sent.",
-            EXIT_VALIDATION,
-        )
 
-    if address is not None:
-        for index, leg in enumerate(payload.get("legs", [])):
-            passengers = leg.get("passengers")
-            if not isinstance(passengers, list) or not passengers:
-                if us_touching:
-                    _die(f'"legs[{index}].passengers" must not be empty for a US trip.', EXIT_VALIDATION)
-                continue
-            normalized: list[dict[str, Any]] = []
-            for passenger in passengers:
-                if isinstance(passenger, str):
-                    passenger = {"id": passenger}
-                if not isinstance(passenger, dict) or not passenger.get("id"):
-                    _die(
-                        f'Every "legs[{index}].passengers" item must contain a saved passenger ID.',
-                        EXIT_VALIDATION,
-                    )
-                passenger = dict(passenger)
-                passenger["destinationAddress"] = dict(address)
-                normalized.append(passenger)
-            leg["passengers"] = normalized
+def _passenger_default_passport_id(token: str, passenger_id: str) -> str | None:
+    """Android passportIdForPassenger: the selected passport, else the first saved one.
 
-    return {"usTouching": us_touching, "airports": countries}
+    The live owner API does not persist a selected passport, so the first
+    saved passport is used.
+    """
+    passenger = api_get(token, f"/my-passenger/{passenger_id}")
+    ids = _passenger_passport_ids(passenger)
+    return ids[0] if ids else None
 
 
 @booking_app.command("create")
 def booking_create(
-    body: str = typer.Option(..., "--body", help='JSON body for POST /trip/book'),
-    destination_address: Optional[str] = typer.Option(
-        None,
-        "--destination-address",
-        help='JSON object with street, city, state, zip, country; copied to every passenger on every leg.',
+    leg: list[str] = typer.Option(
+        ...,
+        "--leg",
+        help='One per flight leg, in order: "FROM>TO@YYYY-MM-DDTHH:MM" (ICAO codes or airport IDs; local time at the departure airport).',
     ),
+    aircraft_id: Optional[str] = typer.Option(None, "--aircraft-id", help="Aircraft ID from `booking info`; defaults to the account's aircraft."),
+    passengers: Optional[str] = typer.Option(None, "--passengers", help="Comma-separated saved passenger IDs flying on every leg."),
+    passport: Optional[list[str]] = typer.Option(
+        None, "--passport",
+        help="PASSENGER_ID=PASSPORT_ID, repeatable. Otherwise each passenger's first saved passport is used, as in the app.",
+    ),
+    seats: Optional[int] = typer.Option(None, "--seats", min=1, help="Seats reserved on each leg (default: number of passengers, at least 1)."),
+    pets: Optional[str] = typer.Option(None, "--pets", help="Comma-separated pet IDs from `pet list`."),
+    baggage: list[str] = typer.Option(..., "--baggage", help=_BAGGAGE_HELP),
+    catering: str = typer.Option("no", "--catering", help="yes | no"),
+    catering_request: Optional[str] = typer.Option(None, "--catering-request", help="What to serve (needs --catering yes)."),
+    ground_transportation: str = typer.Option("no", "--ground-transportation", help="yes | no"),
+    ground_transportation_when: Optional[str] = typer.Option(None, "--ground-transportation-when", help="departure | arrival | both"),
+    ground_transportation_method: Optional[str] = typer.Option(None, "--ground-transportation-method", help=_GROUND_METHOD_HELP),
+    ground_pickup_address: Optional[str] = typer.Option(None, "--ground-pickup-address", help=_ADDRESS_TEXT_HELP),
+    ground_dropoff_address: Optional[str] = typer.Option(None, "--ground-dropoff-address", help=_ADDRESS_TEXT_HELP),
+    arrival_ground_method: Optional[str] = typer.Option(None, "--arrival-ground-method", help="Method at the arrival city when --ground-transportation-when both."),
+    arrival_pickup_address: Optional[str] = typer.Option(None, "--arrival-pickup-address", help=_ADDRESS_TEXT_HELP),
+    arrival_dropoff_address: Optional[str] = typer.Option(None, "--arrival-dropoff-address", help=_ADDRESS_TEXT_HELP),
+    note: Optional[str] = typer.Option(None, "--note", help="Note to the flight concierge for every leg."),
+    destination_street: Optional[str] = typer.Option(None, "--destination-street", help="Where passengers stay (required for US trips)."),
+    destination_street2: Optional[str] = typer.Option(None, "--destination-street2", help="Suite / apartment / unit."),
+    destination_city: Optional[str] = typer.Option(None, "--destination-city"),
+    destination_state: Optional[str] = typer.Option(None, "--destination-state"),
+    destination_zip: Optional[str] = typer.Option(None, "--destination-zip"),
     us_touching: Optional[bool] = typer.Option(
         None,
         "--us-touching/--not-us-touching",
-        help="Override country detection when airport IDs are not in the local cache.",
+        help="Override US detection when airport countries are not in the local cache.",
     ),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Validate and show payload without submitting"),
+    international: Optional[bool] = typer.Option(
+        None,
+        "--international/--domestic",
+        help="Override border-crossing detection when airport countries are not in the local cache.",
+    ),
+    dog_form_submitted: str = typer.Option("no", "--dog-form-submitted", help="yes if the CDC dog-import form is already submitted (dogs entering the US)."),
+    special_requests: Optional[str] = typer.Option(None, "--special-requests", help="Free text shown with the trip."),
+    open_to_share: str = typer.Option("no", "--open-to-share", help="yes | no — offer spare seats to joiners."),
+    share_network: str = typer.Option("my-network", "--share-network", help="my-network | airsprint-network"),
+    share_groups: Optional[str] = typer.Option(None, "--share-groups", help="Comma-separated group IDs; limits sharing to those groups."),
+    share_seats: int = typer.Option(0, "--share-seats", min=0, help="Seats offered to joiners."),
+    share_pets_allowed: str = typer.Option("no", "--share-pets-allowed", help="yes | no"),
+    share_children_allowed: str = typer.Option("no", "--share-children-allowed", help="yes | no"),
+    share_cost_percentage: int = typer.Option(50, "--share-cost-percentage", help="Joiner share of variable cost, 30–80 (app default 50)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Validate and show the exact request without submitting"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
+    compact: bool = Compact,
 ):
-    """Book a new trip (POST /trip/book).
+    """Book a new trip the way the AirSprint app does (POST /trip/book).
 
-    Required body schema (top-level keys):
-        legs:           [{ departureAirportId, arrivalAirportId, aircraftId,
-                           date, numberOfSeats, passengers: [], petIds: [],
-                           requestSettings: {} }]
-        baggage:        []
-        shareSettings:  {}
+    Answer the booking form with options; the CLI builds Android 6.1.4's exact
+    request. Catering, ground transportation, and notes apply to every leg —
+    adjust one leg afterwards with `leg update-required-info`. Run
+    `booking info` first for aircraft, passenger, and airport IDs.
 
-    Run `airsprint booking info` first to get valid IDs.
+    Guard rails (nothing is sent when one fails): baggage must be answered
+    (`--baggage none` for no bags); a trip that crosses a border needs a
+    passport on file for every passenger; US-touching or international trips
+    need a destination address (hotel, residence, ...).
     """
-    payload = _parse_json(body)
-
-    if "accountId" in payload:
-        _die('Remove top-level "accountId"; the booking account is implicit in the token.', EXIT_VALIDATION)
-
-    for key in ("legs", "baggage", "shareSettings"):
-        if key not in payload:
-            _die(f'Body must contain "{key}" (see --help for full schema).', EXIT_VALIDATION)
-
-    legs = payload["legs"]
-    if not isinstance(legs, list) or not legs:
-        _die('"legs" must be a non-empty array.', EXIT_VALIDATION)
-    leg_required = (
-        "departureAirportId", "arrivalAirportId", "aircraftId", "date",
-        "numberOfSeats", "passengers", "petIds", "requestSettings",
+    catering_flag = _yes_no(catering, "--catering")
+    ground_flag = _yes_no(ground_transportation, "--ground-transportation")
+    dog_form = _yes_no(dog_form_submitted, "--dog-form-submitted")
+    open_flag = _yes_no(open_to_share, "--open-to-share")
+    network_type = _enum(share_network, "--share-network", _SHARE_NETWORK_TYPES)
+    pets_flag = _yes_no(share_pets_allowed, "--share-pets-allowed")
+    children_flag = _yes_no(share_children_allowed, "--share-children-allowed")
+    percentage = _int_between(share_cost_percentage, "--share-cost-percentage", 30, 80)
+    group_ids = _csv(share_groups, "--share-groups")
+    if group_ids and not open_flag:
+        _die("--share-groups needs --open-to-share yes.", EXIT_VALIDATION)
+    passenger_ids = _csv(passengers, "--passengers")
+    pet_ids = _csv(pets, "--pets")
+    passport_by_passenger = _key_value_pairs(passport, "--passport")
+    unknown = sorted(set(passport_by_passenger) - set(passenger_ids))
+    if unknown:
+        _die("--passport names passengers not in --passengers: " + ", ".join(unknown), EXIT_VALIDATION)
+    baggage_items = _baggage_items(baggage)
+    destination = _address_payload(
+        destination_street, destination_street2, destination_city, destination_state, destination_zip,
+        "--destination",
     )
-    for index, leg in enumerate(legs):
-        if not isinstance(leg, dict):
-            _die(f'"legs[{index}]" must be an object.', EXIT_VALIDATION)
-        missing = [key for key in leg_required if key not in leg]
-        if missing:
-            _die(f'"legs[{index}]" is missing: {", ".join(missing)}', EXIT_VALIDATION)
-        settings = leg.get("requestSettings")
-        if not isinstance(settings, dict) or not all(
-            key in settings for key in ("cateringRequired", "groundTransportationRequired")
-        ):
-            _die(
-                f'"legs[{index}].requestSettings" must include '
-                '"cateringRequired" and "groundTransportationRequired".',
-                EXIT_VALIDATION,
-            )
-
-    share = payload["shareSettings"]
-    if not isinstance(share, dict):
-        _die('"shareSettings" must be an object.', EXIT_VALIDATION)
-    share_required = (
-        "specialRequests", "openToShare", "networkType", "seats",
-        "petsAllowed", "childrenAllowed",
+    request_settings = _build_request_settings(
+        catering=catering_flag,
+        catering_request=(catering_request or "").strip() or None,
+        ground_transportation=ground_flag,
+        ground_transportation_type=_optional_enum(ground_transportation_when, "--ground-transportation-when", _GROUND_TRANSPORTATION_TYPES),
+        ground_transportation_method=_optional_enum(ground_transportation_method, "--ground-transportation-method", _GROUND_TRANSPORTATION_METHODS),
+        pickup_address=_address_text(ground_pickup_address, "--ground-pickup-address"),
+        dropoff_address=_address_text(ground_dropoff_address, "--ground-dropoff-address"),
+        arrival_method=_optional_enum(arrival_ground_method, "--arrival-ground-method", _GROUND_TRANSPORTATION_METHODS),
+        arrival_pickup_address=_address_text(arrival_pickup_address, "--arrival-pickup-address"),
+        arrival_dropoff_address=_address_text(arrival_dropoff_address, "--arrival-dropoff-address"),
+        note=(note or "").strip() or None,
     )
-    missing_share = [key for key in share_required if key not in share]
-    if missing_share:
-        _die(f'"shareSettings" is missing: {", ".join(missing_share)}', EXIT_VALIDATION)
-    if share.get("networkType") not in ("MY_NETWORK", "AIRSPRINT_NETWORK"):
-        _die(
-            '"shareSettings.networkType" must be MY_NETWORK or AIRSPRINT_NETWORK.',
-            EXIT_VALIDATION,
-        )
-    percentage = share.get("joinerVariableCostPercentage")
-    if percentage is not None and (
-        not isinstance(percentage, (int, float)) or isinstance(percentage, bool)
-        or not 30 <= percentage <= 80
-    ):
-        _die(
-            '"shareSettings.joinerVariableCostPercentage" must be between 30 and 80.',
-            EXIT_VALIDATION,
-        )
-    if share.get("specificGroupsOnly") and not share.get("groupIds"):
-        _die(
-            '"shareSettings.groupIds" is required when "specificGroupsOnly" is true.',
-            EXIT_VALIDATION,
-        )
+    leg_specs = [_parse_leg_spec(item) for item in leg]
+    number_of_seats = seats if seats is not None else max(1, len(passenger_ids))
 
-    parsed_address: dict[str, str] | None = None
-    if destination_address is not None:
-        parsed_address = _destination_address(_parse_json(destination_address))
-        if parsed_address is None:
-            _die(
-                "--destination-address requires non-empty street, city, state, zip, and country.",
-                EXIT_VALIDATION,
-            )
-    destination_check = _prepare_booking_destination_addresses(
-        payload,
-        parsed_address,
-        us_touching,
+    token: str | None = None
+
+    def auth() -> str:
+        nonlocal token
+        if token is None:
+            token = get_api_token(username, password)
+        return token
+
+    def airport_id(code: str) -> str:
+        return code if _UUID_RE.match(code) else _resolve_airport(auth(), code)
+
+    resolved_aircraft = aircraft_id or _get_default_aircraft(auth())
+    passport_ids: dict[str, str | None] = {}
+    for passenger_id in passenger_ids:
+        passport_ids[passenger_id] = passport_by_passenger.get(passenger_id) or _passenger_default_passport_id(auth(), passenger_id)
+
+    legs: list[dict[str, Any]] = []
+    summary: list[dict[str, Any]] = []
+    typed_routes: list[tuple[str, str]] = []
+    for departure, arrival, date in leg_specs:
+        legs.append(_build_trip_leg(
+            departure_airport_id=airport_id(departure),
+            arrival_airport_id=airport_id(arrival),
+            aircraft_id=resolved_aircraft,
+            date=date,
+            number_of_seats=number_of_seats,
+            passengers=[
+                _build_trip_passenger(passenger_id, passport_ids[passenger_id], None)
+                for passenger_id in passenger_ids
+            ],
+            pet_ids=list(pet_ids),
+            request_settings=dict(request_settings),
+        ))
+        summary.append({"from": departure, "to": arrival, "departureLocalTime": date[:16]})
+        typed_routes.append((departure, arrival))
+
+    payload = _build_trip_book_body(
+        legs=legs,
+        dog_form_submitted=dog_form,
+        baggage=baggage_items,
+        share_settings=_build_share_settings(
+            special_requests=(special_requests or "").strip(),
+            open_to_share=open_flag,
+            network_type=network_type,
+            group_ids=group_ids,
+            seats=share_seats,
+            pets_allowed=pets_flag,
+            children_allowed=children_flag,
+            cost_percentage=int(percentage),
+        ),
     )
+    route_check = _booking_route_check(payload, typed_routes, us_touching, international)
+    _require_passports_for_international_trip(payload, route_check)
+    _apply_booking_destination_address(payload, destination, route_check)
 
     if dry_run:
         _out({
             "dry_run": True,
+            "method": "POST",
+            "path": "/trip/book",
+            "legs": summary,
+            "passengers": passenger_ids,
             "payload": payload,
-            "destinationCheck": destination_check,
+            "routeCheck": route_check,
             "message": "Would POST /trip/book exactly once; no read-back would follow.",
-        }, fmt)
+        }, fmt, compact)
         return
 
-    token = get_api_token(username, password)
-    data = api_post(token, "/trip/book", payload)
-    _out(data, fmt)
+    data = api_post(auth(), "/trip/book", payload)
+    _out(data, fmt, compact)
 
 
 @booking_app.command("cancel")
@@ -1630,15 +2386,10 @@ def _leg_passenger_payload(row: Any) -> dict[str, Any] | None:
             ),
             {},
         )
-        # Android 6.1.4's LegPassengerUpdate fields are id,
-        # customsDeclarationId, destinationAddress, and passport. passportIds
-        # is retained as a live-API compatibility field used by older records.
-        for key in (
-            "customsDeclarationId",
-            "destinationAddress",
-            "passport",
-            "passportIds",
-        ):
+        # Android 6.1.4's LegPassengerUpdate.toJson (0x801778) has exactly
+        # id, customsDeclarationId, destinationAddress and passport; nothing
+        # else from the fetched record (such as passportIds) is copied.
+        for key in ("customsDeclarationId", "destinationAddress", "passport"):
             value = row.get(key, nested.get(key))
             if value not in (None, "", [], {}):
                 payload[key] = value
@@ -1733,17 +2484,94 @@ def leg_update_passengers(
     }, fmt, compact)
 
 
+def _build_request_settings_update(
+    *,
+    catering: bool | None,
+    catering_request: str | None,
+    ground_transportation: bool | None,
+    ground_transportation_type: str | None,
+    ground_transportation_method: str | None,
+    pickup_address: dict[str, str] | None,
+    dropoff_address: dict[str, str] | None,
+    arrival_method: str | None,
+    arrival_pickup_address: dict[str, str] | None,
+    arrival_dropoff_address: dict[str, str] | None,
+    note: str | None,
+) -> dict[str, Any]:
+    """Android LegRequestSettingsUpdate.toJson (leg_update models) with nulls removed, in key order."""
+    fields = (
+        ("cateringRequired", catering),
+        ("cateringRequest", catering_request),
+        ("groundTransportationRequired", ground_transportation),
+        ("groundTransportationType", ground_transportation_type),
+        ("groundTransportationMethod", ground_transportation_method),
+        ("groundTransportationPickUpAddress", pickup_address),
+        ("groundTransportationDropOffAddress", dropoff_address),
+        ("arrivalGroundTransportationMethod", arrival_method),
+        ("arrivalGroundTransportationPickUpAddress", arrival_pickup_address),
+        ("arrivalGroundTransportationDropOffAddress", arrival_dropoff_address),
+        ("note", note),
+    )
+    return {key: value for key, value in fields if value not in (None, "", {})}
+
+
+def _leg_destination_address_update(address: dict[str, str]) -> dict[str, str]:
+    """Android LegDestinationAddressUpdate.toJson key order: street, street2, city, state, zip (nulls removed)."""
+    return {key: address[key] for key in ("street", "street2", "city", "state", "zip") if address.get(key)}
+
+
+def _build_leg_update_options(
+    *,
+    number_of_seats: int | None,
+    passengers: list[dict[str, Any]] | None,
+    pet_ids: list[str] | None,
+    baggage: list[dict[str, Any]] | None,
+    request_settings: dict[str, Any] | None,
+    dog_form_submitted: bool | None,
+) -> dict[str, Any]:
+    """Android LegUpdateOptions.toJson (PATCH /leg/{id}/required-info) with nulls removed.
+
+    Android's buildPartialLegUpdateOptions sends only the sections that
+    changed, always with the complete passenger list. departureAirportId,
+    arrivalAirportId, aircraftId, date, and shareSettings exist in the model
+    but are not part of the CLI's required-information form.
+    """
+    fields = (
+        ("numberOfSeats", number_of_seats),
+        ("passengers", passengers),
+        ("petIds", pet_ids),
+        ("baggage", baggage),
+        ("requestSettings", request_settings),
+        ("dogFormSubmitted", dog_form_submitted),
+    )
+    return {key: value for key, value in fields if value is not None}
+
+
 @leg_app.command("update-required-info")
 def leg_update_required_info(
     leg_id: str = typer.Option(..., "--leg-id", help="Booked-leg UUID"),
-    body: str = typer.Option(
-        ...,
-        "--body",
-        help=(
-            "Android LegUpdateOptions JSON. If passengers are present, each item must use "
-            "the saved passenger UUID in id and is merged onto the current full list."
-        ),
-    ),
+    passport: Optional[list[str]] = typer.Option(None, "--passport", help="PASSENGER_ID=PASSPORT_ID, repeatable."),
+    customs: Optional[list[str]] = typer.Option(None, "--customs", help="PASSENGER_ID=CUSTOMS_DECLARATION_ID, repeatable."),
+    destination_street: Optional[str] = typer.Option(None, "--destination-street", help="Destination for every passenger on the leg."),
+    destination_street2: Optional[str] = typer.Option(None, "--destination-street2", help="Suite / apartment / unit."),
+    destination_city: Optional[str] = typer.Option(None, "--destination-city"),
+    destination_state: Optional[str] = typer.Option(None, "--destination-state"),
+    destination_zip: Optional[str] = typer.Option(None, "--destination-zip"),
+    seats: Optional[int] = typer.Option(None, "--seats", min=1, help="Seats reserved on the leg."),
+    pets: Optional[str] = typer.Option(None, "--pets", help="Comma-separated pet IDs (replaces the leg's pets)."),
+    baggage: Optional[list[str]] = typer.Option(None, "--baggage", help="NAME=QUANTITY, repeatable, or \"none\" (replaces the leg's baggage)."),
+    dog_form_submitted: Optional[str] = typer.Option(None, "--dog-form-submitted", help="yes | no"),
+    catering: Optional[str] = typer.Option(None, "--catering", help="yes | no"),
+    catering_request: Optional[str] = typer.Option(None, "--catering-request"),
+    ground_transportation: Optional[str] = typer.Option(None, "--ground-transportation", help="yes | no"),
+    ground_transportation_when: Optional[str] = typer.Option(None, "--ground-transportation-when", help="departure | arrival | both"),
+    ground_transportation_method: Optional[str] = typer.Option(None, "--ground-transportation-method", help=_GROUND_METHOD_HELP),
+    ground_pickup_address: Optional[str] = typer.Option(None, "--ground-pickup-address", help=_ADDRESS_TEXT_HELP),
+    ground_dropoff_address: Optional[str] = typer.Option(None, "--ground-dropoff-address", help=_ADDRESS_TEXT_HELP),
+    arrival_ground_method: Optional[str] = typer.Option(None, "--arrival-ground-method", help=_GROUND_METHOD_HELP),
+    arrival_pickup_address: Optional[str] = typer.Option(None, "--arrival-pickup-address", help=_ADDRESS_TEXT_HELP),
+    arrival_dropoff_address: Optional[str] = typer.Option(None, "--arrival-dropoff-address", help=_ADDRESS_TEXT_HELP),
+    note: Optional[str] = typer.Option(None, "--note", help="Note to the flight concierge."),
     dry_run: bool = typer.Option(False, "--dry-run"),
     confirm: bool = typer.Option(False, "--confirm", help="Required before the single PATCH"),
     probe: bool = typer.Option(False, "--probe/--no-probe", help="Override recent-booking-write cooldown"),
@@ -1752,52 +2580,52 @@ def leg_update_required_info(
     fmt: str = Format,
     compact: bool = Compact,
 ):
-    """Patch Android required information once, preserving the full passenger list."""
-    parsed = _parse_json(body)
-    options = parsed.get("options", parsed)
-    if not isinstance(options, dict) or not options:
-        _die("--body must contain non-empty LegUpdateOptions.", EXIT_VALIDATION)
+    """Complete a booked leg's required information (passports, customs, destination, pets, catering, ground transportation).
 
-    # Fields emitted by Android 6.1.4 LegUpdateOptions.toJson. Keeping this
-    # allowlist prevents a typo from becoming an opaque live-booking mutation.
-    allowed = {
-        "departureAirportId", "arrivalAirportId", "aircraftId", "date",
-        "numberOfSeats", "passengers", "petIds", "baggage",
-        "requestSettings", "dogFormSubmitted", "shareSettings",
-    }
-    unsupported = sorted(set(options) - allowed)
-    if unsupported:
-        _die(
-            "Android does not emit these LegUpdateOptions fields: " + ", ".join(unsupported),
-            EXIT_VALIDATION,
-        )
+    Passenger changes are merged onto the leg's complete current passenger
+    list after one GET (Android sends every passenger). Only the sections you
+    answer are sent, in one PATCH, with no read-back.
+    """
+    passport_by_passenger = _key_value_pairs(passport, "--passport")
+    customs_by_passenger = _key_value_pairs(customs, "--customs")
+    destination = _address_payload(
+        destination_street, destination_street2, destination_city, destination_state, destination_zip,
+        "--destination",
+    )
+    request_settings: dict[str, Any] | None = None
+    request_options = (
+        catering, catering_request, ground_transportation, ground_transportation_when,
+        ground_transportation_method, ground_pickup_address, ground_dropoff_address,
+        arrival_ground_method, arrival_pickup_address, arrival_dropoff_address, note,
+    )
+    if any(value is not None for value in request_options):
+        request_settings = _build_request_settings_update(
+            catering=_optional_yes_no(catering, "--catering"),
+            catering_request=(catering_request or "").strip() or None,
+            ground_transportation=_optional_yes_no(ground_transportation, "--ground-transportation"),
+            ground_transportation_type=_optional_enum(ground_transportation_when, "--ground-transportation-when", _GROUND_TRANSPORTATION_TYPES),
+            ground_transportation_method=_optional_enum(ground_transportation_method, "--ground-transportation-method", _GROUND_TRANSPORTATION_METHODS),
+            pickup_address=_address_text(ground_pickup_address, "--ground-pickup-address"),
+            dropoff_address=_address_text(ground_dropoff_address, "--ground-dropoff-address"),
+            arrival_method=_optional_enum(arrival_ground_method, "--arrival-ground-method", _GROUND_TRANSPORTATION_METHODS),
+            arrival_pickup_address=_address_text(arrival_pickup_address, "--arrival-pickup-address"),
+            arrival_dropoff_address=_address_text(arrival_dropoff_address, "--arrival-dropoff-address"),
+            note=(note or "").strip() or None,
+        ) or None
+    pet_ids = _csv(pets, "--pets") if pets is not None else None
+    baggage_items = _baggage_items(baggage, required=False) if baggage else None
+    dog_form = _optional_yes_no(dog_form_submitted, "--dog-form-submitted")
+
+    passenger_changes = bool(passport_by_passenger or customs_by_passenger or destination)
+    if not passenger_changes and not any(
+        value is not None for value in (seats, pet_ids, baggage_items, request_settings, dog_form)
+    ):
+        _die("Nothing to update: answer at least one required-information option.", EXIT_VALIDATION)
 
     plan: dict[str, Any] | None = None
-    passenger_updates = options.get("passengers")
-    if passenger_updates is not None:
-        if not isinstance(passenger_updates, list) or not passenger_updates:
-            _die('"options.passengers" must be a non-empty array.', EXIT_VALIDATION)
-        update_by_id: dict[str, dict[str, Any]] = {}
-        allowed_passenger = {
-            "id", "customsDeclarationId", "destinationAddress", "passport", "passportIds",
-        }
-        for index, item in enumerate(passenger_updates):
-            if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
-                _die(
-                    f'options.passengers[{index}].id must be a saved passenger UUID.',
-                    EXIT_VALIDATION,
-                )
-            bad_fields = sorted(set(item) - allowed_passenger)
-            if bad_fields:
-                _die(
-                    f'options.passengers[{index}] has fields Android does not emit: '
-                    + ", ".join(bad_fields),
-                    EXIT_VALIDATION,
-                )
-            if item["id"] in update_by_id:
-                _die(f'Duplicate passenger update for {item["id"]}.', EXIT_VALIDATION)
-            update_by_id[item["id"]] = dict(item)
-
+    merged: list[dict[str, Any]] | None = None
+    token: str | None = None
+    if passenger_changes:
         _guard_booking_probe(probe)
         token = get_api_token(username, password)
         leg = _response_data(api_get(token, f"/leg/{leg_id}"))
@@ -1821,33 +2649,51 @@ def leg_update_required_info(
                 EXIT_VALIDATION,
             )
         current_ids = {item["id"] for item in current}
-        unknown_ids = sorted(set(update_by_id) - current_ids)
+        unknown_ids = sorted((set(passport_by_passenger) | set(customs_by_passenger)) - current_ids)
         if unknown_ids:
             _die(
                 "Required-info updates may not add/drop passengers; unknown saved IDs: "
                 + ", ".join(unknown_ids),
                 EXIT_VALIDATION,
             )
-        merged: list[dict[str, Any]] = []
+        merged = []
+        updated_ids: list[str] = []
         for current_item in current:
             passenger_id = current_item["id"]
-            merged.append({**current_item, **update_by_id.get(passenger_id, {})})
-        options = dict(options)
-        options["passengers"] = merged
+            item = dict(current_item)
+            changed = False
+            if passenger_id in customs_by_passenger:
+                item["customsDeclarationId"] = customs_by_passenger[passenger_id]
+                changed = True
+            if destination is not None:
+                item["destinationAddress"] = _leg_destination_address_update(destination)
+                changed = True
+            if passenger_id in passport_by_passenger:
+                item["passport"] = {"id": passport_by_passenger[passenger_id]}
+                changed = True
+            if changed:
+                updated_ids.append(passenger_id)
+            merged.append(item)
         plan = {
             "kept": [
                 {"id": item["id"], "name": labels.get(item["id"], item["id"])}
-                for item in current if item["id"] not in update_by_id
+                for item in current if item["id"] not in updated_ids
             ],
             "updated": [
                 {"id": item["id"], "name": labels.get(item["id"], item["id"])}
-                for item in current if item["id"] in update_by_id
+                for item in current if item["id"] in updated_ids
             ],
             "dropped": [],
         }
-    else:
-        token = None
 
+    options = _build_leg_update_options(
+        number_of_seats=seats,
+        passengers=merged,
+        pet_ids=pet_ids,
+        baggage=baggage_items,
+        request_settings=request_settings,
+        dog_form_submitted=dog_form,
+    )
     path = f"/leg/{leg_id}/required-info"
     payload = {"options": options}
     if dry_run:
@@ -2009,18 +2855,99 @@ def messages_read_all(
 # ---------------------------------------------------------------------------
 
 
+# Android 6.1.4 FeedbackSurveyCreateRequestModel (POST /feedback/create). Wire
+# values come from the app's enum objects (blutter objs.txt off_10); note the
+# app's own misspelling DISSASTIFIED, which the API expects verbatim.
+_FEEDBACK_SATISFACTION = ("VERY_SATISFIED", "SATISFIED", "NEUTRAL", "DISSASTIFIED", "VERY_DISSATISFIED")
+_FEEDBACK_CONDITION = ("EXCELLENT", "GOOD", "FAIR", "POOR", "VERY_POOR")
+_FEEDBACK_CREW = ("EXCEPTIONAL", "VERY_GOOD", "SATISFACTORY", "NEEDS_IMPROVEMENT", "POOR")
+_FEEDBACK_SPELLING = {"DISSATISFIED": "DISSASTIFIED"}
+
+
+def _feedback_choice(value: str, option: str, allowed: tuple[str, ...]) -> str:
+    normalized = value.strip().upper().replace("-", "_").replace(" ", "_")
+    normalized = _FEEDBACK_SPELLING.get(normalized, normalized)
+    if normalized not in allowed:
+        choices = ", ".join(
+            {"DISSASTIFIED": "dissatisfied"}.get(item, item.lower().replace("_", "-")) for item in allowed
+        )
+        _die(f"{option} must be one of: {choices}", EXIT_VALIDATION)
+    return normalized
+
+
+def _build_feedback_body(
+    *,
+    leg_id: str,
+    quality: str,
+    cleanliness: str,
+    professionalism: str,
+    fbo: str,
+    catering: str,
+    contact: bool | None,
+    additional_feedback: str,
+) -> dict[str, Any]:
+    """Android FeedbackSurveyCreateRequestModel, in key order.
+
+    contact is sent only when the yes/no question was answered (the model
+    skips the key when it is null). score is Android's mapSatisfaction: each
+    answer scores 5 (best) down to 1 (worst); the five scores are summed and
+    divided by 5.0.
+    """
+    ratings = (
+        (quality, _FEEDBACK_SATISFACTION),
+        (cleanliness, _FEEDBACK_CONDITION),
+        (professionalism, _FEEDBACK_CREW),
+        (fbo, _FEEDBACK_SATISFACTION),
+        (catering, _FEEDBACK_CONDITION),
+    )
+    score = sum(5 - allowed.index(value) for value, allowed in ratings) / 5.0
+    body: dict[str, Any] = {
+        "legId": leg_id,
+        "quality": quality,
+        "cleanliness": cleanliness,
+        "professionalism": professionalism,
+        "fbo": fbo,
+        "catering": catering,
+    }
+    if contact is not None:
+        body["contact"] = contact
+    body["additionalFeedback"] = additional_feedback
+    body["score"] = score
+    return body
+
+
 @feedback_app.command("submit")
 def feedback_submit(
-    body: str = typer.Option(..., "--body", help="JSON feedback body"),
+    leg_id: str = typer.Option(..., "--leg-id", help="Completed-leg UUID"),
+    snacks_and_amenities: str = typer.Option(..., "--snacks-and-amenities", help="In-flight snacks, beverages, amenities: very-satisfied | satisfied | neutral | dissatisfied | very-dissatisfied"),
+    aircraft_condition: str = typer.Option(..., "--aircraft-condition", help="excellent | good | fair | poor | very-poor"),
+    crew: str = typer.Option(..., "--crew", help="Flight crew professionalism: exceptional | very-good | satisfactory | needs-improvement | poor"),
+    fbo: str = typer.Option(..., "--fbo", help="FBO facilities: very-satisfied | satisfied | neutral | dissatisfied | very-dissatisfied"),
+    catering_and_transport: str = typer.Option(..., "--catering-and-transport", help="Catering / ground transportation: excellent | good | fair | poor | very-poor"),
+    contact_me: Optional[str] = typer.Option(None, "--contact-me", help="yes | no — be contacted about these answers (omitted when unanswered, as in the app)"),
+    comments: Optional[str] = typer.Option(None, "--comments", help="Additional feedback"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
+    compact: bool = Compact,
 ):
-    """Submit feedback to AirSprint."""
-    payload = _parse_json(body)
+    """Rate a completed flight, question by question, as in the app (POST /feedback/create)."""
+    payload = _build_feedback_body(
+        leg_id=leg_id,
+        quality=_feedback_choice(snacks_and_amenities, "--snacks-and-amenities", _FEEDBACK_SATISFACTION),
+        cleanliness=_feedback_choice(aircraft_condition, "--aircraft-condition", _FEEDBACK_CONDITION),
+        professionalism=_feedback_choice(crew, "--crew", _FEEDBACK_CREW),
+        fbo=_feedback_choice(fbo, "--fbo", _FEEDBACK_SATISFACTION),
+        catering=_feedback_choice(catering_and_transport, "--catering-and-transport", _FEEDBACK_CONDITION),
+        contact=_yes_no(contact_me, "--contact-me") if contact_me is not None else None,
+        additional_feedback=(comments or "").strip(),
+    )
+    if dry_run:
+        _out({"dry_run": True, "method": "POST", "path": "/feedback/create", "payload": payload}, fmt, compact)
+        return
     token = get_api_token(username, password)
-    data = api_post(token, "/feedback/create", payload)
-    _out(data, fmt)
+    _out(api_post(token, "/feedback/create", payload), fmt, compact)
 
 
 # ---------------------------------------------------------------------------
@@ -2252,26 +3179,20 @@ def _get_account_aircraft_id(token: str, value: str | None = None) -> str:
 
 def _hours_estimate_query(
     token: str,
-    body: str | None,
     account_aircraft_id: str | None,
     hours: float | None,
     action: str | None,
 ) -> dict[str, Any]:
-    query = _parse_json(body) if body else {}
-    if account_aircraft_id:
-        query["accountAircraftId"] = account_aircraft_id
-    if hours is not None:
-        query["hours"] = hours
-    if action:
-        query["type"] = action.upper()
-    query["accountAircraftId"] = _get_account_aircraft_id(
-        token, query.get("accountAircraftId")
-    )
-    if "hours" not in query:
-        _die("--hours is required (or include hours in --body).", EXIT_VALIDATION)
-    if query.get("type") not in ("BUY", "SELL"):
-        _die("--type must be BUY or SELL (or include type in --body).", EXIT_VALIDATION)
-    return query
+    """GET /hour-exchange/estimate query: accountAircraftId, hours, type (BUY|SELL)."""
+    if hours is None:
+        _die("--hours is required.", EXIT_VALIDATION)
+    if not action:
+        _die("--type must be BUY or SELL.", EXIT_VALIDATION)
+    return {
+        "accountAircraftId": _get_account_aircraft_id(token, account_aircraft_id),
+        "hours": hours,
+        "type": _enum(action, "--type", ("BUY", "SELL")),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2281,57 +3202,72 @@ def _hours_estimate_query(
 
 @quote_app.command("flight")
 def quote_flight(
-    departure: Optional[str] = typer.Option(None, "--from", help="Departure ICAO code (e.g. CYQB). Resolved to UUID automatically."),
-    arrival: Optional[str] = typer.Option(None, "--to", help="Arrival ICAO code (e.g. KTEB). Resolved to UUID automatically."),
-    date: Optional[str] = typer.Option(None, "--date", help="Departure date/time in local time (e.g. 2026-04-15T10:00, 2026-04-15). Converted to UTC using --timezone."),
-    body: Optional[str] = typer.Option(None, "--body", help="Full JSON body (overrides --from/--to/--date)"),
-    pax: int = typer.Option(1, "--pax", min=1, help="Passenger count sent in each Android quote leg"),
+    departure: str = typer.Option(..., "--from", help="Departure airport ICAO code (e.g. CYQB)"),
+    arrival: str = typer.Option(..., "--to", help="Arrival airport ICAO code (e.g. KTEB)"),
+    date: str = typer.Option(..., "--date", help="Departure date/time, local to --timezone (2026-04-15T10:00 or 2026-04-15)"),
+    return_date: Optional[str] = typer.Option(None, "--return-date", help="Add a return leg on this local date/time"),
+    pax: int = typer.Option(1, "--pax", min=1, help="Passengers on each leg"),
+    aircraft: Optional[str] = typer.Option(None, "--aircraft-id", help="Aircraft UUID from `quote aircraft`; defaults to your account aircraft"),
     timezone: Optional[str] = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """Get a flight quote with real server-side pricing from AirSprint.
+    """Price a one-way or round trip with AirSprint's real quote engine.
 
-    Two modes:
-
-    1. Simple: --from CYQB --to KTEB --date 2026-04-15T10:00
-       (ICAO auto-resolved, local time converted to UTC via --timezone, uses your default aircraft)
-
-    2. Advanced: --body '{"legs": [{"aircraftId": "UUID", "departureAirportId": "UUID", ...}]}'
-       (pass UUIDs directly — get them from `quote airports` and `quote aircraft`)
-
-    Date accepts local time (requires --timezone or AIRSPRINT_TIMEZONE), e.g.:
-      --date 2026-04-15T10:00 --tz America/Montreal  → 10:00 AM Eastern
-      --date 2026-04-15 --tz America/Montreal         → midnight Eastern
-      --date 2026-04-15T14:00:00Z                     → already UTC, no --tz needed
+    Local dates need --timezone / AIRSPRINT_TIMEZONE; dates ending in Z or an
+    offset are used as-is.
     """
+    _use_timezone(timezone)
     token = get_api_token(username, password)
-
-    if body:
-        payload = _parse_json(body)
-    elif departure and arrival and date:
-        date_utc = _parse_local_dt(date, timezone)
-        dep_id = _resolve_airport(token, departure)
-        arr_id = _resolve_airport(token, arrival)
-        ac_id = _get_default_aircraft(token)
-        payload = {
-            "legs": [{
-                "aircraftId": ac_id,
-                "departureAirportId": dep_id,
-                "arrivalAirportId": arr_id,
-                "departureDateUTC": date_utc,
-                "pax": pax,
-            }]
-        }
-    else:
-        _die("Provide either --from/--to/--date or --body", EXIT_VALIDATION)
-
+    payload = _build_flight_quote_body(
+        token,
+        departure=departure,
+        arrival=arrival,
+        date=date,
+        return_date=return_date,
+        pax=pax,
+        aircraft_id=aircraft,
+        timezone=timezone,
+    )
     try:
         resp = api_post(token, "/flight-quote", payload)
         _out(resp.get("data", resp), fmt)
     except RuntimeError as e:
         _die(str(e), EXIT_ERROR)
+
+
+def _build_flight_quote_body(
+    token: str,
+    *,
+    departure: str,
+    arrival: str,
+    date: str,
+    return_date: str | None,
+    pax: int,
+    aircraft_id: str | None,
+    timezone: str | None,
+) -> dict[str, Any]:
+    """Android 6.1.4 /flight-quote legs: aircraftId, departureAirportId, arrivalAirportId, departureDateUTC, pax."""
+    dep_id = _resolve_airport(token, departure)
+    arr_id = _resolve_airport(token, arrival)
+    ac_id = aircraft_id or _get_default_aircraft(token)
+    legs = [{
+        "aircraftId": ac_id,
+        "departureAirportId": dep_id,
+        "arrivalAirportId": arr_id,
+        "departureDateUTC": _parse_local_dt(date, timezone),
+        "pax": pax,
+    }]
+    if return_date:
+        legs.append({
+            "aircraftId": ac_id,
+            "departureAirportId": arr_id,
+            "arrivalAirportId": dep_id,
+            "departureDateUTC": _parse_local_dt(return_date, timezone),
+            "pax": pax,
+        })
+    return {"legs": legs}
 
 
 @quote_app.command("roundtrip")
@@ -2383,22 +3319,87 @@ def quote_roundtrip(
         _die(str(e), EXIT_ERROR)
 
 
+_MISC_COST_AIRCRAFT = ("LEGACY_450", "CITATION_CJ3_PLUS", "CITATION_CJ2_PLUS")
+
+
+def _build_misc_cost_body(
+    *,
+    aircraft: str,
+    quote_price: float,
+    service_area: str,
+    service_location: str | None,
+    actual_flight_minutes: int | None,
+    ground_transportation_method: str | None,
+    owned_aircraft: str | None,
+    flown_aircraft: str,
+) -> dict[str, Any]:
+    """Android toTripMiscCostEstimateRequest (POST /trip/misc-cost-estimate) for one leg.
+
+    Keys in Android's order: aircraft and quotePrice and serviceArea (always,
+    serviceArea may be ""), then serviceLocation, actualFlightMinutes and
+    groundTransportation ({"method", "applyServiceCharge": true}) only when
+    set, then interchange {"ownedAircraft", "flownAircraft"} only when the
+    owned aircraft type is known (the app also requires a recognised flown
+    type; the CLI validates both against the same enum).
+    """
+    leg: dict[str, Any] = {
+        "aircraft": aircraft,
+        "quotePrice": float(quote_price),
+        "serviceArea": service_area,
+    }
+    if service_location:
+        leg["serviceLocation"] = service_location
+    if actual_flight_minutes is not None:
+        leg["actualFlightMinutes"] = int(actual_flight_minutes)
+    if ground_transportation_method:
+        leg["groundTransportation"] = {"method": ground_transportation_method, "applyServiceCharge": True}
+    if owned_aircraft:
+        leg["interchange"] = {"ownedAircraft": owned_aircraft, "flownAircraft": flown_aircraft}
+    return {"legs": [leg]}
+
+
 @quote_app.command("cost")
 def quote_cost(
-    body: str = typer.Option(..., "--body", help='JSON body, e.g. \'{"legs":[{"aircraft":"CITATION_CJ2_PLUS","quotePrice":750}]}\''),
+    aircraft: str = typer.Option(..., "--aircraft", help="legacy-450 | citation-cj3-plus | citation-cj2-plus"),
+    quote_price: float = typer.Option(..., "--quote-price", min=0, help="Quoted flight price for the leg"),
+    flight_minutes: Optional[int] = typer.Option(None, "--flight-minutes", min=1, help="Flight time in minutes, when known (left out otherwise, as in the app)"),
+    service_area: Optional[str] = typer.Option(None, "--service-area", help="Airport service area label, if the airport has one"),
+    service_location: Optional[str] = typer.Option(None, "--service-location", help="Airport service location label, if any"),
+    ground_transportation_method: Optional[str] = typer.Option(None, "--ground-transportation-method", help=_GROUND_METHOD_HELP),
+    owned_aircraft: Optional[str] = typer.Option(None, "--owned-aircraft", help="Aircraft type you own; answer it to price an interchange (flying a different type)"),
+    flown_aircraft: Optional[str] = typer.Option(None, "--flown-aircraft", help="Aircraft type actually flown for the interchange (default: --aircraft)"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
+    compact: bool = Compact,
 ):
-    """Get miscellaneous cost estimate (catering, ground transport, surcharges).
+    """Estimate one leg's miscellaneous costs (catering, ground transport, surcharges) — POST /trip/misc-cost-estimate.
 
-    This calls api.airsprint.com for server-side cost breakdown.
+    Run it once per leg for multi-leg trips.
     """
-    payload = _parse_json(body)
+    aircraft_type = _enum(aircraft, "--aircraft", _MISC_COST_AIRCRAFT)
+    if flown_aircraft and not owned_aircraft:
+        _die("--flown-aircraft describes an interchange; also answer --owned-aircraft. Nothing was sent.", EXIT_VALIDATION)
+    payload = _build_misc_cost_body(
+        aircraft=aircraft_type,
+        quote_price=quote_price,
+        service_area=(service_area or "").strip(),
+        service_location=(service_location or "").strip() or None,
+        actual_flight_minutes=flight_minutes,
+        ground_transportation_method=_optional_enum(
+            ground_transportation_method, "--ground-transportation-method", _GROUND_TRANSPORTATION_METHODS,
+        ),
+        owned_aircraft=_enum(owned_aircraft, "--owned-aircraft", _MISC_COST_AIRCRAFT) if owned_aircraft else None,
+        flown_aircraft=_enum(flown_aircraft, "--flown-aircraft", _MISC_COST_AIRCRAFT) if flown_aircraft else aircraft_type,
+    )
+    if dry_run:
+        _out({"dry_run": True, "method": "POST", "path": "/trip/misc-cost-estimate", "payload": payload}, fmt, compact)
+        return
     token = get_api_token(username, password)
     try:
         resp = api_post(token, "/trip/misc-cost-estimate", payload)
-        _out(resp.get("data", resp), fmt)
+        _out(resp.get("data", resp), fmt, compact)
     except RuntimeError as e:
         _die(str(e), EXIT_ERROR)
 
@@ -2408,7 +3409,6 @@ def quote_hours_exchange(
     hours: Optional[float] = typer.Option(None, "--hours", min=0.01),
     action: Optional[str] = typer.Option(None, "--type", help="BUY or SELL"),
     account_aircraft_id: Optional[str] = typer.Option(None, "--account-aircraft-id", help="Defaults automatically when the account has one aircraft"),
-    body: Optional[str] = typer.Option(None, "--body", help='Compatibility JSON, e.g. {"hours":2,"type":"BUY"}'),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
@@ -2419,7 +3419,7 @@ def quote_hours_exchange(
     one aircraft, its account-aircraft ID is selected automatically.
     """
     token = get_api_token(username, password)
-    query = _hours_estimate_query(token, body, account_aircraft_id, hours, action)
+    query = _hours_estimate_query(token, account_aircraft_id, hours, action)
     try:
         resp = api_get(token, "/hour-exchange/estimate", query)
         _out(resp.get("data", resp), fmt)
@@ -2501,7 +3501,7 @@ def quote_aircraft(
     password: Optional[str] = Password,
     fmt: str = Format,
 ):
-    """List all AirSprint aircraft types with UUIDs (needed for quote --body).
+    """List all AirSprint aircraft types with UUIDs (for `--aircraft-id` on `quote flight` / `quote roundtrip`).
 
     Served from local mirror when fresh; refresh with `cache refresh`.
     """
@@ -2725,12 +3725,28 @@ def _parse_ids(value: str, option_name: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# raw — generic escape hatches for any endpoint
+# raw — maintainer-only escape hatches (hidden; not part of the agent surface)
 # ---------------------------------------------------------------------------
+
+AllowRaw = typer.Option(
+    False,
+    "--allow-raw",
+    help="Required. Raw requests bypass the CLI's typed forms and safety checks; maintainers only.",
+)
+
+
+def _require_raw_access(allow_raw: bool) -> None:
+    if not allow_raw:
+        _die(
+            "Raw API access is reserved for maintainers. Use the typed command for this "
+            "action (see --skill), or pass --allow-raw deliberately.",
+            EXIT_VALIDATION,
+        )
 
 
 @raw_app.command("api-get")
 def raw_api_get(
+    allow_raw: bool = AllowRaw,
     path: str = typer.Option(..., "--path", help='Path on api.airsprint.com (e.g. "/my-saved-airports/")'),
     probe: bool = typer.Option(False, "--probe/--no-probe", help="Override recent-booking-write cooldown"),
     username: Optional[str] = Username,
@@ -2739,6 +3755,7 @@ def raw_api_get(
     compact: bool = Compact,
 ):
     """GET against api.airsprint.com."""
+    _require_raw_access(allow_raw)
     if path.startswith(("/trip/", "/leg/", "/my-flight/", "/my-leg/")):
         _guard_booking_probe(probe)
     token = get_api_token(username, password)
@@ -2747,6 +3764,7 @@ def raw_api_get(
 
 @raw_app.command("api-post")
 def raw_api_post(
+    allow_raw: bool = AllowRaw,
     path: str = typer.Option(..., "--path", help="Path on api.airsprint.com"),
     body: str = typer.Option("{}", "--body", help="JSON body (default empty)"),
     username: Optional[str] = Username,
@@ -2755,12 +3773,14 @@ def raw_api_post(
     compact: bool = Compact,
 ):
     """POST against api.airsprint.com."""
+    _require_raw_access(allow_raw)
     token = get_api_token(username, password)
     _out(api_post(token, path, _parse_json(body)), fmt, compact)
 
 
 @raw_app.command("api-patch")
 def raw_api_patch(
+    allow_raw: bool = AllowRaw,
     path: str = typer.Option(..., "--path", help="Path on api.airsprint.com"),
     body: str = typer.Option("{}", "--body", help="JSON body (default empty)"),
     confirm: bool = typer.Option(False, "--confirm", help="Required before sending PATCH"),
@@ -2771,6 +3791,7 @@ def raw_api_patch(
     compact: bool = Compact,
 ):
     """PATCH exactly once with no read-back. Requires --confirm or --dry-run."""
+    _require_raw_access(allow_raw)
     payload = _parse_json(body)
     if dry_run:
         _out({"dry_run": True, "method": "PATCH", "path": path, "payload": payload}, fmt, compact)
@@ -2787,6 +3808,7 @@ def raw_api_patch(
 
 @raw_app.command("api-delete")
 def raw_api_delete(
+    allow_raw: bool = AllowRaw,
     path: str = typer.Option(..., "--path", help="Path on api.airsprint.com"),
     confirm: bool = typer.Option(False, "--confirm", help="Required before sending DELETE"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show the request without sending it"),
@@ -2796,6 +3818,7 @@ def raw_api_delete(
     compact: bool = Compact,
 ):
     """DELETE against api.airsprint.com. Requires --confirm or --dry-run."""
+    _require_raw_access(allow_raw)
     if dry_run:
         _out({"dry_run": True, "method": "DELETE", "path": path}, fmt, compact)
         return
@@ -2824,19 +3847,91 @@ def account_users(
     _out(resp.get("data", resp), fmt, compact)
 
 
+
+_ACCOUNT_ROLES = (
+    "ACCOUNT_OWNER", "FULL_ACCESS", "INDIVIDUAL_ACCESS", "EMPTY_LEG_ACCESS", "PASSENGER_ACCESS",
+)
+
+
+def _resolve_role_id(token: str, role: str) -> str:
+    """Android getRoleIdByName(): one /account-user-role lookup filtered by name."""
+    response = api_post(token, "/account-user-role", {
+        "filter": {"name": role},
+        "page": {"limit": 2, "offset": 0},
+    })
+    data = _response_data(response)
+    items = data.get("items") if isinstance(data, dict) else data
+    for item in items or []:
+        if isinstance(item, dict) and isinstance(item.get("id"), str):
+            return item["id"]
+    _die(f"Role {role} was not found on this account.", EXIT_NOT_FOUND)
+
+
+def _resolve_invite_account_id(token: str, account_id: str | None) -> str:
+    if account_id:
+        return account_id
+    account_ids = _get_account_ids(token)
+    if len(account_ids) == 1:
+        return account_ids[0]
+    if not account_ids:
+        _die("No accounts found", EXIT_ERROR)
+    _die("Several accounts found; pass --account-id (see `user accounts`).", EXIT_VALIDATION)
+
+
+def _build_account_invite_body(
+    *,
+    first_name: str,
+    last_name: str,
+    email: str,
+    role_id: str,
+    account_id: str,
+    passenger_id: str | None,
+) -> dict[str, Any]:
+    """Android inviteNewAccountUser()/inviteAccountUserFromPassenger() bodies."""
+    new_user = {
+        "firstName": _required_text(first_name, "--first-name"),
+        "lastName": _required_text(last_name, "--last-name"),
+        "email": _required_text(email, "--email"),
+        "accountUserRoleId": role_id,
+        "accountId": account_id,
+    }
+    if passenger_id:
+        return {"passengerId": passenger_id, "newUser": new_user}
+    return {"newUser": new_user}
+
+
 @account_app.command("invite")
 def account_invite(
-    body: str = typer.Option(..., "--body", help="JSON body for invite"),
+    first_name: str = typer.Option(..., "--first-name"),
+    last_name: str = typer.Option(..., "--last-name"),
+    email: str = typer.Option(..., "--email"),
+    role: Optional[str] = typer.Option(
+        None, "--role", help="Access level: " + ", ".join(_ACCOUNT_ROLES),
+    ),
+    role_id: Optional[str] = typer.Option(None, "--role-id", help="Role UUID from `account roles` (instead of --role)"),
+    account_id: Optional[str] = typer.Option(None, "--account-id", help="Needed only when you own several accounts"),
+    passenger_id: Optional[str] = typer.Option(
+        None, "--passenger-id", help="Invite an existing saved passenger (their passenger UUID)",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Invite a user to the account (POST /account-user/invite)."""
-    payload = _parse_json(body)
+    """Invite someone to use the account (POST /account-user/invite)."""
+    if bool(role) == bool(role_id):
+        _die("Pass exactly one of --role or --role-id.", EXIT_VALIDATION)
+    role_name = _optional_enum(role, "--role", _ACCOUNT_ROLES)
+    token = get_api_token(username, password)
+    resolved_role = role_id or _resolve_role_id(token, role_name or "")
+    payload = _build_account_invite_body(
+        first_name=first_name, last_name=last_name, email=email,
+        role_id=resolved_role,
+        account_id=_resolve_invite_account_id(token, account_id),
+        passenger_id=passenger_id,
+    )
     if dry_run:
         _out({"dry_run": True, "payload": payload, "endpoint": "/account-user/invite"}, fmt, compact)
         return
-    token = get_api_token(username, password)
     _out(api_post(token, "/account-user/invite", payload), fmt, compact)
 
 
@@ -2870,14 +3965,13 @@ def account_user_update(
 
 @account_app.command("user-patch")
 def account_user_patch(
-    user_id: str = typer.Option(..., "--id", help="Account-user UUID"),
-    body: str = typer.Option(
-        ...,
-        "--body",
-        help=(
-            "JSON fields: firstName, lastName, email, accountUserRoleId, "
-            "savedAirportIds; wrapped in options automatically"
-        ),
+    user_id: str = typer.Option(..., "--id", help="Account-user UUID from `account users`"),
+    first_name: Optional[str] = typer.Option(None, "--first-name"),
+    last_name: Optional[str] = typer.Option(None, "--last-name"),
+    email: Optional[str] = typer.Option(None, "--email"),
+    role_id: Optional[str] = typer.Option(None, "--role-id", help="Role UUID from `account roles`"),
+    saved_airports: Optional[str] = typer.Option(
+        None, "--saved-airports", help="Comma-separated airport UUIDs (replaces the list; empty string clears it)",
     ),
     dry_run: bool = typer.Option(False, "--dry-run"),
     confirm: bool = typer.Option(False, "--confirm"),
@@ -2886,18 +3980,20 @@ def account_user_patch(
     fmt: str = Format,
     compact: bool = Compact,
 ):
-    """Patch one account user using Android's PATCH /my-account-user/{id}."""
-    parsed = _parse_json(body)
-    options = parsed.get("options", parsed)
-    if not isinstance(options, dict) or not options:
-        _die("--body must contain at least one account-user field.", EXIT_VALIDATION)
-    allowed = {"firstName", "lastName", "email", "accountUserRoleId", "savedAirportIds"}
-    unsupported = sorted(set(options) - allowed)
-    if unsupported:
-        _die(
-            "Android does not send these account-user fields: " + ", ".join(unsupported),
-            EXIT_VALIDATION,
-        )
+    """Edit one account user's name, email, role, or saved airports."""
+    options: dict[str, Any] = {}
+    if first_name is not None:
+        options["firstName"] = _required_text(first_name, "--first-name")
+    if last_name is not None:
+        options["lastName"] = _required_text(last_name, "--last-name")
+    if email is not None:
+        options["email"] = _required_text(email, "--email")
+    if role_id is not None:
+        options["accountUserRoleId"] = _required_text(role_id, "--role-id")
+    if saved_airports is not None:
+        options["savedAirportIds"] = _csv(saved_airports, "--saved-airports")
+    if not options:
+        _die("Pass at least one field to change (see --help).", EXIT_VALIDATION)
     path = f"/my-account-user/{user_id}"
     payload = {"id": user_id, "options": options}
     if dry_run:
@@ -2971,45 +4067,186 @@ def passenger_get(
     _out(api_get(token, f"/my-passenger/{passenger_id}"), fmt, compact)
 
 
+SaveProfile = typer.Option(
+    None, "--save-profile",
+    help='Required. "yes" keeps the person in your Saved Passengers list; "no" creates '
+         "them for this booking only (hidden from the list). Same question as the web form.",
+)
+
+
 @passenger_app.command("create")
 def passenger_create(
-    body: str = typer.Option(..., "--body", help="JSON body for new passenger"),
+    first_name: str = typer.Option(..., "--first-name", help="Legal first name"),
+    last_name: str = typer.Option(..., "--last-name", help="Legal last name"),
+    save_profile: Optional[str] = SaveProfile,
+    middle_name: Optional[str] = typer.Option(None, "--middle-name", help="Legal middle name"),
+    email: Optional[str] = typer.Option(None, "--email"),
+    gender: str = typer.Option(..., "--gender", help="male | female | x (required, as in the app; used for weight and balance)"),
+    category: str = typer.Option("ADULT", "--category", help="ADULT (12+) | CHILD (2-11) | INFANT (<2)"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Create a saved passenger (POST /my-passenger/create)."""
-    payload = _parse_json(body)
+    """Add a person, same questions as the app's "Add New Person" form.
+
+    --save-profile is required: "yes" = add to Saved Passengers, "no" = this
+    booking only. Either way the result contains an `id` to use with
+    `leg update-passengers --add` or `booking create --passengers`.
+    Passports and addresses are attached afterwards with `passport create`
+    and `address create`.
+    """
+    if save_profile is None:
+        _die('--save-profile yes|no is required (the web form asks: "add this person to your Saved Passengers list?").', EXIT_VALIDATION)
+    saved = _yes_no(save_profile, "--save-profile")
+    payload = _build_passenger_create_body(
+        first_name=first_name,
+        middle_name=middle_name,
+        last_name=last_name,
+        email=email,
+        gender=_gender(gender),
+        category=_enum(category, "--category", _CATEGORIES),
+        saved=saved,
+    )
     if dry_run:
-        _out({"dry_run": True, "payload": payload, "endpoint": "/my-passenger/create"}, fmt, compact)
+        _out({"dry_run": True, "endpoint": "/my-passenger/create",
+              "saveProfile": saved, "payload": payload}, fmt, compact)
         return
     token = get_api_token(username, password)
     _out(api_post(token, "/my-passenger/create", payload), fmt, compact)
 
 
+def _build_passenger_create_body(
+    *,
+    first_name: str,
+    middle_name: str | None,
+    last_name: str,
+    email: str | None,
+    gender: str,
+    category: str,
+    saved: bool,
+) -> dict[str, Any]:
+    """Android 6.1.4 NewPassengersRequestModel.toJson (0x6f4a90), in its key order.
+
+    AddNewPersonController.submit (0x918028) trims every text and turns a
+    blank middle name or email into null; toJson then writes middleName and
+    picture as "" when null, keeps email null, hard-codes flightPreferences
+    to "" (0x6f4ba4), adds `passports` only when the list is non-empty (the
+    form always passes an empty one, 0x9182c8) and always sends
+    `addresses: []` plus `isActive` (the "add to Saved Passengers?" toggle).
+    """
+    first, last = first_name.strip(), last_name.strip()
+    if not first or not last:
+        _die("--first-name and --last-name must not be blank.", EXIT_VALIDATION)
+    return {
+        "firstName": first,
+        "middleName": (middle_name or "").strip(),
+        "lastName": last,
+        "email": (email or "").strip() or None,
+        "gender": gender,
+        "age": category,
+        "flightPreferences": "",
+        "picture": "",
+        "addresses": [],
+        "isActive": saved,
+    }
+
+
+_PASSENGER_PROFILE_KEYS = ("firstName", "middleName", "lastName", "email", "gender", "age", "flightPreferences")
+
+
+def _passenger_record(response: Any) -> dict[str, Any]:
+    data = _response_data(response)
+    if isinstance(data, dict) and "firstName" not in data and isinstance(data.get("options"), dict):
+        data = data["options"]
+    return data if isinstance(data, dict) else {}
+
+
+def _build_passenger_update_body(current: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]:
+    """Android PassengerPersonProfilePage._onSave (0x881fcc): the whole profile form, every time.
+
+    The app never patches one field. After `isValid` (0x87de8c: first and
+    last name non-blank after trim, gender set) it sends firstName,
+    middleName, lastName, email, gender, age and flightPreferences in that
+    order (0x88237c-0x8825e8), trimmed, with a blank middle name or
+    preferences as "" and a blank email as null. `picture` is added only after
+    a new avatar upload, which the CLI does not do; isActive is never sent.
+    """
+    merged: dict[str, Any] = {key: current.get(key) for key in _PASSENGER_PROFILE_KEYS}
+    merged.update(changes)
+
+    def text(key: str) -> str:
+        value = merged.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    first, last = text("firstName"), text("lastName")
+    if not first or not last:
+        _die("The profile needs a first and last name; pass --first-name / --last-name.", EXIT_VALIDATION)
+    gender = merged.get("gender")
+    if gender not in _GENDERS:
+        _die("Gender is required, as in the app's profile form: pass --gender male|female|x.", EXIT_VALIDATION)
+    age = merged.get("age")
+    if age not in _CATEGORIES:
+        _die("Category is required: pass --category ADULT|CHILD|INFANT.", EXIT_VALIDATION)
+    return {
+        "firstName": first,
+        "middleName": text("middleName"),
+        "lastName": last,
+        "email": text("email") or None,
+        "gender": gender,
+        "age": age,
+        "flightPreferences": text("flightPreferences"),
+    }
+
+
 @passenger_app.command("update")
 def passenger_update(
     passenger_id: str = typer.Option(..., "--id", help="Passenger UUID"),
-    body: str = typer.Option(..., "--body", help="JSON fields accepted by the AirSprint passenger form"),
+    first_name: Optional[str] = typer.Option(None, "--first-name"),
+    middle_name: Optional[str] = typer.Option(None, "--middle-name", help='Pass "" to clear'),
+    last_name: Optional[str] = typer.Option(None, "--last-name"),
+    email: Optional[str] = typer.Option(None, "--email", help='Pass "" to clear'),
+    gender: Optional[str] = typer.Option(None, "--gender", help="male | female | x"),
+    category: Optional[str] = typer.Option(None, "--category", help="ADULT | CHILD | INFANT"),
+    flight_preferences: Optional[str] = typer.Option(None, "--flight-preferences", help='Free text; pass "" to clear'),
     dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Update a saved passenger (PATCH /my-passenger/{id})."""
+    """Edit a saved person with the app's profile form (PATCH /my-passenger/{id}).
+
+    Pass only what changes. Like the app, the CLI reads the current profile
+    and sends the complete form back (first/middle/last name, email, gender,
+    category, flight preferences), so `--dry-run` still performs that read.
+    Passports are managed with `passport create` / `passport make-primary`,
+    addresses with `address create`; the "saved passenger" choice is made
+    once, at creation, and the app never changes it afterwards.
+    """
     path = f"/my-passenger/{passenger_id}"
-    payload = _parse_json(body)
-    fields = payload.get("options", payload)
-    if "selectedPassportId" in fields:
-        _die(
-            "selectedPassportId does not persist. Use `passport make-primary` to reorder passportIds.",
-            EXIT_VALIDATION,
-        )
-    if "options" not in payload:
-        payload = {"options": payload}
-    if dry_run:
-        _out({"dry_run": True, "method": "PATCH", "path": path, "payload": payload}, fmt, compact)
-        return
+    changes: dict[str, Any] = {}
+    if first_name is not None:
+        changes["firstName"] = _required_text(first_name, "--first-name")
+    if middle_name is not None:
+        changes["middleName"] = middle_name.strip()
+    if last_name is not None:
+        changes["lastName"] = _required_text(last_name, "--last-name")
+    if email is not None:
+        changes["email"] = email.strip()
+    if gender is not None:
+        changes["gender"] = _gender(gender)
+    if category is not None:
+        changes["age"] = _enum(category, "--category", _CATEGORIES)
+    if flight_preferences is not None:
+        changes["flightPreferences"] = flight_preferences.strip()
+    if not changes:
+        _die("Pass at least one field to change (see --help).", EXIT_VALIDATION)
     token = get_api_token(username, password)
+    current = _passenger_record(api_get(token, path))
+    if not current:
+        _die(f"Passenger {passenger_id} was not found; nothing was changed.", EXIT_ERROR)
+    payload = {"options": _build_passenger_update_body(current, changes)}
+    if dry_run:
+        _out({"dry_run": True, "method": "PATCH", "path": path, "payload": payload, "changed": sorted(changes)}, fmt, compact)
+        return
     _out(api_patch(token, path, payload), fmt, compact)
 
 
@@ -3089,18 +4326,32 @@ def _passport_epoch_ms(value: Any, field: str, timezone: str | None = None) -> i
     return int(epoch)
 
 
-def _normalize_passport_create(
-    payload: dict[str, Any],
-    timezone: str | None = None,
+
+def _build_passport_create_body(
+    *,
+    passenger_id: str,
+    passport_number: str,
+    date_of_birth: str,
+    nationality: str,
+    issuing_authority: str,
+    expiration_date: str,
+    timezone: str | None,
 ) -> dict[str, Any]:
-    normalized = dict(payload)
-    if isinstance(payload.get("options"), dict):
-        normalized["options"] = dict(payload["options"])
-    fields = normalized.get("options", normalized)
-    for key in ("dateOfBirth", "expirationDate"):
-        if key in fields:
-            fields[key] = _passport_epoch_ms(fields[key], key, timezone)
-    return normalized
+    """Android PassportCreateRequestModel.toJson(), keys in source order.
+
+    ``image`` is hard-coded to "" by the app; the scan is attached afterwards
+    through the document upload workflow. Dates are epoch milliseconds taken
+    at device-local midnight.
+    """
+    return {
+        "passengerId": _required_text(passenger_id, "--passenger-id"),
+        "image": "",
+        "passportNumber": _required_text(passport_number, "--passport-number").upper(),
+        "dateOfBirth": _passport_epoch_ms(date_of_birth, "--date-of-birth", timezone),
+        "nationality": _optional_country_code(nationality, "--nationality"),
+        "issuingAuthority": _required_text(issuing_authority, "--issuing-authority"),
+        "expirationDate": _passport_epoch_ms(expiration_date, "--expiration-date", timezone),
+    }
 
 
 def _entity_id(response: dict[str, Any], *keys: str) -> str | None:
@@ -3198,62 +4449,164 @@ def passport_update_authority(
     _out(api_patch(token, path, payload), fmt, compact)
 
 
+
 @passport_app.command("create")
 def passport_create(
-    body: str = typer.Option(..., "--body"),
-    passenger_id: Optional[str] = typer.Option(
+    passenger_id: str = typer.Option(..., "--passenger-id", help="Saved passenger UUID the passport belongs to"),
+    passport_number: str = typer.Option(..., "--passport-number", help="Number printed on the passport"),
+    date_of_birth: str = typer.Option(..., "--date-of-birth", help="YYYY-MM-DD as printed"),
+    nationality: str = typer.Option(..., "--nationality", help="Two-letter country code, e.g. CA"),
+    issuing_authority: str = typer.Option(..., "--issuing-authority", help="Authority/Autorité as printed, e.g. QUÉBEC"),
+    expiration_date: str = typer.Option(..., "--expiration-date", help="YYYY-MM-DD as printed"),
+    file_value: str = typer.Option(
+        ...,
+        "--file",
+        help="Required passport photo/scan (JPEG, PNG, or PDF; maximum 20 MiB)",
+    ),
+    content_type: Optional[str] = typer.Option(
         None,
-        "--passenger-id",
-        help="Saved passenger UUID; makes the new passport first in passportIds.",
+        "--content-type",
+        help="MIME type; inferred from the filename by default",
     ),
     timezone: Optional[str] = Timezone,
     dry_run: bool = typer.Option(False, "--dry-run"),
+    confirm: bool = typer.Option(
+        False,
+        "--confirm",
+        help="Required before creating and uploading the passport",
+    ),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Create a passport with date fields normalized to epoch milliseconds.
+    """Add a passport to a saved passenger and attach its photo/scan.
 
-    The API accepts milliseconds on create but stores seconds. If
-    --passenger-id is supplied, the passenger is read before creation and then
-    patched once so the new passport becomes the first displayed passport.
+    Dates are YYYY-MM-DD exactly as printed; pass --tz (or set
+    AIRSPRINT_TIMEZONE) to the passenger's device timezone. The new passport is
+    placed first so the app shows it. Each write is attempted exactly once.
     """
-    payload = _normalize_passport_create(_parse_json(body), timezone)
+    payload = _build_passport_create_body(
+        passenger_id=passenger_id, passport_number=passport_number,
+        date_of_birth=date_of_birth, nationality=nationality,
+        issuing_authority=issuing_authority, expiration_date=expiration_date,
+        timezone=timezone,
+    )
+    file_path, mime = _passport_scan_file(file_value, content_type)
+    document_base = {"passportId": "<created passport id>"}
+    document_init = {
+        **document_base,
+        "fileName": file_path.name,
+        "contentType": mime,
+        "maxFileSizeBytes": ANDROID_DOCUMENT_MAX_BYTES,
+    }
     if dry_run:
         _out({
             "dry_run": True,
+            "steps": [
+                {"method": "POST", "path": "/my-passport/create", "payload": payload},
+                {
+                    "method": "POST",
+                    "path": "/my-passport/document/upload-init",
+                    "payload": document_init,
+                },
+                {
+                    "method": "POST",
+                    "path": "presignedUpload.url",
+                    "multipartFile": file_path.name,
+                },
+                {
+                    "method": "POST",
+                    "path": "/my-passport/document/attach",
+                    "payload": {
+                        **document_base,
+                        "fileName": file_path.name,
+                        "contentType": mime,
+                        "storagePath": "<from upload-init>",
+                    },
+                },
+                {
+                    "method": "PATCH",
+                    "path": f"/my-passenger/{passenger_id}",
+                    "payload": {"options": {"passportIds": ["<created passport id>", "<existing ids>"]}},
+                    "skippedWhen": "the passenger had no passport before",
+                },
+            ],
             "payload": payload,
-            "endpoint": "/my-passport/create",
-            "dateUnits": "milliseconds on create; API responses may store seconds",
+            "requiredDocument": {
+                "fileName": file_path.name,
+                "contentType": mime,
+                "sizeBytes": file_path.stat().st_size,
+            },
             "dateTimezone": timezone,
-            "makePrimaryForPassenger": passenger_id,
         }, fmt, compact)
         return
+    if not confirm:
+        _die("--confirm required to create a passport and attach its photo/scan.", EXIT_VALIDATION)
     token = get_api_token(username, password)
-    prior_ids: list[str] = []
-    if passenger_id:
-        prior_ids = _passenger_passport_ids(api_get(token, f"/my-passenger/{passenger_id}"))
+    prior_ids = _passenger_passport_ids(api_get(token, f"/my-passenger/{passenger_id}"))
     created = api_post(token, "/my-passport/create", payload)
-    if not passenger_id:
-        _out({
-            "result": created,
-            "dateUnits": "milliseconds sent; API responses may store seconds",
-        }, fmt, compact)
-        return
     new_id = _entity_id(created, "passport")
     if not new_id:
-        _out({
-            "result": created,
-            "warning": "Passport created but its ID was not returned; passenger passportIds were not changed.",
-        }, fmt, compact)
+        _die(
+            "Passport metadata was created, but AirSprint did not return its UUID, "
+            "so the required photo/scan could not be uploaded. Do not rerun create; "
+            "find the new UUID with `passport list`, then run `passport upload-document` once.",
+            EXIT_ERROR,
+        )
+    try:
+        uploaded = _android_document_upload(
+            token,
+            file_path=file_path,
+            content_type=mime,
+            init_path="/my-passport/document/upload-init",
+            attach_path="/my-passport/document/attach",
+            base_payload={"passportId": new_id},
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(json.dumps({
+            "status": "error",
+            "message": (
+                "Passport metadata was created, but its required photo/scan was not fully attached. "
+                "Do not rerun create; retry only `passport upload-document` with the returned UUID."
+            ),
+            "passportId": new_id,
+            "uploadError": str(exc),
+        })) from exc
+    result: dict[str, Any] = {
+        "result": created,
+        "documentUpload": uploaded,
+        "message": "Passport created and required photo/scan attached; no read-back was performed.",
+    }
+    if not prior_ids:
+        result["passportIds"] = [new_id]
+        _out(result, fmt, compact)
         return
     reordered = [new_id] + [value for value in prior_ids if value != new_id]
-    linked = api_patch(token, f"/my-passenger/{passenger_id}", {"options": {"passportIds": reordered}})
-    _out({
-        "result": created,
+    try:
+        linked = api_patch(
+            token,
+            f"/my-passenger/{passenger_id}",
+            {"options": {"passportIds": reordered}},
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(json.dumps({
+            "status": "error",
+            "message": (
+                "Passport and required photo/scan were created, but passportIds were not reordered. "
+                "Do not rerun create; use `passport make-primary` with the returned UUID."
+            ),
+            "passportId": new_id,
+            "documentAttached": True,
+            "passengerUpdateError": str(exc),
+        })) from exc
+    result.update({
         "passengerUpdate": linked,
         "passportIds": reordered,
-        "message": "New passport placed first; no selectedPassportId was sent and no read-back was performed.",
-    }, fmt, compact)
+        "message": (
+            "Passport created, required photo/scan attached, and new passport placed first; "
+            "no selectedPassportId or read-back was sent."
+        ),
+    })
+    _out(result, fmt, compact)
 
 
 @passport_app.command("make-primary")
@@ -3293,17 +4646,6 @@ def passport_make_primary(
     }, fmt, compact)
 
 
-@passport_app.command("upload-init")
-def passport_upload_init(
-    body: str = typer.Option(..., "--body", help="JSON body — typically describes file metadata"),
-    username: Optional[str] = Username, password: Optional[str] = Password,
-    fmt: str = Format, compact: bool = Compact,
-):
-    """Begin a passport document upload — returns a presigned upload URL (POST /my-passport/document/upload-init)."""
-    token = get_api_token(username, password)
-    _out(api_post(token, "/my-passport/document/upload-init", _parse_json(body)), fmt, compact)
-
-
 @passport_app.command("upload-document")
 def passport_upload_document(
     passport_id: str = typer.Option(..., "--id", help="Passport UUID"),
@@ -3315,7 +4657,7 @@ def passport_upload_document(
     fmt: str = Format, compact: bool = Compact,
 ):
     """Upload and attach a passport document using Android's full workflow."""
-    file_path, mime = _document_file(file_value, content_type)
+    file_path, mime = _passport_scan_file(file_value, content_type)
     base_payload = {"passportId": passport_id}
     init_payload = {
         **base_payload,
@@ -3345,17 +4687,6 @@ def passport_upload_document(
         attach_path="/my-passport/document/attach",
         base_payload=base_payload,
     ), fmt, compact)
-
-
-@passport_app.command("attach")
-def passport_attach(
-    body: str = typer.Option(..., "--body", help="JSON body — references the uploaded file"),
-    username: Optional[str] = Username, password: Optional[str] = Password,
-    fmt: str = Format, compact: bool = Compact,
-):
-    """Attach a previously-uploaded document to a passport (POST /my-passport/document/attach)."""
-    token = get_api_token(username, password)
-    _out(api_post(token, "/my-passport/document/attach", _parse_json(body)), fmt, compact)
 
 
 @passport_app.command("delete")
@@ -3405,31 +4736,83 @@ def pet_get(
     _out(api_get(token, f"/my-pet/{pet_id}"), fmt, compact)
 
 
+
+_PET_SPECIES = ("DOG", "CAT", "RABBIT", "OTHER")
+_PET_GENDERS = ("MALE", "FEMALE")
+_PET_WEIGHTS = ("SMALL", "MEDIUM", "LARGE")
+PetSaveProfile = typer.Option(
+    None, "--save-profile",
+    help='"yes" keeps the pet in your Saved Pets list; "no" creates it for this booking only.',
+)
+
+
+def _build_pet_create_body(
+    *,
+    name: str,
+    species: str,
+    gender: str,
+    weight: str,
+    saved: bool,
+) -> dict[str, Any]:
+    """Android NewPetRequestModel.toJson(), keys in source order."""
+    return {
+        "name": _required_text(name, "--name"),
+        "species": _enum(species, "--species", _PET_SPECIES),
+        "gender": _enum(gender, "--gender", _PET_GENDERS),
+        "weight": _enum(weight, "--weight", _PET_WEIGHTS),
+        "vaccineDocuments": [],
+        "importFormReceipt": "",
+        "isActive": saved,
+        "picture": "",
+        "note": "",
+    }
+
+
+def _build_pet_update_body(
+    *,
+    name: str | None,
+    species: str | None,
+    gender: str | None,
+    weight: str | None,
+    saved: bool | None,
+) -> dict[str, Any]:
+    """Android updatePetOwn(): {"options": {<changed fields>}}."""
+    fields = {
+        "name": name.strip() if name is not None else None,
+        "species": _optional_enum(species, "--species", _PET_SPECIES),
+        "gender": _optional_enum(gender, "--gender", _PET_GENDERS),
+        "weight": _optional_enum(weight, "--weight", _PET_WEIGHTS),
+        "isActive": saved,
+    }
+    options = {key: value for key, value in fields.items() if value is not None}
+    if not options:
+        _die("Pass at least one field to change (see --help).", EXIT_VALIDATION)
+    return {"options": options}
+
+
 @pet_app.command("create")
 def pet_create(
-    body: str = typer.Option(..., "--body"),
+    name: str = typer.Option(..., "--name"),
+    species: str = typer.Option(..., "--species", help="DOG, CAT, RABBIT, or OTHER"),
+    gender: str = typer.Option(..., "--gender", help="MALE or FEMALE"),
+    weight: str = typer.Option(..., "--weight", help="SMALL (under 17 lb), MEDIUM (17-55 lb), or LARGE (over 55 lb)"),
+    save_profile: Optional[str] = PetSaveProfile,
     dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Create a saved pet (POST /my-pet/create)."""
-    payload = _parse_json(body)
+    """Add a pet, the same fields as the app's "Add New Pet" form (POST /my-pet/create)."""
+    saved = _yes_no(save_profile, "--save-profile")
+    payload = _build_pet_create_body(
+        name=name, species=species, gender=gender, weight=weight, saved=saved,
+    )
     if dry_run:
-        _out({"dry_run": True, "payload": payload, "endpoint": "/my-pet/create"}, fmt, compact)
+        _out({
+            "dry_run": True, "endpoint": "/my-pet/create", "saveProfile": saved, "payload": payload,
+        }, fmt, compact)
         return
     token = get_api_token(username, password)
     _out(api_post(token, "/my-pet/create", payload), fmt, compact)
-
-
-@pet_app.command("upload-init")
-def pet_upload_init(
-    body: str = typer.Option(..., "--body"),
-    username: Optional[str] = Username, password: Optional[str] = Password,
-    fmt: str = Format, compact: bool = Compact,
-):
-    """Begin a pet document upload (POST /my-pet/document/upload-init)."""
-    token = get_api_token(username, password)
-    _out(api_post(token, "/my-pet/document/upload-init", _parse_json(body)), fmt, compact)
 
 
 @pet_app.command("upload-document")
@@ -3486,30 +4869,25 @@ def pet_upload_document(
     ), fmt, compact)
 
 
-@pet_app.command("attach")
-def pet_attach(
-    body: str = typer.Option(..., "--body"),
-    username: Optional[str] = Username, password: Optional[str] = Password,
-    fmt: str = Format, compact: bool = Compact,
-):
-    """Attach an uploaded document to a pet (POST /my-pet/document/attach)."""
-    token = get_api_token(username, password)
-    _out(api_post(token, "/my-pet/document/attach", _parse_json(body)), fmt, compact)
-
 
 @pet_app.command("update")
 def pet_update(
     pet_id: str = typer.Option(..., "--id", help="Pet UUID"),
-    body: str = typer.Option(..., "--body"),
+    name: Optional[str] = typer.Option(None, "--name"),
+    species: Optional[str] = typer.Option(None, "--species", help="DOG, CAT, RABBIT, or OTHER"),
+    gender: Optional[str] = typer.Option(None, "--gender", help="MALE or FEMALE"),
+    weight: Optional[str] = typer.Option(None, "--weight", help="SMALL, MEDIUM, or LARGE"),
+    save_profile: Optional[str] = PetSaveProfile,
     dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Update a saved pet (PATCH /my-pet/{id})."""
+    """Edit a saved pet. Only the fields you pass are changed (PATCH /my-pet/{id})."""
     path = f"/my-pet/{pet_id}"
-    payload = _parse_json(body)
-    if "options" not in payload:
-        payload = {"options": payload}
+    payload = _build_pet_update_body(
+        name=name, species=species, gender=gender, weight=weight,
+        saved=_optional_yes_no(save_profile, "--save-profile"),
+    )
     if dry_run:
         _out({"dry_run": True, "method": "PATCH", "path": path, "payload": payload}, fmt, compact)
         return
@@ -3552,14 +4930,6 @@ def _trip_legs(trip: Any) -> list[dict[str, Any]]:
         if isinstance(nested, dict):
             return _trip_legs(nested)
     return []
-
-
-def _leg_departure_date(leg: dict[str, Any]) -> str | None:
-    for key in ("departureDate", "departureTime", "date"):
-        value = leg.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
 
 
 def _leg_departure_country(leg: dict[str, Any]) -> str | None:
@@ -3619,20 +4989,111 @@ def _resolve_customs_passengers(leg: dict[str, Any], names: list[str]) -> list[s
     return resolved
 
 
-def _validate_customs_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    ids = payload.get("legPassengerIds")
-    if not isinstance(ids, list) or not ids or not all(isinstance(value, str) and value for value in ids):
-        _die('"legPassengerIds" must be a non-empty array of leg passenger UUIDs.', EXIT_VALIDATION)
-    if payload.get("purposeOfTravel") not in {"BUSINESS", "PLEASURE"}:
-        _die('"purposeOfTravel" must be BUSINESS or PLEASURE.', EXIT_VALIDATION)
-    description = payload.get("travelDescription")
-    if not isinstance(description, str) or not description.strip():
-        _die('"travelDescription" is required.', EXIT_VALIDATION)
-    date = payload.get("date")
-    if not isinstance(date, str):
-        _die('"date" is required and means the departure leaving Canada.', EXIT_VALIDATION)
-    payload["date"] = _iso_datetime(date)
-    return payload
+_CUSTOMS_CURRENCIES = ("CAD", "USD")
+_CUSTOMS_MAX_PASSENGERS = 4  # app: "Maximum 4 people residing at the same address per declaration"
+
+
+def _customs_declaration_date(value: str | None, timezone: str | None) -> str:
+    """Android: DateFormat("yyyy-MM-dd").tryParse(date).toUtc().toIso8601String().
+
+    The form's "Date" (Traveller Declaration Form section) is a calendar day.
+    The app converts local midnight of that day to UTC, so 2026-09-01 in
+    America/Montreal is sent as 2026-09-01T04:00:00.000Z.
+    """
+    text = (value or "").strip()
+    if not text:
+        _die("--date is required: YYYY-MM-DD, the Traveller Declaration Form date. Nothing was sent.", EXIT_VALIDATION)
+    try:
+        day = datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        _die("--date must be YYYY-MM-DD (a calendar day, no time), as in the app's date picker.", EXIT_VALIDATION)
+    if not timezone:
+        _die(
+            "--timezone is required: the app sends the declaration date from the device's local midnight. "
+            "Set AIRSPRINT_TIMEZONE or pass --tz.",
+            EXIT_VALIDATION,
+        )
+    if not ZoneInfo:
+        _die(f"Cannot convert local time: zoneinfo unavailable for {timezone}", EXIT_ERROR)
+    try:
+        zone = ZoneInfo(timezone)
+    except Exception:
+        _die(f"Unknown timezone: {timezone}", EXIT_VALIDATION)
+    return day.replace(tzinfo=zone).astimezone(_tz_utc.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _customs_text(value: str | None) -> str | None:
+    """Android sends a detail field only when it is non-empty after trim()."""
+    text = (value or "").strip()
+    return text or None
+
+
+def _customs_money(value: str | None, option: str) -> float | None:
+    """Android: double.parse(alcoholOrTobaccoValueCAD) when the field is set."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        _die(f"{option} must be a number in CAD, e.g. 45.50.", EXIT_VALIDATION)
+
+
+def _build_customs_body(
+    *,
+    link_id: str,
+    leg_passenger_ids: list[str],
+    date: str,
+    purpose: str,
+    description: str,
+    has_pet: bool,
+    has_alcohol_or_tobacco: bool,
+    alcohol_type: str | None,
+    alcohol_volume: str | None,
+    alcohol_value_cad: float | None,
+    has_imported_goods: bool,
+    imported_goods: str | None,
+    imported_goods_currency: str | None,
+    imported_goods_from_us: bool,
+    souvenir_items: str | None,
+    has_high_value_currency: bool,
+    high_value_currency_description: str | None,
+) -> dict[str, Any]:
+    """RemoteCustomDeclarationRepository.submitDeclaration() body, keys in app order.
+
+    ``canadianCustomsDeclationLinkId`` keeps the app's misspelling. Detail
+    strings are present only when non-empty, exactly like the app. The seven
+    payment-authorization keys the app can add (cardType, cardName,
+    phoneNumber, billingAddress, cardNumber, expiry, cvc) are deliberately
+    not offered by the CLI.
+    """
+    body: dict[str, Any] = {
+        "canadianCustomsDeclationLinkId": link_id,
+        "legPassengerIds": leg_passenger_ids,
+        "date": date,
+        "purposeOfTravel": purpose,
+        "travelDescription": description,
+        "hasPet": has_pet,
+        "hasAlcoholOrTobacco": has_alcohol_or_tobacco,
+    }
+    if alcohol_type:
+        body["alcoholOrTobaccoType"] = alcohol_type
+    if alcohol_volume:
+        body["alcoholOrTobaccoVolume"] = alcohol_volume
+    if alcohol_value_cad is not None:
+        body["alcoholOrTobaccoValueCAD"] = alcohol_value_cad
+    body["hasImportedGoods"] = has_imported_goods
+    if imported_goods:
+        body["importedGoodItems"] = imported_goods
+    if imported_goods_currency:
+        body["importedGoodsCurrency"] = imported_goods_currency
+    body["importedGoodsFromUS"] = imported_goods_from_us
+    if souvenir_items:
+        body["souvenirItems"] = souvenir_items
+    body["hasHighValueCurrency"] = has_high_value_currency
+    if high_value_currency_description:
+        body["highValueCurrencyDescription"] = high_value_currency_description
+    return body
 
 
 @customs_app.command("list")
@@ -3652,97 +5113,157 @@ def customs_list(
 
 @customs_app.command("create")
 def customs_create(
-    body: Optional[str] = typer.Option(None, "--body", help="Validated raw JSON alternative to the ergonomic flags"),
-    booking_id: Optional[str] = typer.Option(None, "--booking", help="Booking code or trip UUID"),
-    leg_id: Optional[str] = typer.Option(None, "--leg-id", help="Specific booked-leg UUID"),
-    passengers: Optional[str] = typer.Option(None, "--passengers", help="Comma-separated passenger names"),
-    purpose: Optional[str] = typer.Option(None, "--purpose", help="BUSINESS or PLEASURE"),
-    description: Optional[str] = typer.Option(None, "--description", help="Travel description"),
-    date: Optional[str] = typer.Option(None, "--date", help="ISO departure leaving Canada; defaults from outbound leg"),
-    has_pet: Optional[bool] = typer.Option(None, "--has-pet/--no-pet"),
-    has_alcohol_or_tobacco: Optional[bool] = typer.Option(None, "--has-alcohol-or-tobacco/--no-alcohol-or-tobacco"),
-    has_imported_goods: Optional[bool] = typer.Option(None, "--has-imported-goods/--no-imported-goods"),
-    imported_goods_from_us: Optional[bool] = typer.Option(None, "--imported-goods-from-us/--no-imported-goods-from-us"),
-    has_high_value_currency: Optional[bool] = typer.Option(None, "--has-high-value-currency/--no-high-value-currency"),
-    souvenir_items: Optional[str] = typer.Option(None, "--souvenir-items", help="JSON value accepted by the API"),
+    booking_id: Optional[str] = typer.Option(None, "--booking", help="Booking code or trip UUID (uses its leg departing Canada)"),
+    leg_id: Optional[str] = typer.Option(None, "--leg-id", help="Booked-leg UUID"),
+    passengers: Optional[str] = typer.Option(None, "--passengers", help="Comma-separated passenger names on that leg (max 4 per declaration, same address)"),
+    purpose: Optional[str] = typer.Option(None, "--purpose", help="BUSINESS | PLEASURE"),
+    description: Optional[str] = typer.Option(None, "--description", help="Purpose details; required for BUSINESS"),
+    date: Optional[str] = typer.Option(None, "--date", help="YYYY-MM-DD — the Traveller Declaration Form date (needs --timezone)"),
+    has_pet: Optional[str] = typer.Option(None, "--has-pet", help="yes | no — travelling with a pet"),
+    has_alcohol_or_tobacco: Optional[str] = typer.Option(None, "--has-alcohol-or-tobacco", help="yes | no; yes needs --alcohol-type, --alcohol-volume, --alcohol-value-cad"),
+    alcohol_type: Optional[str] = typer.Option(None, "--alcohol-type", help="Type of alcohol or tobacco, e.g. wine"),
+    alcohol_volume: Optional[str] = typer.Option(None, "--alcohol-volume", help='Volume/quantity, e.g. "2 x 750 ml"'),
+    alcohol_value_cad: Optional[str] = typer.Option(None, "--alcohol-value-cad", help="Total value in CAD, e.g. 45.50"),
+    has_imported_goods: Optional[str] = typer.Option(None, "--has-imported-goods", help="yes | no; yes needs --imported-goods, --imported-goods-currency, --imported-goods-from-us"),
+    imported_goods: Optional[str] = typer.Option(None, "--imported-goods", help="Describe the goods in detail"),
+    imported_goods_currency: Optional[str] = typer.Option(None, "--imported-goods-currency", help="CAD | USD — currency of purchases"),
+    imported_goods_from_us: Optional[str] = typer.Option(None, "--imported-goods-from-us", help="yes | no — are the goods products of the U.S.?"),
+    souvenir_items: Optional[str] = typer.Option(None, "--souvenir-items", help="Souvenirs or miscellaneous items (optional)"),
+    has_high_value_currency: Optional[str] = typer.Option(None, "--has-high-value-currency", help="yes | no; yes needs --high-value-currency-description"),
+    high_value_currency_description: Optional[str] = typer.Option(None, "--high-value-currency-description", help="Currency or monetary instruments of CAD 10,000 or more"),
+    link_id: Optional[str] = typer.Option(None, "--link-id", help="Existing declaration link (`customs link-create`); when omitted one is created for the leg first, as the app does"),
+    timezone: Optional[str] = Timezone,
     dry_run: bool = typer.Option(False, "--dry-run"),
     probe: bool = typer.Option(False, "--probe/--no-probe", help="Override recent-booking-write cooldown"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Create Canadian declarations for named passengers on one outbound leg.
+    """Submit the Canadian customs declaration form for named passengers on one leg.
 
-    --booking/--leg-id mode resolves legPassenger IDs and defaults date to the
-    outbound departure leaving Canada. One request with several IDs creates one
-    declaration per person. Certification/signature must still be done by the
-    owner in the AirSprint app.
+    Every yes/no question must be answered and the details behind a "yes" are
+    required, as in the app. One request naming several passengers creates one
+    declaration per person. Certification/signature still happens in the
+    AirSprint app.
     """
-    token: str | None = None
-    if body is not None:
-        if any(value is not None for value in (booking_id, leg_id, passengers, purpose, description, date)):
-            _die("Use either --body or the booking/leg flags, not both.", EXIT_VALIDATION)
-        payload = _validate_customs_payload(_parse_json(body))
+    if not (booking_id or leg_id):
+        _die("Provide --booking or --leg-id.", EXIT_VALIDATION)
+    names = _csv(passengers, "--passengers", required=True)
+    if len(names) > _CUSTOMS_MAX_PASSENGERS:
+        _die(
+            f"A declaration covers at most {_CUSTOMS_MAX_PASSENGERS} people residing at the same address; "
+            "submit another declaration for the others. Nothing was sent.",
+            EXIT_VALIDATION,
+        )
+    if not purpose:
+        _die("--purpose is required: BUSINESS or PLEASURE.", EXIT_VALIDATION)
+    purpose_value = _enum(purpose, "--purpose", ("BUSINESS", "PLEASURE"))
+    description_text = (description or "").strip()
+    if purpose_value == "BUSINESS" and not description_text:
+        _die("--description is required when --purpose is BUSINESS. Nothing was sent.", EXIT_VALIDATION)
+    declaration_date = _customs_declaration_date(date, timezone)
+    unanswered = [
+        option for option, answer in (
+            ("--has-pet", has_pet),
+            ("--has-alcohol-or-tobacco", has_alcohol_or_tobacco),
+            ("--has-imported-goods", has_imported_goods),
+            ("--has-high-value-currency", has_high_value_currency),
+        ) if answer is None
+    ]
+    if unanswered:
+        _die("Answer every declaration question with yes or no: " + ", ".join(unanswered) + ". Nothing was sent.", EXIT_VALIDATION)
+    pet = _yes_no(has_pet, "--has-pet")
+    alcohol = _yes_no(has_alcohol_or_tobacco, "--has-alcohol-or-tobacco")
+    imported = _yes_no(has_imported_goods, "--has-imported-goods")
+    high_value = _yes_no(has_high_value_currency, "--has-high-value-currency")
+    alcohol_type_text = _customs_text(alcohol_type)
+    alcohol_volume_text = _customs_text(alcohol_volume)
+    alcohol_value = _customs_money(alcohol_value_cad, "--alcohol-value-cad")
+    if alcohol and not (alcohol_type_text and alcohol_volume_text and alcohol_value is not None):
+        _die(
+            "--has-alcohol-or-tobacco yes needs --alcohol-type, --alcohol-volume and --alcohol-value-cad. Nothing was sent.",
+            EXIT_VALIDATION,
+        )
+    goods_text = _customs_text(imported_goods)
+    currency = _optional_enum(imported_goods_currency, "--imported-goods-currency", _CUSTOMS_CURRENCIES)
+    if imported and not (goods_text and currency):
+        _die(
+            "--has-imported-goods yes needs --imported-goods and --imported-goods-currency (CAD or USD). Nothing was sent.",
+            EXIT_VALIDATION,
+        )
+    if imported and imported_goods_from_us is None:
+        _die("--has-imported-goods yes needs --imported-goods-from-us yes|no. Nothing was sent.", EXIT_VALIDATION)
+    from_us = _yes_no(imported_goods_from_us, "--imported-goods-from-us") if imported_goods_from_us is not None else False
+    high_value_text = _customs_text(high_value_currency_description)
+    if high_value and not high_value_text:
+        _die("--has-high-value-currency yes needs --high-value-currency-description. Nothing was sent.", EXIT_VALIDATION)
+
+    _guard_booking_probe(probe)
+    token = get_api_token(username, password)
+    if leg_id:
+        leg = _response_data(api_get(token, f"/leg/{leg_id}"))
+        if not isinstance(leg, dict):
+            _die(f"Unexpected leg response for {leg_id}.", EXIT_ERROR)
     else:
-        if not (booking_id or leg_id):
-            _die("Provide --booking or --leg-id.", EXIT_VALIDATION)
-        if not passengers or not purpose or not description:
-            _die("--passengers, --purpose, and --description are required.", EXIT_VALIDATION)
-        _guard_booking_probe(probe)
-        token = get_api_token(username, password)
-        if leg_id:
-            leg = _response_data(api_get(token, f"/leg/{leg_id}"))
-            if not isinstance(leg, dict):
-                _die(f"Unexpected leg response for {leg_id}.", EXIT_ERROR)
-        else:
-            trip_uuid = _resolve_trip_uuid(token, booking_id or "")
-            trip = api_get(token, f"/trip/{trip_uuid}")
-            legs = _trip_legs(trip)
-            if not legs:
-                _die(f"No legs found for {booking_id}.", EXIT_NOT_FOUND)
-            canadian_departures = [
-                item for item in legs
-                if (_leg_departure_country(item) or "").casefold() == "canada"
-            ]
-            leg = canadian_departures[0] if canadian_departures else legs[0]
-        departure_date = date or _leg_departure_date(leg)
-        if not departure_date:
-            _die("Could not determine the outbound departure; pass --date explicitly.", EXIT_VALIDATION)
-        names = [value.strip() for value in passengers.split(",") if value.strip()]
-        payload = {
-            "legPassengerIds": _resolve_customs_passengers(leg, names),
-            "purposeOfTravel": purpose.upper(),
-            "travelDescription": description,
-            "date": departure_date,
-        }
-        optional_values = {
-            "hasPet": has_pet,
-            "hasAlcoholOrTobacco": has_alcohol_or_tobacco,
-            "hasImportedGoods": has_imported_goods,
-            "importedGoodsFromUS": imported_goods_from_us,
-            "hasHighValueCurrency": has_high_value_currency,
-        }
-        payload.update({key: value for key, value in optional_values.items() if value is not None})
-        if souvenir_items is not None:
-            try:
-                payload["souvenirItems"] = json.loads(souvenir_items)
-            except json.JSONDecodeError as exc:
-                _die(f"Invalid --souvenir-items JSON: {exc}", EXIT_VALIDATION)
-        payload = _validate_customs_payload(payload)
+        trip_uuid = _resolve_trip_uuid(token, booking_id or "")
+        trip = api_get(token, f"/trip/{trip_uuid}")
+        legs = _trip_legs(trip)
+        if not legs:
+            _die(f"No legs found for {booking_id}.", EXIT_NOT_FOUND)
+        canadian_departures = [
+            item for item in legs
+            if (_leg_departure_country(item) or "").casefold() == "canada"
+        ]
+        leg = canadian_departures[0] if canadian_departures else legs[0]
+    leg_uuid = leg_id or leg.get("id")
+    if not isinstance(leg_uuid, str) or not leg_uuid:
+        _die("Could not determine the leg UUID; pass --leg-id explicitly.", EXIT_ERROR)
+    leg_passenger_ids = _resolve_customs_passengers(leg, names)
+    body = _build_customs_body(
+        link_id=link_id or f"(new link for leg {leg_uuid})",
+        leg_passenger_ids=leg_passenger_ids,
+        date=declaration_date,
+        purpose=purpose_value,
+        description=description_text,
+        has_pet=pet,
+        has_alcohol_or_tobacco=alcohol,
+        alcohol_type=alcohol_type_text,
+        alcohol_volume=alcohol_volume_text,
+        alcohol_value_cad=alcohol_value,
+        has_imported_goods=imported,
+        imported_goods=goods_text,
+        imported_goods_currency=currency,
+        imported_goods_from_us=from_us,
+        souvenir_items=_customs_text(souvenir_items),
+        has_high_value_currency=high_value,
+        high_value_currency_description=high_value_text,
+    )
+    link_note = (
+        f"reusing link {link_id}" if link_id
+        else f'POST /canadian-customs-declaration-link/create {{"legId": "{leg_uuid}"}} runs first, as in the app'
+    )
     if dry_run:
         _out({
             "dry_run": True,
-            "payload": payload,
-            "endpoint": "/canadianCustomsDeclaration/create",
-            "declarations": len(payload["legPassengerIds"]),
-            "message": "Signature/certification still needs the AirSprint app.",
+            "method": "POST",
+            "path": "/canadianCustomsDeclaration/create",
+            "payload": body,
+            "declarations": len(leg_passenger_ids),
+            "link": link_note,
+            "message": "Certification/signature still needs the AirSprint app.",
         }, fmt, compact)
         return
-    token = token or get_api_token(username, password)
-    result = api_post(token, "/canadianCustomsDeclaration/create", payload)
+    if not link_id:
+        link = api_post(token, "/canadian-customs-declaration-link/create", {"legId": leg_uuid})
+        link_id = _entity_id(link, "link")
+        if not link_id:
+            _die(f"Could not create the declaration link for leg {leg_uuid}; nothing was declared.", EXIT_ERROR)
+        body["canadianCustomsDeclationLinkId"] = link_id
+    result = api_post(token, "/canadianCustomsDeclaration/create", body)
     _out({
         "result": result,
-        "declarations": len(payload["legPassengerIds"]),
-        "message": "Created once; signature/certification still needs the AirSprint app.",
+        "declarations": len(leg_passenger_ids),
+        "linkId": link_id,
+        "message": "Created once; certification/signature still needs the AirSprint app.",
     }, fmt, compact)
 
 
@@ -3812,49 +5333,82 @@ def customs_link_get(
 # ---------------------------------------------------------------------------
 
 
-@booking_app.command("empty-leg")
-def booking_empty_leg(
-    body: str = typer.Option(..., "--body", help="JSON body for empty-leg booking"),
+@booking_app.command("empty-leg", help="Book seats on an empty leg from `explore flights` (POST /empty-leg/book).")
+@booking_app.command("shared-flight", help="Join a shared flight from `explore flights` (POST /shared-flight/book).")
+def booking_existing_flight(
+    ctx: typer.Context,
+    flight_id: str = typer.Option(..., "--flight-id", help="Flight ID from `explore flights`"),
+    passengers: str = typer.Option(..., "--passengers", help="Comma-separated saved passenger IDs"),
+    destination_street: Optional[str] = typer.Option(None, "--destination-street", help="Where passengers stay (US flights)."),
+    destination_street2: Optional[str] = typer.Option(None, "--destination-street2", help="Suite / apartment / unit."),
+    destination_city: Optional[str] = typer.Option(None, "--destination-city"),
+    destination_state: Optional[str] = typer.Option(None, "--destination-state"),
+    destination_zip: Optional[str] = typer.Option(None, "--destination-zip"),
+    pets: Optional[str] = typer.Option(None, "--pets", help="Comma-separated pet IDs from `pet list`."),
+    baggage: list[str] = typer.Option(..., "--baggage", help=_BAGGAGE_HELP),
+    catering: str = typer.Option("no", "--catering", help="yes | no"),
+    catering_request: Optional[str] = typer.Option(None, "--catering-request"),
+    ground_transportation: str = typer.Option("no", "--ground-transportation", help="yes | no"),
+    ground_transportation_when: Optional[str] = typer.Option(None, "--ground-transportation-when", help="departure | arrival | both"),
+    ground_transportation_method: Optional[str] = typer.Option(None, "--ground-transportation-method", help=_GROUND_METHOD_HELP),
+    ground_pickup_address: Optional[str] = typer.Option(None, "--ground-pickup-address", help=_ADDRESS_TEXT_HELP),
+    ground_dropoff_address: Optional[str] = typer.Option(None, "--ground-dropoff-address", help=_ADDRESS_TEXT_HELP),
     dry_run: bool = typer.Option(False, "--dry-run"),
-    username: Optional[str] = Username, password: Optional[str] = Password,
-    fmt: str = Format, compact: bool = Compact,
+    username: Optional[str] = Username,
+    password: Optional[str] = Password,
+    fmt: str = Format,
+    compact: bool = Compact,
 ):
-    """Book an empty leg (POST /empty-leg/book)."""
-    payload = _parse_json(body)
+    """Book an existing flight with Android's exact BookSharedRequest body."""
+    path = "/empty-leg/book" if ctx.command.name == "empty-leg" else "/shared-flight/book"
+    passenger_ids = _csv(passengers, "--passengers", required=True)
+    destination = _address_payload(
+        destination_street, destination_street2, destination_city, destination_state, destination_zip,
+        "--destination",
+    )
+    payload = _build_shared_booking_body(
+        flight_id=flight_id,
+        passengers=[
+            _build_shared_passenger(passenger_id, destination)
+            for passenger_id in passenger_ids
+        ],
+        request_settings=_build_request_settings(
+            catering=_yes_no(catering, "--catering"),
+            catering_request=(catering_request or "").strip() or None,
+            ground_transportation=_yes_no(ground_transportation, "--ground-transportation"),
+            ground_transportation_type=_optional_enum(ground_transportation_when, "--ground-transportation-when", _GROUND_TRANSPORTATION_TYPES),
+            ground_transportation_method=_optional_enum(ground_transportation_method, "--ground-transportation-method", _GROUND_TRANSPORTATION_METHODS),
+            pickup_address=_address_text(ground_pickup_address, "--ground-pickup-address"),
+            dropoff_address=_address_text(ground_dropoff_address, "--ground-dropoff-address"),
+        ),
+        pet_ids=_csv(pets, "--pets"),
+        baggage=_baggage_items(baggage),
+    )
     if dry_run:
-        _out({"dry_run": True, "payload": payload, "endpoint": "/empty-leg/book"}, fmt, compact)
+        _out({
+            "dry_run": True,
+            "method": "POST",
+            "path": path,
+            "payload": payload,
+            "message": f"Would POST {path} exactly once; no read-back would follow.",
+        }, fmt, compact)
         return
     token = get_api_token(username, password)
-    _out(api_post(token, "/empty-leg/book", payload), fmt, compact)
-
-
-@booking_app.command("shared-flight")
-def booking_shared_flight(
-    body: str = typer.Option(..., "--body"),
-    dry_run: bool = typer.Option(False, "--dry-run"),
-    username: Optional[str] = Username, password: Optional[str] = Password,
-    fmt: str = Format, compact: bool = Compact,
-):
-    """Book a shared flight (POST /shared-flight/book)."""
-    payload = _parse_json(body)
-    if dry_run:
-        _out({"dry_run": True, "payload": payload, "endpoint": "/shared-flight/book"}, fmt, compact)
-        return
-    token = get_api_token(username, password)
-    _out(api_post(token, "/shared-flight/book", payload), fmt, compact)
+    _out(api_post(token, path, payload), fmt, compact)
 
 
 @booking_app.command("lock")
 def booking_lock(
-    body: str = typer.Option(..., "--body"),
+    flight_id: str = typer.Option(..., "--flight-id", help="Flight ID from `explore flights`"),
+    release: bool = typer.Option(False, "--release", help="Release a hold instead of placing one"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Lock (hold) a flight (POST /flight/lock)."""
-    payload = _parse_json(body)
+    """Hold a flight while you finish booking it, or release the hold (POST /flight/lock)."""
+    payload = _build_flight_lock_body(flight_id, not release)
     if dry_run:
-        _out({"dry_run": True, "payload": payload, "endpoint": "/flight/lock"}, fmt, compact)
+        _out({"dry_run": True, "method": "POST", "path": "/flight/lock", "payload": payload}, fmt, compact)
         return
     token = get_api_token(username, password)
     _out(api_post(token, "/flight/lock", payload), fmt, compact)
@@ -3886,15 +5440,64 @@ def booking_baggage_types(
     _out(_response_items(response), fmt, compact)
 
 
+# Android 6.1.4 BookingSurveyCreateRequestModel (POST /booking-survey/create).
+# Wire values from the app's enum objects (blutter objs.txt off_10).
+_SURVEY_AGREEMENT = ("STRONGLY_AGREE", "AGREE", "DISAGREE", "STRONGLY_DISAGREE")
+_SURVEY_CONCIERGE_INTEREST = ("AGREE", "DISAGREE", "AGREE_PRIVATE")
+_SURVEY_CONCIERGE_HELP = ("YES", "NO", "NOT_APPLICABLE")
+_SURVEY_YES_NO = ("YES", "NO")
+
+
+def _build_booking_survey_body(
+    *,
+    leg_id: str,
+    booking_experience: str,
+    response_time: str,
+    concierge_interest: str,
+    concierge_help: str,
+    flight_itinerary_time: str,
+    additional_feedback: str,
+) -> dict[str, Any]:
+    """Android BookingSurveyCreateRequestModel, in key order. Surveys are keyed by legId, never tripId."""
+    return {
+        "legId": leg_id,
+        "bookingExperience": booking_experience,
+        "responseTime": response_time,
+        "conciergeInterest": concierge_interest,
+        "conciergeHelp": concierge_help,
+        "flightItineraryTime": flight_itinerary_time,
+        "additionalFeedback": additional_feedback,
+    }
+
+
 @booking_app.command("survey")
 def booking_survey(
-    body: str = typer.Option(..., "--body"),
+    leg_id: str = typer.Option(..., "--leg-id", help="Completed-leg UUID"),
+    booking_experience: str = typer.Option(..., "--booking-experience", help='"My concierge offered a seamless, personalized booking experience": strongly-agree | agree | disagree | strongly-disagree'),
+    response_time: str = typer.Option(..., "--response-time", help='"My concierge responded in a timely fashion": strongly-agree | agree | disagree | strongly-disagree'),
+    concierge_interest: str = typer.Option(..., "--concierge-interest", help='"My concierge took an interest in my reason for travel": agree | disagree | agree-private (I prefer to keep it private)'),
+    concierge_help: str = typer.Option(..., "--concierge-help", help="Happy with catering/transportation pricing and options arranged by the concierge: yes | no | not-applicable"),
+    itinerary_on_time: str = typer.Option(..., "--itinerary-on-time", help="Final itinerary received in a timely fashion: yes | no"),
+    comments: Optional[str] = typer.Option(None, "--comments", help="Additional feedback"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Submit a post-booking survey (POST /booking-survey/create)."""
+    """Answer the post-booking concierge survey for one completed leg (POST /booking-survey/create)."""
+    payload = _build_booking_survey_body(
+        leg_id=leg_id,
+        booking_experience=_enum(booking_experience, "--booking-experience", _SURVEY_AGREEMENT),
+        response_time=_enum(response_time, "--response-time", _SURVEY_AGREEMENT),
+        concierge_interest=_enum(concierge_interest, "--concierge-interest", _SURVEY_CONCIERGE_INTEREST),
+        concierge_help=_enum(concierge_help, "--concierge-help", _SURVEY_CONCIERGE_HELP),
+        flight_itinerary_time=_enum(itinerary_on_time, "--itinerary-on-time", _SURVEY_YES_NO),
+        additional_feedback=(comments or "").strip(),
+    )
+    if dry_run:
+        _out({"dry_run": True, "method": "POST", "path": "/booking-survey/create", "payload": payload}, fmt, compact)
+        return
     token = get_api_token(username, password)
-    _out(api_post(token, "/booking-survey/create", _parse_json(body)), fmt, compact)
+    _out(api_post(token, "/booking-survey/create", payload), fmt, compact)
 
 
 # ---------------------------------------------------------------------------
@@ -3902,16 +5505,22 @@ def booking_survey(
 # ---------------------------------------------------------------------------
 
 
+def _build_manifest_send_body(recipients: list[str], trip_id: str) -> dict[str, Any]:
+    """Android POST /trip/manifest/send body: {"recipients": [emails], "tripId"}."""
+    return {"recipients": recipients, "tripId": trip_id}
+
+
 @trips_app.command("manifest-send")
 def trips_manifest_send(
-    body: str = typer.Option(..., "--body", help="JSON body — recipients & trip ID"),
+    trip_id: str = typer.Option(..., "--trip-id", help="Trip UUID"),
+    to: str = typer.Option(..., "--to", help="Comma-separated recipient email addresses"),
     dry_run: bool = typer.Option(False, "--dry-run"),
-    confirm: bool = typer.Option(False, "--confirm"),
+    confirm: bool = typer.Option(False, "--confirm", help="Required before the email is sent"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Email the trip manifest (POST /trip/manifest/send)."""
-    payload = _parse_json(body)
+    """Email the trip manifest to people you name (POST /trip/manifest/send)."""
+    payload = _build_manifest_send_body(_email_list(to, "--to"), trip_id)
     if dry_run:
         _out({"dry_run": True, "method": "POST", "path": "/trip/manifest/send", "payload": payload}, fmt, compact)
         return
@@ -3961,17 +5570,6 @@ def trips_leg_get(
     _guard_booking_probe(probe)
     token = get_api_token(username, password)
     _out(api_get(token, f"/my-leg/{leg_id}"), fmt, compact)
-
-
-@trips_app.command("recent-save")
-def trips_recent_save(
-    body: str = typer.Option(..., "--body"),
-    username: Optional[str] = Username, password: Optional[str] = Password,
-    fmt: str = Format, compact: bool = Compact,
-):
-    """Save a leg to recents (POST /leg/recent/save)."""
-    token = get_api_token(username, password)
-    _out(api_post(token, "/leg/recent/save", _parse_json(body)), fmt, compact)
 
 
 # ---------------------------------------------------------------------------
@@ -4067,15 +5665,59 @@ def address_autocomplete(
     _out(_response_items(response, limit), fmt, compact)
 
 
+
+def _build_address_create_body(
+    *,
+    passenger_id: str,
+    label: str,
+    street: str,
+    street_2: str | None,
+    country: str,
+    city: str,
+    state: str,
+    zip_code: str,
+) -> dict[str, Any]:
+    """Android createAddressOwn(), keys in source order; addressLine2 only when given."""
+    body: dict[str, Any] = {
+        "passengerId": _required_text(passenger_id, "--passenger-id"),
+        "label": _required_text(label, "--label"),
+        "addressLine1": _required_text(street, "--street"),
+    }
+    if street_2 and street_2.strip():
+        body["addressLine2"] = street_2.strip()
+    body.update({
+        "country": _required_text(country, "--country"),
+        "city": _required_text(city, "--city"),
+        "stateOrProvince": _required_text(state, "--state"),
+        "zipOrPostal": _required_text(zip_code, "--zip"),
+    })
+    return body
+
+
 @address_app.command("create")
 def address_create(
-    body: str = typer.Option(..., "--body"),
+    passenger_id: str = typer.Option(..., "--passenger-id", help="Saved passenger UUID the address belongs to"),
+    street: str = typer.Option(..., "--street", help="Street address line 1"),
+    street_2: Optional[str] = typer.Option(None, "--street-2", help="Apartment, suite, etc."),
+    city: str = typer.Option(..., "--city"),
+    state: str = typer.Option(..., "--state", help="State or province"),
+    zip_code: str = typer.Option(..., "--zip", help="ZIP or postal code"),
+    country: str = typer.Option(..., "--country"),
+    label: str = typer.Option("Profile Address", "--label", help="Address label (app default: Profile Address)"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Save an address (POST /my-address/create)."""
+    """Save an address on a passenger profile (POST /my-address/create)."""
+    payload = _build_address_create_body(
+        passenger_id=passenger_id, label=label, street=street, street_2=street_2,
+        country=country, city=city, state=state, zip_code=zip_code,
+    )
+    if dry_run:
+        _out({"dry_run": True, "endpoint": "/my-address/create", "payload": payload}, fmt, compact)
+        return
     token = get_api_token(username, password)
-    _out(api_post(token, "/my-address/create", _parse_json(body)), fmt, compact)
+    _out(api_post(token, "/my-address/create", payload), fmt, compact)
 
 
 # ---------------------------------------------------------------------------
@@ -4088,13 +5730,12 @@ def hours_estimate(
     hours: Optional[float] = typer.Option(None, "--hours", min=0.01),
     action: Optional[str] = typer.Option(None, "--type", help="BUY or SELL"),
     account_aircraft_id: Optional[str] = typer.Option(None, "--account-aircraft-id", help="Defaults automatically when the account has one aircraft"),
-    body: Optional[str] = typer.Option(None, "--body", help='Compatibility JSON, e.g. {"hours":2,"type":"SELL"}'),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
     """Estimate Hours Exchange value (GET /hour-exchange/estimate)."""
     token = get_api_token(username, password)
-    query = _hours_estimate_query(token, body, account_aircraft_id, hours, action)
+    query = _hours_estimate_query(token, account_aircraft_id, hours, action)
     resp = api_get(token, "/hour-exchange/estimate", query)
     _out(resp.get("data", resp), fmt, compact)
 
@@ -4102,35 +5743,40 @@ def hours_estimate(
 @hours_app.command("power")
 def hours_power(
     account_aircraft_id: Optional[str] = typer.Option(None, "--account-aircraft-id", help="Defaults automatically when the account has one aircraft"),
-    body: Optional[str] = typer.Option(None, "--body", help='Compatibility JSON with accountAircraftId'),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
     """Get Hours Exchange buying/selling power (GET /hour-exchange/power)."""
     token = get_api_token(username, password)
-    query = _parse_json(body) if body else {}
-    if account_aircraft_id:
-        query["accountAircraftId"] = account_aircraft_id
-    query["accountAircraftId"] = _get_account_aircraft_id(
-        token, query.get("accountAircraftId")
-    )
+    query = {"accountAircraftId": _get_account_aircraft_id(token, account_aircraft_id)}
     resp = api_get(token, "/hour-exchange/power", query)
     _out(resp.get("data", resp), fmt, compact)
 
 
+_HOURS_LISTING_ACTIONS = ("BUY", "SELL")
+
+
+def _build_hours_listing_body(account_aircraft_id: str, action: str, hours: float) -> dict[str, Any]:
+    """Android POST /hours-exchange-listing/create body: {"accountAircraftId", "action": BUY|SELL, "hours": double}."""
+    return {"accountAircraftId": account_aircraft_id, "action": action, "hours": float(hours)}
+
+
 @hours_app.command("listing-create")
 def hours_listing_create(
-    body: str = typer.Option(..., "--body"),
+    action: str = typer.Option(..., "--action", help="buy | sell"),
+    hours: float = typer.Option(..., "--hours", min=0.01, help="Hours to list"),
+    account_aircraft_id: Optional[str] = typer.Option(None, "--account-aircraft-id", help="Defaults automatically when the account has one aircraft"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """List hours for sale on the marketplace (POST /hours-exchange-listing/create)."""
-    payload = _parse_json(body)
-    if dry_run:
-        _out({"dry_run": True, "payload": payload, "endpoint": "/hours-exchange-listing/create"}, fmt, compact)
-        return
+    """List hours to buy or sell on the Hours Exchange (POST /hours-exchange-listing/create)."""
+    listing_action = _enum(action, "--action", _HOURS_LISTING_ACTIONS)
     token = get_api_token(username, password)
+    payload = _build_hours_listing_body(_get_account_aircraft_id(token, account_aircraft_id), listing_action, hours)
+    if dry_run:
+        _out({"dry_run": True, "method": "POST", "path": "/hours-exchange-listing/create", "payload": payload}, fmt, compact)
+        return
     _out(api_post(token, "/hours-exchange-listing/create", payload), fmt, compact)
 
 
@@ -4237,17 +5883,6 @@ def files_public_get(
     """Get a public-file record (GET /file-public/{id})."""
     token = get_api_token(username, password)
     _out(api_get(token, f"/file-public/{file_id}"), fmt, compact)
-
-
-@files_app.command("public-create")
-def files_public_create(
-    body: str = typer.Option(..., "--body"),
-    username: Optional[str] = Username, password: Optional[str] = Password,
-    fmt: str = Format, compact: bool = Compact,
-):
-    """Create a public-file record (POST /file-public/create)."""
-    token = get_api_token(username, password)
-    _out(api_post(token, "/file-public/create", _parse_json(body)), fmt, compact)
 
 
 # ---------------------------------------------------------------------------
@@ -4423,7 +6058,7 @@ def network_connect(
 
 @network_app.command("claim")
 def network_claim(
-    payload_value: str = typer.Option(..., "--payload", help="Connection invite payload"),
+    payload_value: str = typer.Option(..., "--invite", help="Invitation code from the AirSprint connection link"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
@@ -4555,18 +6190,30 @@ def network_group_delete(
 # ---------------------------------------------------------------------------
 
 
+
+def _build_change_password_body(current_password: str, new_password: str) -> dict[str, Any]:
+    """Android changeMyPassword(): {"currentPassword", "newPassword"}."""
+    if not current_password:
+        _die("--current-password is required.", EXIT_VALIDATION)
+    if current_password == new_password:
+        _die("--new-password must differ from --current-password.", EXIT_VALIDATION)
+    return {"currentPassword": current_password, "newPassword": _new_password(new_password)}
+
+
 @user_app.command("change-password")
 def user_change_password(
-    body: str = typer.Option(..., "--body", help='JSON body, e.g. {"currentPassword":"...", "newPassword":"..."}'),
-    confirm: bool = typer.Option(False, "--confirm", help="Required — change-password is destructive"),
+    current_password: str = typer.Option(..., "--current-password", help="Password used today"),
+    new_password: str = typer.Option(..., "--new-password", help="New password (at least 8 characters)"),
+    confirm: bool = typer.Option(False, "--confirm", help="Required — this changes the login password"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Change your password (POST /my-user/change-password). Requires --confirm."""
+    """Change the login password. Requires --confirm."""
+    payload = _build_change_password_body(current_password, new_password)
     if not confirm:
         _die("--confirm required to actually change the password.", EXIT_VALIDATION)
     token = get_api_token(username, password)
-    _out(api_post(token, "/my-user/change-password", _parse_json(body)), fmt, compact)
+    _out(api_post(token, "/my-user/change-password", payload), fmt, compact)
 
 
 @user_app.command("avatar")
@@ -4606,27 +6253,31 @@ def messages_settings(
 
 @messages_app.command("settings-update")
 def messages_settings_update(
-    body: str = typer.Option(..., "--body"),
+    on: Optional[str] = NotificationsOn,
+    off: Optional[str] = NotificationsOff,
+    dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Update notification settings (PATCH /my-notification-settings/update)."""
-    payload = _parse_json(body)
-    if "options" not in payload:
-        payload = {"options": payload}
-    token = get_api_token(username, password)
-    _out(api_patch(token, "/my-notification-settings/update", payload), fmt, compact)
+    """Turn notification toggles on/off, e.g. --on weeklyDigest --off airsprintPromotions."""
+    _notification_settings_update(on, off, dry_run, username, password, fmt, compact)
 
 
 @messages_app.command("update")
 def messages_update(
-    body: str = typer.Option(..., "--body", help='JSON body — e.g. {"ids":["id1","id2"],"isRead":true}'),
+    ids: str = typer.Option(..., "--ids", help="Comma-separated notification IDs from `messages list`"),
+    read: str = typer.Option("yes", "--read", help='"yes" marks them read, "no" marks them unread'),
+    dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Bulk-update notifications (PATCH /my-notifications/update)."""
+    """Mark in-app messages read or unread."""
+    payload = {"ids": _csv(ids, "--ids", required=True), "isRead": _yes_no(read, "--read")}
+    if dry_run:
+        _out({"dry_run": True, "method": "PATCH", "path": "/my-notifications/update", "payload": payload}, fmt, compact)
+        return
     token = get_api_token(username, password)
-    _out(api_patch(token, "/my-notifications/update", _parse_json(body)), fmt, compact)
+    _out(api_patch(token, "/my-notifications/update", payload), fmt, compact)
 
 
 # ---------------------------------------------------------------------------
@@ -4644,26 +6295,65 @@ def auth_2fa_setup(
     _out(api_post(token, "/user/2fa/setup", {}), fmt, compact)
 
 
+
+_TWO_FA_CODE_RE = re.compile(r"^\d{6}$")
+
+
+def _two_fa_code(value: str) -> str:
+    code = value.strip().replace(" ", "")
+    if not _TWO_FA_CODE_RE.match(code):
+        _die("--code must be the 6-digit code shown by the authenticator app.", EXIT_VALIDATION)
+    return code
+
+
+def _build_2fa_verify_body(code: str) -> dict[str, Any]:
+    """Android User2faVerifyRequest.toJson(): {"token"}."""
+    return {"token": _two_fa_code(code)}
+
+
+def _build_2fa_sign_in_body(user_id: str, code: str) -> dict[str, Any]:
+    """Android User2faSignInRequest.toJson(): {"userId", "token"} in that order."""
+    return {"userId": _required_text(user_id, "--user-id"), "token": _two_fa_code(code)}
+
+
+def _build_reset_confirm_body(token: str, new_password: str) -> dict[str, Any]:
+    """Android setNewPassword(): {"token", "newPassword"}."""
+    return {
+        "token": _required_text(token, "--token"),
+        "newPassword": _new_password(new_password),
+    }
+
+
+def _new_password(value: str) -> str:
+    if len(value) < 8:
+        _die("--new-password must be at least 8 characters.", EXIT_VALIDATION)
+    return value
+
+
 @auth_app.command("2fa-verify")
 def auth_2fa_verify(
-    body: str = typer.Option(..., "--body", help='JSON body, e.g. {"code":"123456"}'),
+    code: str = typer.Option(..., "--code", help="6-digit code from the authenticator app"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Verify a 2FA code during setup (POST /user/2fa/verify)."""
+    """Confirm the authenticator code that completes 2FA setup."""
+    payload = _build_2fa_verify_body(code)
     token = get_api_token(username, password)
-    _out(api_post(token, "/user/2fa/verify", _parse_json(body)), fmt, compact)
+    _out(api_post(token, "/user/2fa/verify", payload), fmt, compact)
+
 
 
 @auth_app.command("2fa-sign-in")
 def auth_2fa_sign_in(
-    body: str = typer.Option(..., "--body"),
+    user_id: str = typer.Option(..., "--user-id", help="User UUID returned by the first sign-in step"),
+    code: str = typer.Option(..., "--code", help="6-digit code from the authenticator app"),
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Complete a 2FA sign-in (POST /user/2fa/sign-in) — no auth header required."""
+    """Finish a sign-in that requires a 2FA code. No auth header required."""
+    payload = _build_2fa_sign_in_body(user_id, code)
     _out(_http("POST", f"{API_BASE_URL}/user/2fa/sign-in",
                headers={"Content-Type": "application/json", "Accept": "application/json"},
-               data=json.dumps(_parse_json(body)).encode("utf-8")), fmt, compact)
+               data=json.dumps(payload).encode("utf-8")), fmt, compact)
 
 
 @auth_app.command("2fa-disable")
@@ -4690,15 +6380,18 @@ def auth_reset_request(
                data=json.dumps({"email": email}).encode("utf-8")), fmt, compact)
 
 
+
 @auth_app.command("reset-confirm")
 def auth_reset_confirm(
-    body: str = typer.Option(..., "--body", help='JSON body, e.g. {"token":"...", "newPassword":"..."}'),
+    token: str = typer.Option(..., "--token", help="Reset token from the password-reset email link"),
+    new_password: str = typer.Option(..., "--new-password", help="New password (at least 8 characters)"),
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Confirm a password reset (POST /user/reset-password). No auth required."""
+    """Set a new password with the token from the reset email. No auth required."""
+    payload = _build_reset_confirm_body(token, new_password)
     _out(_http("POST", f"{API_BASE_URL}/user/reset-password",
                headers={"Content-Type": "application/json", "Accept": "application/json"},
-               data=json.dumps(_parse_json(body)).encode("utf-8")), fmt, compact)
+               data=json.dumps(payload).encode("utf-8")), fmt, compact)
 
 
 # ---------------------------------------------------------------------------
