@@ -1,0 +1,743 @@
+{
+  "androidVersion": "6.1.10",
+  "versionCode": 133,
+  "baseApkSha256": "388e12c6fa0c5d6c5f51424103efed9590a3ba590d1c096c891b9e053d1d8413",
+  "apiCallCount": 112,
+  "contracts": [
+    {
+      "method": "DELETE",
+      "path": "/my-account-user/{id}",
+      "source": "app/features/account/data/remote_account_user_repository.dart",
+      "function": "_ deleteAccountUserOwn(/* No info */) async {",
+      "callAddress": "0x860198"
+    },
+    {
+      "method": "DELETE",
+      "path": "/my-passenger/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ deletePassengerOwn(/* No info */) async {",
+      "callAddress": "0x8724e4"
+    },
+    {
+      "method": "DELETE",
+      "path": "/my-passport/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ deleteMyPassport(/* No info */) async {",
+      "callAddress": "0x86f960"
+    },
+    {
+      "method": "DELETE",
+      "path": "/my-pet/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ deletePetOwn(/* No info */) async {",
+      "callAddress": "0x878ab0"
+    },
+    {
+      "method": "DELETE",
+      "path": "/my-saved-airports/{id}",
+      "source": "app/features/account/data/remote_account_user_repository.dart",
+      "function": "_ deleteSavedAirport(/* No info */) async {",
+      "callAddress": "0x829648"
+    },
+    {
+      "method": "DELETE",
+      "path": "/my-user/connections/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ disconnectUser(/* No info */) async {",
+      "callAddress": "0x8435f4"
+    },
+    {
+      "method": "DELETE",
+      "path": "/my-user/groups/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ deleteNetworkGroup(/* No info */) async {",
+      "callAddress": "0x844498"
+    },
+    {
+      "method": "DELETE",
+      "path": "/my-user/groups/{id}/members/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ removeNetworkGroupMember(/* No info */) async {",
+      "callAddress": "0x846e30"
+    },
+    {
+      "method": "GET",
+      "path": "/aircraft/{id}",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ aircraftById(/* No info */) async {",
+      "callAddress": "0x9fac40"
+    },
+    {
+      "method": "GET",
+      "path": "/app-update",
+      "source": "app/features/app_update/data/remote_app_update_repository.dart",
+      "function": "_ check(/* No info */) async {",
+      "callAddress": "0x541760"
+    },
+    {
+      "method": "GET",
+      "path": "/canadian-customs-declaration-link/{id}",
+      "source": "app/features/custom_declaration/data/remote_custom_declaration_repository.dart",
+      "function": "_ getDeclarationLink(/* No info */) async {",
+      "callAddress": "0x7337c0"
+    },
+    {
+      "method": "GET",
+      "path": "/content/{id}",
+      "source": "app/shared/repositories/settings/remote_settings_repository.dart",
+      "function": "_ getContent(/* No info */) async {",
+      "callAddress": "0x9ff2c0"
+    },
+    {
+      "method": "GET",
+      "path": "/faq/{id}",
+      "source": "app/shared/repositories/settings/remote_settings_repository.dart",
+      "function": "_ getFaq(/* No info */) async {",
+      "callAddress": "0x9feb80"
+    },
+    {
+      "method": "GET",
+      "path": "/file-public/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ resolveFileUrlById(/* No info */) async {",
+      "callAddress": "0x70d7a8"
+    },
+    {
+      "method": "GET",
+      "path": "/hour-exchange/estimate",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ hourExchangeEstimateGet(/* No info */) async {",
+      "callAddress": "0x83aa2c"
+    },
+    {
+      "method": "GET",
+      "path": "/hour-exchange/power",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ hourExchangePowerGet(/* No info */) async {",
+      "callAddress": "0x83b38c"
+    },
+    {
+      "method": "GET",
+      "path": "/leg/recent/list",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ getRecentSearch(/* No info */) async {",
+      "callAddress": "0xa0aab8"
+    },
+    {
+      "method": "GET",
+      "path": "/me",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ resolveFileUrlFromApplicationUrl(/* No info */) async {",
+      "callAddress": "0x70c280"
+    },
+    {
+      "method": "GET",
+      "path": "/my-file/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ _completePictureUpload(/* No info */) async {",
+      "callAddress": "0x870158"
+    },
+    {
+      "method": "GET",
+      "path": "/my-flight/{id}",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ myAccountFlight(/* No info */) async {",
+      "callAddress": "0x73a3ec"
+    },
+    {
+      "method": "GET",
+      "path": "/my-leg/{id}",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ myAccountLeg(/* No info */) async {",
+      "callAddress": "0x7406a4"
+    },
+    {
+      "method": "GET",
+      "path": "/my-notification-settings",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ getMyNotificationSettings(/* No info */) async {",
+      "callAddress": "0x9fc700"
+    },
+    {
+      "method": "GET",
+      "path": "/my-passenger/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ getPassenger(/* No info */) async {",
+      "callAddress": "0x72e0c8"
+    },
+    {
+      "method": "GET",
+      "path": "/my-pet/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ getMyPet(/* No info */) async {",
+      "callAddress": "0x730ed4"
+    },
+    {
+      "method": "GET",
+      "path": "/my-user/avatar/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ getMyAvatarUrl(/* No info */) async {",
+      "callAddress": "0x70c9c4"
+    },
+    {
+      "method": "GET",
+      "path": "/policy/{id}",
+      "source": "app/shared/repositories/settings/remote_settings_repository.dart",
+      "function": "_ getPolicy(/* No info */) async {",
+      "callAddress": "0xacca94"
+    },
+    {
+      "method": "GET",
+      "path": "/trip/manifest/{id}",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ _resolveTripManifestUrl(/* No info */) async {",
+      "callAddress": "0x8179a4"
+    },
+    {
+      "method": "GET",
+      "path": "/trip/{id}",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ accountTrip(/* No info */) async {",
+      "callAddress": "0xacd5e4"
+    },
+    {
+      "method": "GET",
+      "path": "/user/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ getUserById(/* No info */) async {",
+      "callAddress": "0xacc120"
+    },
+    {
+      "method": "PATCH",
+      "path": "/account-user/update",
+      "source": "app/features/account/data/remote_account_user_repository.dart",
+      "function": "_ updateAccountUser(/* No info */) async {",
+      "callAddress": "0x85ee50"
+    },
+    {
+      "method": "PATCH",
+      "path": "/leg/{id}",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ updateLeg(/* No info */) async {",
+      "callAddress": "0x8b9110"
+    },
+    {
+      "method": "PATCH",
+      "path": "/leg/{id}/required-info",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ updateLegRequiredInfo(/* No info */) async {",
+      "callAddress": "0x804924"
+    },
+    {
+      "method": "PATCH",
+      "path": "/my-account-user/{id}",
+      "source": "app/features/account/data/remote_account_user_repository.dart",
+      "function": "_ updateAccountUserOwn(/* No info */) async {",
+      "callAddress": "0x85f834"
+    },
+    {
+      "method": "PATCH",
+      "path": "/my-notification-settings/update",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ updateMyNotificationSettings(/* No info */) async {",
+      "callAddress": "0x86719c"
+    },
+    {
+      "method": "PATCH",
+      "path": "/my-notifications/update",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ markAllNotificationsAsRead(/* No info */) async {",
+      "callAddress": "0x84ce1c"
+    },
+    {
+      "method": "PATCH",
+      "path": "/my-passenger/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ updatePassengerOwn(/* No info */) async {",
+      "callAddress": "0x8555c0"
+    },
+    {
+      "method": "PATCH",
+      "path": "/my-passport/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ updateMyPassport(/* No info */) async {",
+      "callAddress": "0x855e3c"
+    },
+    {
+      "method": "PATCH",
+      "path": "/my-pet/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ updatePetOwn(/* No info */) async {",
+      "callAddress": "0x8764c8"
+    },
+    {
+      "method": "PATCH",
+      "path": "/my-user",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ updateUser(/* No info */) async {",
+      "callAddress": "0x705cf4"
+    },
+    {
+      "method": "PATCH",
+      "path": "/my-user/groups/{id}",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ updateNetworkGroupName(/* No info */) async {",
+      "callAddress": "0x8459bc"
+    },
+    {
+      "method": "POST",
+      "path": "/account-notification-registration-token-delete",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ accountNotificationRegistrationTokenDelete(/* No info */) async {",
+      "callAddress": "0x834448"
+    },
+    {
+      "method": "POST",
+      "path": "/account-notification-registration-token-register",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ accountNotificationRegistrationTokenRegister(/* No info */) async {",
+      "callAddress": "0x75460c"
+    },
+    {
+      "method": "POST",
+      "path": "/account-user-role",
+      "source": "app/features/account/data/remote_account_user_repository.dart",
+      "function": "_ getRoleIdByName(/* No info */) async {",
+      "callAddress": "0x85b960"
+    },
+    {
+      "method": "POST",
+      "path": "/account-user/invite",
+      "source": "app/features/account/data/remote_account_user_repository.dart",
+      "function": "_ inviteNewAccountUser(/* No info */) async {",
+      "callAddress": "0x85b608"
+    },
+    {
+      "method": "POST",
+      "path": "/address/autocomplete",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ addressAutocomplete(/* No info */) async {",
+      "callAddress": "0x925f7c"
+    },
+    {
+      "method": "POST",
+      "path": "/aircraft",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ accountAircrafts(/* No info */) async {",
+      "callAddress": "0xad08a0"
+    },
+    {
+      "method": "POST",
+      "path": "/airport",
+      "source": "app/features/trips/data/remote_book_repository.dart",
+      "function": "_ searchAirports(/* No info */) async {",
+      "callAddress": "0x71531c"
+    },
+    {
+      "method": "POST",
+      "path": "/airport/nearest",
+      "source": "app/features/trips/data/remote_book_repository.dart",
+      "function": "_ getNearbyAirports(/* No info */) async {",
+      "callAddress": "0x74758c"
+    },
+    {
+      "method": "POST",
+      "path": "/baggage-type",
+      "source": "app/shared/repositories/baggage/remote_baggage_repository.dart",
+      "function": "_ fetchBaggageTypes(/* No info */) async {",
+      "callAddress": "0xa055c0"
+    },
+    {
+      "method": "POST",
+      "path": "/booking-survey/create",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ createBookingSurvey(/* No info */) async {",
+      "callAddress": "0x8d8318"
+    },
+    {
+      "method": "POST",
+      "path": "/canadian-customs-declaration-link/create",
+      "source": "app/features/custom_declaration/data/remote_custom_declaration_repository.dart",
+      "function": "_ generateCustomDeclarationLinkId(/* No info */) async {",
+      "callAddress": "0x734dd8"
+    },
+    {
+      "method": "POST",
+      "path": "/canadianCustomsDeclaration/create",
+      "source": "app/features/custom_declaration/data/remote_custom_declaration_repository.dart",
+      "function": "_ submitDeclaration(/* No info */) async {",
+      "callAddress": "0x8930f4"
+    },
+    {
+      "method": "POST",
+      "path": "/cancel-own",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ cancelLeg(/* No info */) async {",
+      "callAddress": "0x7fe1b4"
+    },
+    {
+      "method": "POST",
+      "path": "/concierge",
+      "source": "app/shared/repositories/settings/remote_settings_repository.dart",
+      "function": "_ fetchConciergeList(/* No info */) async {",
+      "callAddress": "0x9ffbcc"
+    },
+    {
+      "method": "POST",
+      "path": "/empty-leg/book",
+      "source": "app/features/trips/data/remote_book_repository.dart",
+      "function": "_ submitEmptyLegFlight(/* No info */) async {",
+      "callAddress": "0x8b6fb0"
+    },
+    {
+      "method": "POST",
+      "path": "/faq",
+      "source": "app/shared/repositories/settings/remote_settings_repository.dart",
+      "function": "_ fetchFaqsList(/* No info */) async {",
+      "callAddress": "0x9fd438"
+    },
+    {
+      "method": "POST",
+      "path": "/faq-category",
+      "source": "app/shared/repositories/settings/remote_settings_repository.dart",
+      "function": "_ fetchFaqCategory(/* No info */) async {",
+      "callAddress": "0x9fde9c"
+    },
+    {
+      "method": "POST",
+      "path": "/feedback/create",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ createFeedbackSurvey(/* No info */) async {",
+      "callAddress": "0x7290b0"
+    },
+    {
+      "method": "POST",
+      "path": "/file-public/create",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ uploadUserAvatar(/* No info */) async {",
+      "callAddress": "0x85630c"
+    },
+    {
+      "method": "POST",
+      "path": "/flight-quote",
+      "source": "app/features/trips/data/remote_book_repository.dart",
+      "function": "_ quotePrice(/* No info */) async {",
+      "callAddress": "0x8c31b4"
+    },
+    {
+      "method": "POST",
+      "path": "/flight/lock",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ lockFlight(/* No info */) async {",
+      "callAddress": "0x8ce060"
+    },
+    {
+      "method": "POST",
+      "path": "/hours-exchange-listing/create",
+      "source": "app/features/account/data/remote_hour_exchange_repository.dart",
+      "function": "_ createListing(/* No info */) async {",
+      "callAddress": "0x838704"
+    },
+    {
+      "method": "POST",
+      "path": "/leg/recent/save",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ saveLegRecentSearch(/* No info */) async {",
+      "callAddress": "0x81dd58"
+    },
+    {
+      "method": "POST",
+      "path": "/my-account-users",
+      "source": "app/features/account/data/remote_account_user_repository.dart",
+      "function": "_ fetchCurrentAccountUser(/* No info */) async {",
+      "callAddress": "0x7035d4"
+    },
+    {
+      "method": "POST",
+      "path": "/my-accounts",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ getAccounts(/* No info */) async {",
+      "callAddress": "0x705dd0"
+    },
+    {
+      "method": "POST",
+      "path": "/my-address/create",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ createAddressOwn(/* No info */) async {",
+      "callAddress": "0x855770"
+    },
+    {
+      "method": "POST",
+      "path": "/my-aircraft",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ accountAircrafts(/* No info */) async {",
+      "callAddress": "0x8388c4"
+    },
+    {
+      "method": "POST",
+      "path": "/my-file",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ resolveFileUrlFromApplicationUrl(/* No info */) async {",
+      "callAddress": "0x70c07c"
+    },
+    {
+      "method": "POST",
+      "path": "/my-flights",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ flights(/* No info */) async {",
+      "callAddress": "0x741a5c"
+    },
+    {
+      "method": "POST",
+      "path": "/my-hours-exchange-listing",
+      "source": "app/features/account/data/remote_hour_exchange_repository.dart",
+      "function": "_ listOwn(/* No info */) async {",
+      "callAddress": "0x709fe8"
+    },
+    {
+      "method": "POST",
+      "path": "/my-leg",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ myAccountLegs(/* No info */) async {",
+      "callAddress": "0x745264"
+    },
+    {
+      "method": "POST",
+      "path": "/my-notifications",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ listMyNotifications(/* No info */) async {",
+      "callAddress": "0x84aa3c"
+    },
+    {
+      "method": "POST",
+      "path": "/my-passenger",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ getMyPassengers(/* No info */) async {",
+      "callAddress": "0x7100b0"
+    },
+    {
+      "method": "POST",
+      "path": "/my-passenger/create",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ createNewPassenger(/* No info */) async {",
+      "callAddress": "0x86efa4"
+    },
+    {
+      "method": "POST",
+      "path": "/my-passport/create",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ addNewPassport(/* No info */) async {",
+      "callAddress": "0x80cb20"
+    },
+    {
+      "method": "POST",
+      "path": "/my-passport/document/attach",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ uploadPassportDocument(/* No info */) async {",
+      "callAddress": "0x809300"
+    },
+    {
+      "method": "POST",
+      "path": "/my-passport/document/upload-init",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ uploadPassportDocument(/* No info */) async {",
+      "callAddress": "0x808f68"
+    },
+    {
+      "method": "POST",
+      "path": "/my-pet",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ getMyPets(/* No info */) async {",
+      "callAddress": "0x96dbfc"
+    },
+    {
+      "method": "POST",
+      "path": "/my-pet/create",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ createNewPet(/* No info */) async {",
+      "callAddress": "0x876158"
+    },
+    {
+      "method": "POST",
+      "path": "/my-pet/document/attach",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ uploadPetDocument(/* No info */) async {",
+      "callAddress": "0x876e48"
+    },
+    {
+      "method": "POST",
+      "path": "/my-pet/document/upload-init",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ uploadPetDocument(/* No info */) async {",
+      "callAddress": "0x876a48"
+    },
+    {
+      "method": "POST",
+      "path": "/my-user/change-password",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ changeMyPassword(/* No info */) async {",
+      "callAddress": "0x863ab0"
+    },
+    {
+      "method": "POST",
+      "path": "/my-user/connections",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ _listNetworkUsers(/* No info */) async {",
+      "callAddress": "0x70e928"
+    },
+    {
+      "method": "POST",
+      "path": "/my-user/groups",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ listMyGroups(/* No info */) async {",
+      "callAddress": "0x70ccd0"
+    },
+    {
+      "method": "POST",
+      "path": "/my-user/groups/create",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ createNetworkGroup(/* No info */) async {",
+      "callAddress": "0x844ddc"
+    },
+    {
+      "method": "POST",
+      "path": "/my-user/groups/{id}/members",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ addNetworkGroupMembers(/* No info */) async {",
+      "callAddress": "0x8474e0"
+    },
+    {
+      "method": "POST",
+      "path": "/myCanadianCustomsDeclaration",
+      "source": "app/features/custom_declaration/data/remote_custom_declaration_repository.dart",
+      "function": "_ myCanadianCustomsDeclaration(/* No info */) async {",
+      "callAddress": "0x7fff80"
+    },
+    {
+      "method": "POST",
+      "path": "/policy",
+      "source": "app/shared/repositories/settings/remote_settings_repository.dart",
+      "function": "_ fetchPolicyList(/* No info */) async {",
+      "callAddress": "0xa00a78"
+    },
+    {
+      "method": "POST",
+      "path": "/policy-category",
+      "source": "app/shared/repositories/settings/remote_settings_repository.dart",
+      "function": "_ fetchPolicyCategory(/* No info */) async {",
+      "callAddress": "0xa01a58"
+    },
+    {
+      "method": "POST",
+      "path": "/reserve-day",
+      "source": "app/shared/repositories/settings/remote_settings_repository.dart",
+      "function": "_ fetchReservedDays(/* No info */) async {",
+      "callAddress": "0x74966c"
+    },
+    {
+      "method": "POST",
+      "path": "/shared-flight/book",
+      "source": "app/features/trips/data/remote_book_repository.dart",
+      "function": "_ submitSharedFlight(/* No info */) async {",
+      "callAddress": "0x8b89f0"
+    },
+    {
+      "method": "POST",
+      "path": "/system-notice",
+      "source": "app/shared/repositories/settings/remote_settings_repository.dart",
+      "function": "_ fetchSystemNotices(/* No info */) async {",
+      "callAddress": "0x74d648"
+    },
+    {
+      "method": "POST",
+      "path": "/trip/book",
+      "source": "app/features/trips/data/remote_book_repository.dart",
+      "function": "_ submit(/* No info */) async {",
+      "callAddress": "0x8bb8e0"
+    },
+    {
+      "method": "POST",
+      "path": "/trip/manifest/send",
+      "source": "app/shared/repositories/flight/remote_flight_repository.dart",
+      "function": "_ sendTripManifest(/* No info */) async {",
+      "callAddress": "0x8e3130"
+    },
+    {
+      "method": "POST",
+      "path": "/trip/misc-cost-estimate",
+      "source": "app/features/trips/data/remote_book_repository.dart",
+      "function": "_ miscCostEstimate(/* No info */) async {",
+      "callAddress": "0x8c0ac0"
+    },
+    {
+      "method": "POST",
+      "path": "/user/2fa/disable",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ user2faDisable(/* No info */) async {",
+      "callAddress": "0x7f8990"
+    },
+    {
+      "method": "POST",
+      "path": "/user/2fa/setup",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ user2faSetup(/* No info */) async {",
+      "callAddress": "0x9fca84"
+    },
+    {
+      "method": "POST",
+      "path": "/user/2fa/sign-in",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ twoFaSignIn(/* No info */) async {",
+      "callAddress": "0x832358"
+    },
+    {
+      "method": "POST",
+      "path": "/user/2fa/verify",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ user2faVerify(/* No info */) async {",
+      "callAddress": "0x879fac"
+    },
+    {
+      "method": "POST",
+      "path": "/user/authenticate",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ userAuthenticate(/* No info */) async {",
+      "callAddress": "0x7081cc"
+    },
+    {
+      "method": "POST",
+      "path": "/user/connections/invite/claim",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ claimConnectionInvitePayload(/* No info */) async {",
+      "callAddress": "0xacbc44"
+    },
+    {
+      "method": "POST",
+      "path": "/user/connections/request",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ connectWithInviteToken(/* No info */) async {",
+      "callAddress": "0xb10824"
+    },
+    {
+      "method": "POST",
+      "path": "/user/request-reset-password",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ requestPasswordReset(/* No info */) async {",
+      "callAddress": "0xb133cc"
+    },
+    {
+      "method": "POST",
+      "path": "/user/reset-password",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ setNewPassword(/* No info */) async {",
+      "callAddress": "0x863c30"
+    },
+    {
+      "method": "POST",
+      "path": "/user/sign-in-email",
+      "source": "app/features/account/data/remote_account_repository.dart",
+      "function": "_ login(/* No info */) async {",
+      "callAddress": "0x831308"
+    }
+  ]
+}

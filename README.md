@@ -1,14 +1,18 @@
 # AirSprint CLI
 
 Agent-safe command-line access to the current `api.airsprint.com` owner API,
-audited against AirSprint Android 6.1.4 (version code 127).
+audited against AirSprint Android 6.1.10 (version code 133).
 
-The offline source audit found 111 Android repository calls and 104 unique
+The offline source audit found 112 Android repository calls and 105 unique
 method/route contracts; the complete matrix and APK checksum are in
 [ANDROID_CONTRACT.md](ANDROID_CONTRACT.md).
 
+The [2026-09-16 audit report](AUDIT_2026-09-16.md) records the source evidence,
+corrections, offline validation and remaining limits. Route regression tests
+compare the implementation with the extracted Android inventory.
+
 Every write is a **form**: agents answer questions with typed options and the
-CLI builds the exact Android 6.1.4 request. No public command accepts JSON or
+CLI builds the exact Android 6.1.10 request. No public command accepts JSON or
 API field names — only IDs (passenger, passport, pet, flight, trip, leg,
 airport, aircraft) cross the boundary. This keeps agents away from the wire
 format and lets the CLI add guard rails without changing how it is driven.
@@ -95,8 +99,8 @@ and full manifest text. Neither command polls or retries live booking calls.
 ### Safe full-list passenger merge
 
 `PATCH /leg/{id}` replaces the entire passenger list. This command first reads
-the current list, preserves everyone not explicitly removed, and sends saved
-passenger UUIDs rather than `legPassenger.id`:
+the current list with `GET /my-leg/{id}`, preserves everyone not explicitly
+removed, and sends saved passenger UUIDs rather than `legPassenger.id`:
 
 ```bash
 python3 scripts/airsprint_cli.py leg update-passengers \
@@ -111,7 +115,8 @@ cannot be safely mapped, the CLI refuses the PATCH.
 Android's required-information form for a booked leg is also available:
 passports, customs declarations, destination address, seats, pets, baggage,
 catering, ground transportation, and note. Passenger answers reuse the same
-full-list merge protection (one guarded GET, one PATCH, no read-back):
+full-list merge protection (one guarded `GET /my-leg/{id}`, one
+`PATCH /leg/{id}/required-info`, no read-back):
 
 ```bash
 python3 scripts/airsprint_cli.py leg update-required-info \
@@ -306,4 +311,4 @@ git diff --check
 The test suite includes a guard that fails if any public command grows a
 `--body`, `--json`, `--payload`, or `--options` option, and exact-body tests
 that compare each form's request with the payload models decompiled from
-Android 6.1.4.
+Android 6.1.10.

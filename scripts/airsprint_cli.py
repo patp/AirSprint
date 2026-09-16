@@ -50,8 +50,8 @@ import typer
 # ---------------------------------------------------------------------------
 
 API_BASE_URL = "https://api.airsprint.com/api"
-ANDROID_APP_VERSION = "6.1.4"
-ANDROID_APP_VERSION_CODE = 127
+ANDROID_APP_VERSION = "6.1.10"
+ANDROID_APP_VERSION_CODE = 133
 API_TOKEN_CACHE = Path.home() / ".airsprint_api_token.json"
 DATA_CACHE = Path.home() / ".airsprint_cache.json"  # local mirror: airports, aircraft
 BOOKING_WRITE_GUARD = Path.home() / ".airsprint_last_booking_write.json"
@@ -420,8 +420,15 @@ def _api_login(username: str, password: str) -> str:
         api_request=True,
         retry_first_ssl=True,
     )
-    token = resp.get("data", {}).get("authToken")
-    if not token:
+    data = _response_data(resp)
+    token = data.get("authToken") if isinstance(data, dict) else None
+    if not isinstance(token, str) or not token.strip():
+        user_id = (data.get("userId") or data.get("id")) if isinstance(data, dict) else None
+        if isinstance(user_id, str) and user_id:
+            raise RuntimeError(json.dumps({
+                "status": "error", "requires2fa": True, "userId": user_id, "email": username,
+                "message": "Complete sign-in with `auth 2fa-sign-in --user-id USER_ID --code CODE --username EMAIL`.",
+            }))
         raise RuntimeError(
             json.dumps({"status": "error", "message": "No authToken in sign-in response"})
         )
@@ -433,26 +440,33 @@ def _save_api_token(token: str, email: str) -> None:
     _atomic_write_json(API_TOKEN_CACHE, data)
 
 
-def _load_api_token() -> str | None:
+def _load_api_token(email: str | None = None) -> str | None:
     if not API_TOKEN_CACHE.exists():
         return None
     try:
         data = json.loads(API_TOKEN_CACHE.read_text())
     except (json.JSONDecodeError, OSError):
         return None
-    # api.airsprint.com tokens don't have expires_in — use 6 hour TTL
-    if time.time() - data.get("_cached_at", 0) > 21600:
+    if not isinstance(data, dict):
         return None
-    return data.get("authToken")
+    cached_email = data.get("email")
+    if email and (not isinstance(cached_email, str) or cached_email.strip().casefold() != email.strip().casefold()):
+        return None
+    # api.airsprint.com tokens don't have expires_in — use 6 hour TTL.
+    cached_at = data.get("_cached_at")
+    if not isinstance(cached_at, (int, float)) or not 0 <= time.time() - cached_at <= 21600:
+        return None
+    token = data.get("authToken")
+    return token if isinstance(token, str) and token.strip() else None
 
 
 def get_api_token(username: str | None = None, password: str | None = None) -> str:
     """Return a valid api.airsprint.com authToken, using cache when possible."""
-    cached = _load_api_token()
+    u = username or os.environ.get("AIRSPRINT_USERNAME", "")
+    cached = _load_api_token(u or None)
     if cached:
         return cached
 
-    u = username or os.environ.get("AIRSPRINT_USERNAME", "")
     p = password or os.environ.get("AIRSPRINT_PASSWORD", "")
     if not u or not p:
         _die("Credentials required. Set AIRSPRINT_USERNAME/AIRSPRINT_PASSWORD or use --username/--password.", EXIT_AUTH)
@@ -996,6 +1010,10 @@ def _use_timezone(timezone: str | None) -> None:
     """Make --timezone also govern how timestamps are displayed."""
     global _OUTPUT_TIMEZONE
     if timezone:
+        try:
+            ZoneInfo(timezone)
+        except (KeyError, ValueError):
+            _die(f"Unknown timezone: {timezone}", EXIT_VALIDATION)
         _OUTPUT_TIMEZONE = timezone
 
 
@@ -1158,9 +1176,9 @@ def app_options(
     ),
 ):
     """AirSprint owner operations. Use --skill for agent-safe workflows."""
-    global _PRESENT_OUTPUT
-    if internal:
-        _PRESENT_OUTPUT = False
+    global _PRESENT_OUTPUT, _OUTPUT_TIMEZONE
+    _PRESENT_OUTPUT = not internal
+    _OUTPUT_TIMEZONE = None
 
 
 # ---------------------------------------------------------------------------
@@ -1492,6 +1510,7 @@ def trips_list(
 
     Uses api.airsprint.com which returns all trip types including interchange.
     """
+    _use_timezone(timezone)
     token = get_api_token(username, password)
     account_ids = _get_account_ids(token)
     if not account_ids:
@@ -1811,9 +1830,9 @@ def _build_request_settings(
     """Android RequestSettingsPayload.toJson and BookSharedRequestSettings.toJson.
 
     Both start from the literal {cateringRequired, groundTransportationRequired}
-    and append each other key only when it holds a value, in this order. The
-    shared-flight model stops after groundTransportationDropOffAddress; callers
-    for that route simply never pass the arrival* keys or note.
+    and append each other key only when it holds a value, in this order.
+    Android 6.1.10 also sends arrival transport for shared flights. Only the
+    new-trip model sends note; existing-flight callers never pass it.
     """
     if catering_request and not catering:
         _die("--catering-request needs --catering yes.", EXIT_VALIDATION)
@@ -2094,15 +2113,15 @@ def _require_international_travel_documents(
     Stricter than Android 6.1.4, which only warns. Every passenger on an
     international trip needs a passport on file, and — because AirSprint requires
     the passport photo before departure — that passport must have its scan/photo
-    uploaded. The scan is checked only when the passenger read returned the full
-    passport records; a thin response (passport ids only) still enforces the
-    on-file rule. The destination (US) address is enforced separately by
-    `_apply_booking_destination_address`.
+    uploaded. A thin response (passport ids only) cannot establish that the
+    scan exists, so it must not authorize the booking. The destination address
+    is enforced separately by `_apply_booking_destination_address`.
     """
     if not check.get("international"):
         return
     missing_passport: list[str] = []
     missing_scan: list[str] = []
+    unverified_scan: list[str] = []
     for leg in payload.get("legs", []):
         for passenger in leg.get("passengers") or []:
             passenger_id = passenger.get("id")
@@ -2114,15 +2133,21 @@ def _require_international_travel_documents(
                 continue
             records = _passenger_passports(read_passenger(passenger_id))
             if not records:
+                if passenger_id not in unverified_scan:
+                    unverified_scan.append(passenger_id)
                 continue
             selected = next((record for record in records if record.get("id") == passport_id), None)
-            if (selected is None or not _passport_scan_attached(selected)) and passenger_id not in missing_scan:
+            if selected is None and passenger_id not in unverified_scan:
+                unverified_scan.append(passenger_id)
+            elif selected is not None and not _passport_scan_attached(selected) and passenger_id not in missing_scan:
                 missing_scan.append(passenger_id)
     clauses: list[str] = []
     if missing_passport:
         clauses.append("passengers without a passport on file: " + ", ".join(missing_passport))
     if missing_scan:
         clauses.append("passengers whose passport has no photo/scan uploaded: " + ", ".join(missing_scan))
+    if unverified_scan:
+        clauses.append("passengers whose passport photo/scan could not be verified from the response: " + ", ".join(unverified_scan))
     if not clauses:
         return
     message = "This trip crosses a border; " + "; ".join(clauses) + ". "
@@ -2231,7 +2256,7 @@ def booking_create(
 ):
     """Book a new trip the way the AirSprint app does (POST /trip/book).
 
-    Answer the booking form with options; the CLI builds Android 6.1.4's exact
+    Answer the booking form with options; the CLI builds Android 6.1.10's exact
     request. Catering, ground transportation, and notes apply to every leg —
     adjust one leg afterwards with `leg update-required-info`. Run
     `booking info` first for aircraft, passenger, and airport IDs.
@@ -2409,7 +2434,7 @@ def _leg_passenger_rows(leg: dict[str, Any]) -> list[Any]:
     options = leg.get("options")
     if isinstance(options, dict) and isinstance(options.get("passengers"), list):
         return options["passengers"]
-    return []
+    _die("Leg response has no complete passenger list; no write sent.", EXIT_ERROR)
 
 
 def _saved_passenger_id(row: Any) -> str | None:
@@ -2489,9 +2514,9 @@ def leg_update_passengers(
 ):
     """Merge saved-passenger IDs into the leg's complete passenger list.
 
-    The command performs one GET before the PATCH, preserves every current
-    passenger unless explicitly removed, sends saved passenger UUIDs rather
-    than legPassenger IDs, performs one PATCH, and never reads back.
+    The command performs one GET /my-leg/{id} before the PATCH, preserves
+    every current passenger unless explicitly removed, sends saved passenger
+    UUIDs rather than legPassenger IDs, performs one PATCH, and never reads back.
     """
     add_ids = _parse_ids(add or "", "--add") if add else []
     remove_ids = _parse_ids(remove or "", "--remove") if remove else []
@@ -2503,7 +2528,8 @@ def leg_update_passengers(
 
     _guard_booking_probe(probe)
     token = get_api_token(username, password)
-    leg = _response_data(api_get(token, f"/leg/{leg_id}"))
+    # Owner reads use /my-leg; /leg is the write route, not its GET counterpart.
+    leg = _response_data(api_get(token, f"/my-leg/{leg_id}"))
     if not isinstance(leg, dict):
         _die(f"Unexpected leg response for {leg_id}; no PATCH sent.", EXIT_ERROR)
     rows = _leg_passenger_rows(leg)
@@ -2657,8 +2683,8 @@ def leg_update_required_info(
     """Complete a booked leg's required information (passports, customs, destination, pets, catering, ground transportation).
 
     Passenger changes are merged onto the leg's complete current passenger
-    list after one GET (Android sends every passenger). Only the sections you
-    answer are sent, in one PATCH, with no read-back.
+    list after one GET /my-leg/{id} (Android sends every passenger). Only the
+    sections you answer are sent, in one PATCH, with no read-back.
     """
     passport_by_passenger = _key_value_pairs(passport, "--passport")
     customs_by_passenger = _key_value_pairs(customs, "--customs")
@@ -2702,7 +2728,7 @@ def leg_update_required_info(
     if passenger_changes:
         _guard_booking_probe(probe)
         token = get_api_token(username, password)
-        leg = _response_data(api_get(token, f"/leg/{leg_id}"))
+        leg = _response_data(api_get(token, f"/my-leg/{leg_id}"))
         if not isinstance(leg, dict):
             _die(f"Unexpected leg response for {leg_id}; no PATCH sent.", EXIT_ERROR)
         current: list[dict[str, Any]] = []
@@ -3361,6 +3387,7 @@ def quote_roundtrip(
     Compound version of `quote flight`: resolves airports once, fetches both legs,
     and returns combined pricing.
     """
+    _use_timezone(timezone)
     token = get_api_token(username, password)
     out_utc = _parse_local_dt(out_date, timezone)
     ret_utc = _parse_local_dt(return_date, timezone)
@@ -3712,6 +3739,7 @@ def summary(
     Replaces 4+ separate calls (`user accounts`, `trips list`, `explore flights`,
     `explore counts`) with one compound query — ideal for agents that just want context.
     """
+    _use_timezone(timezone)
     token = get_api_token(username, password)
     now = datetime.now(tz=_tz_utc.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
@@ -4558,6 +4586,7 @@ def passport_create(
     AIRSPRINT_TIMEZONE) to the passenger's device timezone. The new passport is
     placed first so the app shows it. Each write is attempted exactly once.
     """
+    _use_timezone(timezone)
     payload = _build_passport_create_body(
         passenger_id=passenger_id, passport_number=passport_number,
         date_of_birth=date_of_birth, nationality=nationality,
@@ -4697,6 +4726,8 @@ def passport_make_primary(
     """Make the app display a passport by placing it first in passportIds."""
     token = get_api_token(username, password)
     existing = _passenger_passport_ids(api_get(token, f"/my-passenger/{passenger_id}"))
+    if passport_id not in existing:
+        _die("--passport-id must already belong to this passenger; no PATCH sent.", EXIT_VALIDATION)
     reordered = [passport_id] + [value for value in existing if value != passport_id]
     path = f"/my-passenger/{passenger_id}"
     payload = {"options": {"passportIds": reordered}}
@@ -5234,6 +5265,7 @@ def customs_create(
     description_text = (description or "").strip()
     if purpose_value == "BUSINESS" and not description_text:
         _die("--description is required when --purpose is BUSINESS. Nothing was sent.", EXIT_VALIDATION)
+    _use_timezone(timezone)
     declaration_date = _customs_declaration_date(date, timezone)
     unanswered = [
         option for option, answer in (
@@ -5274,7 +5306,7 @@ def customs_create(
     _guard_booking_probe(probe)
     token = get_api_token(username, password)
     if leg_id:
-        leg = _response_data(api_get(token, f"/leg/{leg_id}"))
+        leg = _response_data(api_get(token, f"/my-leg/{leg_id}"))
         if not isinstance(leg, dict):
             _die(f"Unexpected leg response for {leg_id}.", EXIT_ERROR)
     else:
@@ -5427,6 +5459,9 @@ def booking_existing_flight(
     ground_transportation_method: Optional[str] = typer.Option(None, "--ground-transportation-method", help=_GROUND_METHOD_HELP),
     ground_pickup_address: Optional[str] = typer.Option(None, "--ground-pickup-address", help=_ADDRESS_TEXT_HELP),
     ground_dropoff_address: Optional[str] = typer.Option(None, "--ground-dropoff-address", help=_ADDRESS_TEXT_HELP),
+    arrival_ground_method: Optional[str] = typer.Option(None, "--arrival-ground-method", help=_GROUND_METHOD_HELP),
+    arrival_pickup_address: Optional[str] = typer.Option(None, "--arrival-pickup-address", help=_ADDRESS_TEXT_HELP),
+    arrival_dropoff_address: Optional[str] = typer.Option(None, "--arrival-dropoff-address", help=_ADDRESS_TEXT_HELP),
     dry_run: bool = typer.Option(False, "--dry-run"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
@@ -5454,6 +5489,9 @@ def booking_existing_flight(
             ground_transportation_method=_optional_enum(ground_transportation_method, "--ground-transportation-method", _GROUND_TRANSPORTATION_METHODS),
             pickup_address=_address_text(ground_pickup_address, "--ground-pickup-address"),
             dropoff_address=_address_text(ground_dropoff_address, "--ground-dropoff-address"),
+            arrival_method=_optional_enum(arrival_ground_method, "--arrival-ground-method", _GROUND_TRANSPORTATION_METHODS),
+            arrival_pickup_address=_address_text(arrival_pickup_address, "--arrival-pickup-address"),
+            arrival_dropoff_address=_address_text(arrival_dropoff_address, "--arrival-dropoff-address"),
         ),
         pet_ids=_csv(pets, "--pets"),
         baggage=_baggage_items(baggage),
@@ -6421,13 +6459,21 @@ def auth_2fa_verify(
 def auth_2fa_sign_in(
     user_id: str = typer.Option(..., "--user-id", help="User UUID returned by the first sign-in step"),
     code: str = typer.Option(..., "--code", help="6-digit code from the authenticator app"),
+    username: Optional[str] = Username,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Finish a sign-in that requires a 2FA code. No auth header required."""
+    """Finish 2FA sign-in and cache the session. Use the email from the first step."""
     payload = _build_2fa_sign_in_body(user_id, code)
-    _out(_http("POST", f"{API_BASE_URL}/user/2fa/sign-in",
-               headers={"Content-Type": "application/json", "Accept": "application/json"},
-               data=json.dumps(payload).encode("utf-8")), fmt, compact)
+    response = _http("POST", f"{API_BASE_URL}/user/2fa/sign-in",
+                     headers={"Content-Type": "application/json", "Accept": "application/json"},
+                     data=json.dumps(payload).encode("utf-8"))
+    data = _response_data(response)
+    token = data.get("authToken") if isinstance(data, dict) else None
+    if not isinstance(token, str) or not token.strip():
+        _die("No authToken in 2FA response; cached session was not replaced.", EXIT_AUTH)
+    email = username or os.environ.get("AIRSPRINT_USERNAME", "")
+    _save_api_token(token, email)
+    _out({"authenticated": True, "email": email, "token_cached": True}, fmt, compact)
 
 
 @auth_app.command("2fa-disable")

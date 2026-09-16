@@ -1,3 +1,4 @@
+import ast
 import json
 import re
 import stat
@@ -553,7 +554,10 @@ class AirSprintCliTests(unittest.TestCase):
             patch.object(cli, "_resolve_airport", side_effect=lambda token, code: f"{code.lower()}-id"),
             patch.object(cli, "_get_default_aircraft", return_value="aircraft-id"),
             patch.object(cli, "_airport_country", return_value=airport_country),
-            patch.object(cli, "api_get", return_value={"data": {"passportIds": ["passport-1", "passport-9"]}}),
+            patch.object(cli, "api_get", return_value={"data": {
+                "passportIds": ["passport-1", "passport-9"],
+                "passports": [{"id": "passport-1", "image": "passport/scan.jpg"}],
+            }}),
         )
 
     def test_booking_create_builds_exact_android_trip_book_body(self) -> None:
@@ -982,7 +986,9 @@ class AirSprintCliTests(unittest.TestCase):
             patch.object(cli, "_resolve_airport", side_effect=lambda token, code: f"{code.lower()}-id"),
             patch.object(cli, "_get_default_aircraft", return_value="aircraft-id"),
             patch.object(cli, "_airport_country", side_effect=lambda airport_id: countries.get(airport_id, (None, None))),
-            patch.object(cli, "api_get", return_value={"data": {"passportIds": ["passport-1"]}}),
+            patch.object(cli, "api_get", return_value={"data": {
+                "passportIds": ["passport-1"], "passports": [{"id": "passport-1", "image": "passport/scan.jpg"}],
+            }}),
             patch.object(cli, "api_post") as post,
         ):
             result = self.runner.invoke(cli.app, [
@@ -1194,15 +1200,14 @@ class AirSprintCliTests(unittest.TestCase):
         self.assertEqual(payload["shareSettings"]["specialRequests"], "")
         self.assertEqual(payload["shareSettings"]["groupIds"], [])
 
-    def test_existing_flight_booking_does_not_offer_arrival_or_note_options(self) -> None:
-        """BookSharedRequestSettings stops at groundTransportationDropOffAddress; no arrival* or note keys
-        exist, and BookSharedPassenger.toJson (0x70760c) never emits customsDeclarationId (its gate is a constant "")."""
+    def test_existing_flight_booking_offers_arrival_but_not_customs_or_note(self) -> None:
+        """Android 6.1.10 adds arrival transport; shared passengers still omit customs and note."""
         root = cli.typer.main.get_command(cli.app)
         for command in ("empty-leg", "shared-flight"):
             options = {opt for param in root.commands["booking"].commands[command].params for opt in param.opts}
             self.assertNotIn("--customs", options)
             self.assertNotIn("--note", options)
-            self.assertNotIn("--arrival-ground-method", options)
+            self.assertIn("--arrival-ground-method", options)
             self.assertIn("--ground-dropoff-address", options)
 
     def test_booking_lock_and_release_use_android_flight_lock_body(self) -> None:
@@ -1419,7 +1424,7 @@ class AirSprintCliTests(unittest.TestCase):
             ])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        read.assert_called_once_with("token", "/leg/leg-id")
+        read.assert_called_once_with("token", "/my-leg/leg-id")
         write.assert_called_once_with("token", "/leg/leg-id", {
             "options": {"passengers": [{"id": "saved-1"}, {"id": "saved-3"}]},
         })
@@ -1781,10 +1786,10 @@ class AirSprintCliTests(unittest.TestCase):
     CUSTOMS_LEG = {"data": {
         "id": "leg-1",
         "departureDate": "2026-09-01T14:00:00Z",
-        "passengers": [
-            {"id": "leg-passenger-1", "passenger": {"id": "s-1", "firstName": "Jane", "lastName": "Doe"}},
-            {"id": "leg-passenger-2", "passenger": {"id": "s-2", "firstName": "John", "lastName": "Roe"}},
-            {"id": "leg-passenger-3", "passenger": {"id": "s-3", "firstName": "Kid", "lastName": "Roe"}},
+        "legPassengers": [
+            {"id": "leg-passenger-1", "passengerId": "s-1", "firstName": "Jane", "lastName": "Doe"},
+            {"id": "leg-passenger-2", "passengerId": "s-2", "firstName": "John", "lastName": "Roe"},
+            {"id": "leg-passenger-3", "passengerId": "s-3", "firstName": "Kid", "lastName": "Roe"},
         ],
     }}
     CUSTOMS_ANSWERED_NO = [
@@ -1818,7 +1823,7 @@ class AirSprintCliTests(unittest.TestCase):
         )
 
         self.assertEqual(result.exit_code, 0, result.output)
-        read.assert_called_once_with("token", "/leg/leg-1")
+        read.assert_called_once_with("token", "/my-leg/leg-1")
         data = json.loads(result.output)["data"]
         self.assertEqual(data["path"], "/canadianCustomsDeclaration/create")
         self.assertEqual(data["declarations"], 2)
@@ -2141,7 +2146,7 @@ class AirSprintCliTests(unittest.TestCase):
             ])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        read.assert_called_once_with("token", "/leg/leg-id")
+        read.assert_called_once_with("token", "/my-leg/leg-id")
         write.assert_called_once_with("token", "/leg/leg-id/required-info", {
             "options": {
                 "passengers": [
@@ -2159,6 +2164,68 @@ class AirSprintCliTests(unittest.TestCase):
         self.assertEqual(plan["dropped"], [])
         self.assertEqual([item["id"] for item in plan["kept"]], ["saved-2"])
         self.assertEqual([item["id"] for item in plan["updated"]], ["saved-1"])
+
+    def test_required_info_address_uses_owner_leg_read_then_original_patch_route(self) -> None:
+        address = {"street": "1 Example Avenue", "city": "New York", "state": "NY", "zip": "10001"}
+        leg = {"data": {"id": "leg-id", "legPassengers": [
+            {"id": "leg-pax-1", "passengerId": "saved-1", "passport": {"id": "passport-1"}},
+            {"id": "leg-pax-2", "passengerId": "saved-2", "customsDeclarationId": "customs-2"},
+        ]}}
+        expected = {"options": {"passengers": [
+            {"id": "saved-1", "passport": {"id": "passport-1"}, "destinationAddress": address},
+            {"id": "saved-2", "customsDeclarationId": "customs-2", "destinationAddress": address},
+        ]}}
+
+        def request(method, url, **kwargs):
+            if method == "GET" and url == f"{cli.API_BASE_URL}/leg/leg-id":
+                raise RuntimeError('{"http_code": 401, "message": "Unauthorized"}')
+            if method == "GET" and url == f"{cli.API_BASE_URL}/my-leg/leg-id":
+                return leg
+            if method == "PATCH" and url == f"{cli.API_BASE_URL}/leg/leg-id/required-info":
+                self.assertEqual(json.loads(kwargs["data"]), expected)
+                return {"data": {"updated": True}}
+            self.fail(f"Unexpected request: {method} {url}")
+
+        for mode in ("--dry-run", "--confirm"):
+            with (
+                self.subTest(mode=mode),
+                patch.object(cli, "BOOKING_WRITE_GUARD", Path(self.temporary.name) / "write.json"),
+                patch.object(cli, "get_api_token", return_value="token"),
+                patch.object(cli, "_http", side_effect=request) as http,
+            ):
+                result = self.runner.invoke(cli.app, [
+                    "leg", "update-required-info", "--leg-id", "leg-id",
+                    "--destination-street", address["street"], "--destination-city", address["city"],
+                    "--destination-state", address["state"], "--destination-zip", address["zip"], mode,
+                ])
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(http.call_count, 1 if mode == "--dry-run" else 2)
+                self.assertEqual(http.call_args_list[0].args, ("GET", f"{cli.API_BASE_URL}/my-leg/leg-id"))
+                self.assertFalse(http.call_args_list[0].kwargs["retry_first_ssl"])
+                data = json.loads(result.output)["data"]
+                self.assertEqual(data["plan"]["dropped"], [])
+                self.assertEqual([row["id"] for row in data["plan"]["updated"]], ["saved-1", "saved-2"])
+                if mode == "--dry-run":
+                    self.assertEqual(data["payload"], expected)
+                else:
+                    self.assertFalse(http.call_args_list[1].kwargs.get("retry_first_ssl", False))
+
+    def test_required_info_failed_owner_read_never_falls_back_or_writes(self) -> None:
+        with (
+            patch.object(cli, "_guard_booking_probe"),
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "_http", side_effect=RuntimeError('{"http_code": 401}')) as http,
+            patch.object(cli, "api_patch") as write,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "leg", "update-required-info", "--leg-id", "leg-id",
+                "--passport", "saved-1=passport-1", "--confirm",
+            ])
+        self.assertNotEqual(result.exit_code, 0)
+        http.assert_called_once()
+        self.assertEqual(http.call_args.args, ("GET", f"{cli.API_BASE_URL}/my-leg/leg-id"))
+        self.assertFalse(http.call_args.kwargs["retry_first_ssl"])
+        write.assert_not_called()
 
     def test_required_info_customs_and_destination_apply_to_passengers(self) -> None:
         leg = {"data": {"passengers": [
@@ -2756,14 +2823,18 @@ class AirSprintCliTests(unittest.TestCase):
         }))
         self.assertEqual(post.call_args_list[1].args, ("token", "/user/2fa/verify", {"token": "123456"}))
 
-        with patch.object(cli, "_http", return_value={}) as http:
+        with (
+            patch.object(cli, "_http", return_value={"data": {"authToken": "2fa-session"}}) as http,
+            patch.object(cli, "_save_api_token") as save,
+        ):
             sign_in = self.runner.invoke(cli.app, [
-                "auth", "2fa-sign-in", "--user-id", "user-1", "--code", "654321",
+                "auth", "2fa-sign-in", "--user-id", "user-1", "--code", "654321", "--username", "jane@example.com",
             ])
             reset = self.runner.invoke(cli.app, [
                 "auth", "reset-confirm", "--token", "reset-token", "--new-password", "new-secret-1",
             ])
         self.assertEqual(sign_in.exit_code, 0, sign_in.output)
+        save.assert_called_once_with("2fa-session", "jane@example.com")
         self.assertEqual(reset.exit_code, 0, reset.output)
         self.assertTrue(http.call_args_list[0].args[1].endswith("/user/2fa/sign-in"))
         self.assertEqual(json.loads(http.call_args_list[0].kwargs["data"]), {"userId": "user-1", "token": "654321"})
@@ -2787,9 +2858,9 @@ class AirSprintCliTests(unittest.TestCase):
         self.assertEqual(bad_code.exit_code, cli.EXIT_VALIDATION)
         self.assertIn("6-digit", bad_code.output)
 
-    def test_android_contract_matrix_has_104_registered_command_mappings(self) -> None:
+    def test_android_contract_matrix_has_105_registered_command_mappings(self) -> None:
         contract = (Path(__file__).resolve().parents[1] / "ANDROID_CONTRACT.md").read_text()
-        expected_counts = {"GET": 20, "PATCH": 11, "DELETE": 8, "POST": 65}
+        expected_counts = {"GET": 21, "PATCH": 11, "DELETE": 8, "POST": 65}
         root = cli.typer.main.get_command(cli.app)
         active_method = None
         counts = {method: 0 for method in expected_counts}
@@ -2812,7 +2883,7 @@ class AirSprintCliTests(unittest.TestCase):
                 self.assertIn(parts[1], group.commands, command_path)
 
         self.assertEqual(counts, expected_counts)
-        self.assertEqual(sum(counts.values()), 104)
+        self.assertEqual(sum(counts.values()), 105)
 
 
     def test_passenger_create_save_profile_yes_builds_android_payload(self) -> None:
@@ -3037,6 +3108,180 @@ class AirSprintCliTests(unittest.TestCase):
             verbatim = self.runner.invoke(cli.app, ["--internal", "passenger", "get", "--id", "p"])
         self.assertEqual(json.loads(shown.output)["data"], {"id": "p", "savedProfile": True})
         self.assertEqual(json.loads(verbatim.output)["data"]["data"], {"object": "passenger", "id": "p", "isActive": True})
+
+
+    def test_all_cli_api_routes_match_the_android_source_inventory(self) -> None:
+        snapshot = json.loads(Path(__file__).with_name("android_contracts.json").read_text())
+        expected = {(item["method"], item["path"]) for item in snapshot["contracts"]}
+        self.assertEqual((snapshot["androidVersion"], snapshot["versionCode"]),
+                         (cli.ANDROID_APP_VERSION, cli.ANDROID_APP_VERSION_CODE))
+        extensions = {("PATCH", "/canadianCustomsDeclaration/{id}")}
+        omitted = {("GET", "/app-update"), ("POST", "/file-public/create"), ("POST", "/leg/recent/save")}
+        observed = set()
+        tree = ast.parse(Path(cli.__file__).read_text())
+        wrappers = {"api_get", "api_post", "api_patch", "api_delete", "_android_document_upload"}
+        for function in tree.body:
+            if not isinstance(function, ast.FunctionDef) or function.name in wrappers or function.name.startswith("raw_"):
+                continue
+            bindings = {
+                target.id: node.value
+                for node in ast.walk(function) if isinstance(node, ast.Assign)
+                for target in node.targets if isinstance(target, ast.Name)
+            }
+
+            def paths(node):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    return {node.value}
+                if isinstance(node, ast.JoinedStr):
+                    return {"".join(
+                        part.value if isinstance(part, ast.Constant)
+                        else cli.API_BASE_URL if isinstance(part.value, ast.Name) and part.value.id == "API_BASE_URL"
+                        else "{id}" for part in node.values
+                    )}
+                if isinstance(node, ast.IfExp):
+                    return paths(node.body) | paths(node.orelse)
+                if isinstance(node, ast.Name) and node.id in bindings:
+                    return paths(bindings[node.id])
+                self.fail(f"Unverified dynamic API route in {function.name}: {ast.unparse(node)}")
+
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                    continue
+                name = node.func.id
+                if name == "_android_document_upload":
+                    calls = [("POST", kw.value) for kw in node.keywords if kw.arg in {"init_path", "attach_path"}]
+                elif name in {"api_get", "api_post", "api_patch", "api_delete"}:
+                    calls = [(name.removeprefix("api_").upper(), node.args[1])]
+                elif name == "_http":
+                    calls = [(node.args[0].value, node.args[1])]
+                else:
+                    continue
+                for method, expression in calls:
+                    for path in paths(expression):
+                        route = (method, path.removeprefix(cli.API_BASE_URL))
+                        self.assertIn(route, expected | extensions, f"{function.name}:{node.lineno}")
+                        observed.add(route)
+        self.assertEqual(expected - omitted, observed - extensions)
+
+    def test_owner_leg_updates_reject_missing_or_unresolved_passengers(self) -> None:
+        cases = [{}, {"legPassengers": None}, {"legPassengers": {}},
+                 {"legPassengers": [{"id": "leg-passenger-only"}]}]
+        commands = [
+            ["leg", "update-passengers", "--leg-id", "leg-id", "--add", "saved-2", "--confirm"],
+            ["leg", "update-required-info", "--leg-id", "leg-id", "--destination-street", "1 Main",
+             "--destination-city", "New York", "--destination-state", "NY", "--destination-zip", "10001", "--confirm"],
+        ]
+        for leg in cases:
+            for command in commands:
+                with (
+                    self.subTest(leg=leg, command=command),
+                    patch.object(cli, "_guard_booking_probe"),
+                    patch.object(cli, "get_api_token", return_value="token"),
+                    patch.object(cli, "api_get", return_value={"data": leg}) as read,
+                    patch.object(cli, "api_patch") as write,
+                ):
+                    result = self.runner.invoke(cli.app, command)
+                    self.assertNotEqual(result.exit_code, 0)
+                    read.assert_called_once_with("token", "/my-leg/leg-id")
+                    write.assert_not_called()
+
+    def test_shared_and_empty_flights_support_android_6110_arrival_transport(self) -> None:
+        for command in ("shared-flight", "empty-leg"):
+            with self.subTest(command=command), patch.object(cli, "api_post") as post:
+                result = self.runner.invoke(cli.app, [
+                    "booking", command, "--flight-id", "flight-id", "--passengers", "saved-1",
+                    "--baggage", "none", "--ground-transportation", "yes", "--ground-transportation-when", "both",
+                    "--ground-transportation-method", "taxi", "--arrival-ground-method", "sedan-and-driver",
+                    "--arrival-pickup-address", "1 Main; New York; NY; 10001",
+                    "--arrival-dropoff-address", "2 Main; New York; NY; 10002", "--dry-run",
+                ])
+                self.assertEqual(result.exit_code, 0, result.output)
+                settings = json.loads(result.output)["data"]["payload"]["options"]["requestSettings"]
+                self.assertEqual(settings["arrivalGroundTransportationMethod"], "SEDAN_AND_DRIVER")
+                self.assertEqual(settings["arrivalGroundTransportationPickUpAddress"]["street"], "1 Main")
+                self.assertEqual(settings["arrivalGroundTransportationDropOffAddress"]["zip"], "10002")
+                self.assertNotIn("note", settings)
+                post.assert_not_called()
+
+    def test_token_cache_respects_the_requested_identity(self) -> None:
+        with (
+            patch.object(cli, "API_TOKEN_CACHE", Path(self.temporary.name) / "token.json"),
+            patch.object(cli, "_api_login", return_value="new-session") as login,
+        ):
+            cli._save_api_token("old-session", "old@example.com")
+            self.assertEqual(cli.get_api_token("OLD@example.com", "unused"), "old-session")
+            login.assert_not_called()
+            self.assertEqual(cli.get_api_token("new@example.com", "new-password"), "new-session")
+            login.assert_called_once_with("new@example.com", "new-password")
+            self.assertIsNone(cli._load_api_token("old@example.com"))
+            self.assertEqual(cli._load_api_token("new@example.com"), "new-session")
+
+    def test_login_exposes_android_two_factor_challenge_without_caching_it(self) -> None:
+        for key in ("userId", "id"):
+            with (
+                self.subTest(key=key),
+                patch.object(cli, "_http", return_value={"data": {key: "user-1"}}) as http,
+                patch.object(cli, "_save_api_token") as save,
+            ):
+                result = self.runner.invoke(cli.app, [
+                    "auth", "login", "--username", "jane@example.com", "--password", "test-password",
+                ])
+                self.assertEqual(result.exit_code, cli.EXIT_AUTH)
+                self.assertIn("user-1", result.output)
+                self.assertIn("2fa-sign-in", result.output)
+                http.assert_called_once()
+                save.assert_not_called()
+
+    def test_failed_two_factor_sign_in_keeps_the_cached_session(self) -> None:
+        with patch.object(cli, "_http", return_value={}), patch.object(cli, "_save_api_token") as save:
+            result = self.runner.invoke(cli.app, ["auth", "2fa-sign-in", "--user-id", "user-1", "--code", "123456"])
+        self.assertEqual(result.exit_code, cli.EXIT_AUTH)
+        save.assert_not_called()
+
+    def test_trips_timezone_is_used_and_does_not_leak_between_invocations(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "_get_account_ids", return_value=["account-1"]),
+            patch.object(cli, "api_post", return_value={"data": {"items": [{"departureTime": 1793554200}]}}),
+        ):
+            local = self.runner.invoke(cli.app, ["trips", "list", "--timezone", "America/Toronto"])
+            utc = self.runner.invoke(cli.app, ["trips", "list"], env={"AIRSPRINT_TIMEZONE": ""})
+        self.assertEqual(local.exit_code, 0, local.output)
+        self.assertEqual(utc.exit_code, 0, utc.output)
+        self.assertEqual(json.loads(local.output)["data"][0]["departureTime"], "2026-11-01T12:30:00-05:00")
+        self.assertEqual(json.loads(utc.output)["data"][0]["departureTime"], "2026-11-01T17:30:00Z")
+
+    def test_invalid_output_timezone_is_rejected_before_authentication(self) -> None:
+        with patch.object(cli, "get_api_token") as auth:
+            result = self.runner.invoke(cli.app, ["trips", "list", "--timezone", "not/a-timezone"])
+        self.assertEqual(result.exit_code, cli.EXIT_VALIDATION)
+        auth.assert_not_called()
+
+    def test_passport_make_primary_does_not_attach_an_unrelated_passport(self) -> None:
+        with (
+            patch.object(cli, "get_api_token", return_value="token"),
+            patch.object(cli, "api_get", return_value={"data": {"passportIds": ["owned"]}}),
+            patch.object(cli, "api_patch") as write,
+        ):
+            result = self.runner.invoke(cli.app, [
+                "passport", "make-primary", "--passenger-id", "saved-1", "--passport-id", "unrelated", "--confirm",
+            ])
+        self.assertEqual(result.exit_code, cli.EXIT_VALIDATION)
+        write.assert_not_called()
+
+    def test_international_booking_requires_verifiable_passport_records(self) -> None:
+        for passenger in ({"data": {"passportIds": ["passport-1"]}}, {"data": {"passports": []}}):
+            patches = self.international_document_patches({"return_value": passenger})
+            with self.subTest(passenger=passenger), patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(cli, "api_post") as post:
+                result = self.runner.invoke(cli.app, [
+                    "booking", "create", "--leg", "CYUL>KTEB@2026-09-01T16:00",
+                    "--passengers", "saved-1", "--passport", "saved-1=passport-1", "--baggage", "none",
+                    "--destination-street", "1 Main", "--destination-city", "New York",
+                    "--destination-state", "NY", "--destination-zip", "10001",
+                ])
+                self.assertEqual(result.exit_code, cli.EXIT_VALIDATION, result.output)
+                self.assertIn("could not be verified", result.output)
+                post.assert_not_called()
 
 
 if __name__ == "__main__":

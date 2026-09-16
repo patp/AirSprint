@@ -6,9 +6,9 @@ description: Use the local AirSprint owner CLI for trips, booking, passengers, p
 # AirSprint CLI agent guide
 
 Use this CLI for AirSprint owner operations against `https://api.airsprint.com/api`.
-It follows the current AirSprint Android 6.1.4 API. Retired prod2, follower, and
+It follows the current AirSprint Android 6.1.10 API. Retired prod2, follower, and
 known-broken passport PATCH commands are intentionally absent.
-The source audit covers all 104 unique Android method/route contracts; see
+The source audit covers all 105 unique Android method/route contracts; see
 `ANDROID_CONTRACT.md` for the checksum and complete mapping.
 
 ## Invoke
@@ -30,11 +30,16 @@ Credentials come from `AIRSPRINT_USERNAME` and `AIRSPRINT_PASSWORD`, or the
 JSON is the default output; there is no `--json` flag. Use `--format human`
 for human output and `--compact` for token-efficient JSON.
 
+Cached sessions are scoped to the requested login email. If `auth login`
+reports a 2FA challenge, use its `userId` with `auth 2fa-sign-in --user-id ID
+--code CODE --username EMAIL`. That command saves the authenticated session;
+it never prints the full token.
+
 ## Forms, not JSON
 
 Every command that writes to AirSprint is a form: you answer questions with
 options (`--leg`, `--passengers`, `--catering yes`, ...) and the CLI builds the
-exact Android 6.1.4 request body itself. No public command accepts JSON, a
+exact Android 6.1.10 request body itself. No public command accepts JSON, a
 `--body`, or any API field name. You never need to know the wire format.
 
 - IDs are the only internals you handle: passenger, passport, pet, flight,
@@ -169,8 +174,9 @@ The dry run's `routeCheck` shows the detected countries, `usTouching`, and
 `international` so you can confirm them with the owner.
 
 Booking an existing flight from `explore flights` uses the same vocabulary but
-a shorter form (no arrival-side transport, no note, no passports — the app does
-not send them for these flights):
+a shorter form (no note or passports in the request). Android 6.1.10 also
+supports arrival transport with `--arrival-ground-method`,
+`--arrival-pickup-address`, and `--arrival-dropoff-address`:
 
 ```bash
 python3 scripts/airsprint_cli.py booking empty-leg \
@@ -198,13 +204,14 @@ python3 scripts/airsprint_cli.py booking cancel \
   --leg-id LEG_UUID --reason "Plans changed" --confirm
 ```
 
-Android 6.1.4 sends only `legId` and `reason`; do not add a booking code,
+Android 6.1.10 sends only `legId` and `reason`; do not add a booking code,
 `tripId`, or a list of legs.
 
 ## Updating passengers on a booked leg
 
 `PATCH /leg/{id}` replaces the passenger list completely. The CLI always sends
 the full current list, keyed by saved passenger UUID, never `legPassenger.id`.
+It reads that list once through the owner's `GET /my-leg/{id}` route.
 
 ```bash
 # Makes one GET and prints the complete kept/added/dropped plan; no PATCH.
@@ -218,6 +225,8 @@ python3 scripts/airsprint_cli.py leg update-passengers \
 
 The command refuses to PATCH if any existing leg passenger cannot be mapped to
 a saved passenger UUID. This prevents accidental passenger loss.
+A missing or malformed passenger-list field is also refused; it is never
+treated as an empty list.
 
 ## Completing a booked leg's required information
 
@@ -225,8 +234,11 @@ a saved passenger UUID. This prevents accidental passenger loss.
 leg: passports, customs declarations, destination address, seats, pets,
 baggage, catering, ground transportation, note, and the CDC dog form. Only the
 sections you answer are sent. Passenger answers (`--passport`, `--customs`,
-`--destination-*`) trigger one guarded leg GET so the complete passenger list
-is preserved; the dry run prints `kept`/`updated`/`dropped`.
+`--destination-*`) trigger one guarded `GET /my-leg/{id}` so the complete
+passenger list is preserved; the dry run prints `kept`/`updated`/`dropped`.
+The write remains `PATCH /leg/{id}/required-info`. Do not use `GET /leg/{id}`
+for the pre-read: owner tokens can receive 401 on that route. A failed read
+stops the command without fallback requests or a PATCH.
 
 ```bash
 python3 scripts/airsprint_cli.py leg update-required-info \
@@ -343,14 +355,14 @@ python3 scripts/airsprint_cli.py pet upload-document \
   --document-type vaccinationDocument --confirm
 ```
 
-Android 6.1.4 parses `yyyy-MM-dd` passport dates at device-local midnight. For
+Android 6.1.10 parses `yyyy-MM-dd` passport dates at device-local midnight. For
 timezone-less ISO input, always pass `--timezone` (or set `AIRSPRINT_TIMEZONE`)
 so the CLI preserves the same calendar date in the Android UI; the CLI refuses
 ambiguous input without it. This is the Android device timezone, not a fixed
 AirSprint HQ/Calgary timezone. Use `America/Edmonton` only when that is the
 device's configured timezone.
 
-Android 6.1.4 supports an authority-only update with one
+Android 6.1.10 supports an authority-only update with one
 `PATCH /my-passport/{id}`. Copy the printed `Authority/Autorité` exactly and use
 `passport update-authority`; do not extend this to passport numbers or dates,
 which have not persisted reliably:
@@ -372,6 +384,8 @@ python3 scripts/airsprint_cli.py passport make-primary \
 python3 scripts/airsprint_cli.py passport make-primary \
   --passenger-id SAVED_PAX_UUID --passport-id PASSPORT_UUID --confirm
 ```
+
+`make-primary` only reorders a passport already attached to that passenger.
 
 ## Canadian customs
 
@@ -405,6 +419,8 @@ python3 scripts/airsprint_cli.py customs create \
   the request; the server already knows it from the leg.
 - `--link-id` reuses a link from `customs link-create`; omit it and the CLI
   creates one for the leg first, as the app does.
+- `--leg-id` reads the booked leg once with `GET /my-leg/{id}` to resolve
+  the leg-passenger IDs.
 - Payment-authorization card details are deliberately not accepted;
   certification/signature stays in the AirSprint app.
 

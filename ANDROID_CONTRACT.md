@@ -1,32 +1,43 @@
-# Android 6.1.4 contract audit
+# Android 6.1.10 contract audit
 
 This is the source-backed API contract for AirSprint CLI. The audit was made
-offline from the Android 6.1.4 APK (version code 127), not by probing a booked
-trip. The audited `base.apk` SHA-256 is:
+offline from the Android 6.1.10 APK (version code 133), installed from Google
+Play on 2026-09-16, without probing a booked trip. The audited `base.apk`
+SHA-256 is:
 
 ```text
-1d029d572731f9507864956e2f77155b641500a0319f368fbac4dab90328a477
+388e12c6fa0c5d6c5f51424103efed9590a3ba590d1c096c891b9e053d1d8413
 ```
 
-The decompiled repository layer contains 111 calls to `APIClient.request`.
-Seven are duplicate uses of the same method and normalized route, leaving 104
+The decompiled repository layer contains 112 calls to `APIClient.request`.
+Seven are duplicate uses of the same method and normalized route, leaving 105
 unique HTTP contracts:
 
 | Method | Unique contracts |
 |---|---:|
 | POST | 65 |
-| GET | 20 |
+| GET | 21 |
 | PATCH | 11 |
 | DELETE | 8 |
-| **Total** | **104** |
+| **Total** | **105** |
 
-102 of these 104 contracts are reachable through a typed CLI command; the two
-remaining routes (`/file-public/create`, `/leg/recent/save`) are deliberately
+102 of these 105 contracts are reachable through a typed CLI command; the three
+remaining routes (`/file-public/create`, `/leg/recent/save`, `/app-update`) are deliberately
 not exposed (see "Deliberate omissions"). No public command accepts JSON or
 API field names: every write is a form of typed options and the CLI builds the
 request body from the decompiled Android payload models. The comparison
 includes methods, bodyless requests, request envelopes, field names, field
 order, ID types, and high-risk no-probe behavior—not only matching URL text.
+
+The 6.1.10 inventory with source locations is in `scripts/android_contracts.json`.
+The regression suite checks the actual CLI call sites against that independent
+inventory, including pre-reads and upload routes. It allows only the documented
+customs-date extension. This would have caught the invalid `GET /leg/{id}`.
+
+The original 6.1.4 analysis remains under `tmp/android-verify/analysis/`.
+Addresses in the historical findings below refer to that baseline unless
+explicitly marked 6.1.10. The fresh analysis is under
+`tmp/audit-2026-09-16/analysis/`; see `AUDIT_2026-09-16.md` for changes and limits.
 
 ## Method
 
@@ -130,8 +141,9 @@ API itself does not make the document mandatory.
   trip form, which always sends them). Passenger entries are `{id,
   [destinationAddress]}`: `BookSharedPassenger.toJson` (0x70760c) gates
   `customsDeclarationId` on a constant `""` (0x707658), so it is never sent,
-  and there is no `passport` key; the request settings have no arrival-side
-  transport or note. `booking empty-leg` and `booking shared-flight` expose
+  and there is no `passport` key; the request settings have no note.
+  Since Android 6.1.10, they also support arrival-side transportation.
+  `booking empty-leg` and `booking shared-flight` expose
   exactly that (no `--customs`; attach declarations with
   `leg update-required-info --customs`).
 - `/flight/lock` sends `{"id", "lock"}` (`booking lock`, `--release` = false).
@@ -205,10 +217,19 @@ API itself does not make the document mandatory.
   `passportIds` list into passenger entries; `LegPassengerUpdate.toJson`
   (0x801778) has no such key, so only `customsDeclarationId`,
   `destinationAddress` and `passport` are carried over.
+- Booked-leg pre-reads in `leg update-required-info`, `leg update-passengers`
+  and `customs create --leg-id` use `GET /my-leg/{id}`, matching
+  `RemoteFlightRepository.myAccountLeg` (0x9bce44; route at 0x9bce94,
+  request at 0x9bcec8). `LegResponseModel.fromJson` reads `legPassengers`
+  (0x6ec2f4); `LegPassengerModel.fromJson` distinguishes the leg-passenger
+  `id` (0x6f16d0) from the saved `passengerId` (0x6f1700). The old
+  `GET /leg/{id}` pre-read could return 401 for an owner token and abort
+  before writing. PATCH routes remain `/leg/{id}` and
+  `/leg/{id}/required-info`. No fallback, retry or read-back was added.
 
 ## Guard rails beyond the app
 
-These CLI refusals are stricter than Android 6.1.4 and happen before the
+These CLI refusals are stricter than Android and happen before the
 write is sent. Baggage and unanswered customs questions are refused before
 any request at all; the passport and destination checks first need read-only
 lookups (airport mirror, `GET /my-passenger/{id}` for passports):
@@ -219,9 +240,9 @@ lookups (airport mirror, `GET /my-passenger/{id}` for passports):
   passport on file (the app only warns). Each passenger's first passport is
   used, as the app does; `--passport PAX=PASSPORT` overrides. When the
   `GET /my-passenger/{id}` read returns the full passport records, a selected
-  passport with no photo/scan uploaded (`image` empty) is refused too, since
-  AirSprint requires the passport image before departure; a thin response that
-  carries only `passportIds` still enforces the on-file rule.
+  passport with no photo/scan uploaded (`image` empty) is refused too. A thin
+  response that carries only `passportIds`, or omits the selected passport,
+  is refused because the required scan cannot be verified.
 - US-touching and international trips require a destination address on every
   passenger of every leg.
 - Airport countries come from the local airport mirror (ICAO prefix as a
@@ -236,11 +257,12 @@ lookups (airport mirror, `GET /my-passenger/{id}` for passports):
 Dynamic IDs are normalized as `{id}`. Multiple CLI commands are shown where a
 single Android route supports several app functions.
 
-### GET (20)
+### GET (21)
 
 | Contract | CLI coverage |
 |---|---|
 | `/aircraft/{id}` | `quote aircraft-get` |
+| `/app-update` | not exposed (native-app version check; deliberate omission) |
 | `/canadian-customs-declaration-link/{id}` | `customs link-get` |
 | `/content/{id}` | `content get` |
 | `/faq/{id}` | `content faq-get` |
@@ -251,7 +273,7 @@ single Android route supports several app functions.
 | `/me` | `user profile` |
 | `/my-file/{id}` | `files get` |
 | `/my-flight/{id}` | `trips flight-get` |
-| `/my-leg/{id}` | `trips leg-get` |
+| `/my-leg/{id}` | `trips leg-get`; pre-read for `leg update-passengers`, `leg update-required-info`, `customs create` (with --leg-id) |
 | `/my-notification-settings` | `messages settings`, `user preferences` |
 | `/my-passenger/{id}` | `passenger get` |
 | `/my-pet/{id}` | `pet get` |
@@ -362,7 +384,7 @@ single Android route supports several app functions.
 
 ## Deliberate API extensions
 
-These commands are useful but are not claims about Android 6.1.4 source:
+These commands are useful but are not claims about the Android source:
 
 - `customs update-date` uses the separately verified declaration PATCH.
 - `passport make-primary` reorders `passportIds` because
@@ -383,9 +405,16 @@ These commands are useful but are not claims about Android 6.1.4 source:
 - Share settings, airports, aircraft, and the departure date are not part of
   the app's required-information form, so `leg update-required-info` does not
   offer them.
-- Arrival-side ground transportation and the note are absent from
-  `booking empty-leg` and `booking shared-flight` because the Android model
-  does not send them for existing flights.
+- The note is absent from `booking empty-leg` and `booking shared-flight`
+  because the Android model does not send it for existing flights. Android
+  6.1.10 adds arrival-side transport, now available through
+  `--arrival-ground-method`, `--arrival-pickup-address`, and
+  `--arrival-dropoff-address` (`BookSharedRequestSettings.toJson`,
+  0x720a3c–0x720a94).
+- `GET /app-update` is the native application's update prompt. It sends
+  `version` and optional `buildNumber` without an owner token
+  (`RemoteAppUpdateRepository.check`, 6.1.10: 0x541688). It does not apply
+  to this Python CLI and is intentionally omitted.
 - `trips flight-feedback` was removed; it duplicated `booking survey` with a
   hand-written body.
 - The seven payment-authorization keys the customs form can add to
