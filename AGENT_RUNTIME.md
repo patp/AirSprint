@@ -83,7 +83,7 @@ an audited general idempotency-key contract.
 
 Python runtime dependencies remain `typer` and `truststore`. The server
 implements MCP 2.0 (`2026-07-28`), including per-request protocol metadata;
-older `initialize` clients are rejected with a protocol error.
+older `initialize` clients use the optional stdio bridge below.
 
 ```bash
 export AIRSPRINT_USERNAME='owner@example.com'
@@ -122,6 +122,35 @@ Eight tools keep initial discovery small:
 Authentication, password changes, raw requests and recursive server commands
 are excluded from MCP. Read the `mayNotifyOwner` guidance before a booked-trip
 detail read. Such reads are never used for event collection.
+
+### Existing MCP 1.x clients
+
+Run `scripts/airsprint_mcp_bridge.py --config /private/path/bridge.json` on the
+client machine. Its mode-0600 configuration contains `url` (the service's
+HTTPS `/mcp` endpoint) and `token`. Register this Python command as a stdio MCP
+server in the client. It negotiates protocol `2025-06-18` and forwards tools
+to the MCP 2.0 service. Operations, credentials for AirSprint, journals and
+files remain on the service machine. Paths in command forms refer to that
+machine; transfer authorized input documents there before using them.
+
+An optional `connect_ip` pins the connection to a literal private address
+when the client's DNS resolves a private service name to a public relay.
+TLS still verifies the URL's hostname and sends that hostname as SNI.
+The bridge disables redirects and environment proxies and never retries an
+HTTP request. Keep its bearer token out of connector registration arguments;
+register only the private configuration file's path.
+
+The MCP 1.x connection advertises tools only. Webhook subscriptions remain
+available at the service's MCP 2.0 endpoint; installing the legacy connector
+does not subscribe that client to events. Existing deterministic watches can
+call `airsprint_read` through the same service without starting agent turns.
+
+On macOS, run the HTTP service through a launchd agent with `RunAtLoad` and
+`KeepAlive`, and keep its environment and state outside the Git checkout.
+Expose it through a private HTTPS proxy (for example Tailscale Serve). After
+an update, verify the service is running, the connector discovers eight tools,
+and a read-only command succeeds. Preserve the state database and customs
+submission journal when moving the service to another machine.
 
 ## Events
 
