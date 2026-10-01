@@ -39,8 +39,8 @@ it never prints the full token.
 
 Every command that writes to AirSprint is a form: you answer questions with
 options (`--leg`, `--passengers`, `--catering yes`, ...) and the CLI builds the
-exact Android 6.1.12 request body itself. No public command accepts JSON, a
-`--body`, or any API field name. You never need to know the wire format.
+exact Android 6.1.12 request body itself. No public command accepts an API
+request body or a `--body` flag. You never need to know the wire format.
 
 - IDs are the only internals you handle: passenger, passport, pet, flight,
   trip, leg, airport, and aircraft UUIDs. Get them from list/info commands.
@@ -58,6 +58,26 @@ exact Android 6.1.12 request body itself. No public command accepts JSON, a
 
 ## Efficient agent usage
 
+- Start with `agent commands --group GROUP` or `--query WORD`, then
+  `agent describe --command 'GROUP COMMAND'`. With no filter, discovery lists
+  groups only. Use the returned required fields, types and effect metadata.
+- For repeated work, use `agent serve`: one typed JSON request and reply per
+  line, reusing the command tree and caches. Form keys use underscores;
+  unknown keys and wrong types fail before execution. See `AGENT_RUNTIME.md`.
+- In the agent runtime or MCP, writes/local edits require a stable
+  `operation_key`; AirSprint writes also require `confirm: true` after explicit
+  authorization. Reuse the original key after interruption to recover its
+  receipt. Never use another key to retry an uncertain write.
+- Inspect failures using `code`, `requestMayHaveSucceeded` and `nextAction`.
+  Use `agent operation --operation-key KEY` for the local receipt.
+- `trips list` and `messages list` return `page.hasMore` and `page.nextOffset`.
+  A partial list does not prove a passenger, flight or notification is absent.
+- MCP clients use `airsprint_commands`, `airsprint_describe`, then the indicated
+  `airsprint_read` or `airsprint_run` tool. Keep the original customs review,
+  individual certification and final submission steps.
+- For monitoring, use MCP events. The service polls safe collections at most
+  once per configured cycle, establishes a silent baseline and delivers signed
+  webhooks. Do not build a polling loop around booked-trip/leg detail reads.
 - Prefer `summary --compact` for dashboard context instead of making several
   separate commands.
 - Use `cache status --compact` before refreshing reference data. `cache refresh`

@@ -12,8 +12,8 @@ corrections, offline validation and remaining limits. Route regression tests
 compare the implementation with the extracted Android inventory.
 
 Every write is a **form**: agents answer questions with typed options and the
-CLI builds the exact Android 6.1.12 request. No public command accepts JSON or
-API field names — only IDs (passenger, passport, pet, flight, trip, leg,
+CLI builds the exact Android 6.1.12 request. No public command accepts an API
+request body — only IDs (passenger, passport, pet, flight, trip, leg,
 airport, aircraft) cross the boundary. This keeps agents away from the wire
 format and lets the CLI add guard rails without changing how it is driven.
 
@@ -23,6 +23,19 @@ printed directly:
 ```bash
 python3 scripts/airsprint_cli.py --skill
 ```
+
+## Agents and MCP
+
+Start with `agent commands --group GROUP` and `agent describe --command
+'GROUP COMMAND'` to load only the form you need. `agent serve` keeps one
+process running for typed JSON-line requests and durable write receipts.
+CLI failures now use structured JSON, including unknown-option errors.
+
+`mcp serve` exposes the same validated forms through MCP 2.0 and adds signed
+webhook events for notifications, trip changes, customs submissions and agent
+operations. Event collection reads safe lists and never polls booked-trip
+detail endpoints. See [the runtime and MCP guide](AGENT_RUNTIME.md) for setup,
+operation keys, event filters, limits and verification.
 
 ## Setup
 

@@ -35,6 +35,7 @@ import subprocess
 import threading
 import time
 import unicodedata
+from contextvars import ContextVar
 from datetime import datetime, timezone as _tz_utc
 from typing import Any, Callable, Optional
 from urllib.error import HTTPError, URLError
@@ -71,6 +72,7 @@ PASSPORT_SCAN_CONTENT_TYPES = frozenset({
 })
 
 _API_REQUEST_COUNT = 0
+_REQUEST_TRACE: ContextVar[list[dict[str, Any]] | None] = ContextVar("airsprint_request_trace", default=None)
 _API_REQUEST_LOCK = threading.Lock()
 _SSL_CONTEXT: ssl.SSLContext | None = None
 _SSL_CONTEXT_LOCK = threading.Lock()
@@ -188,12 +190,21 @@ def _http(
         if api_request:
             _API_REQUEST_COUNT += 1
     req = Request(url, data=data, method=method, headers=dict(headers or {}))
+    trace = _REQUEST_TRACE.get()
+    trace_entry = None
+    if trace is not None and api_request:
+        api_path = urlparse(url).path.removeprefix("/api")
+        read_only = method == "GET" or api_path in _READ_ONLY_POST_PATHS or api_path in {"/user/sign-in-email", "/user/authenticate"}
+        trace_entry = {"method": method, "path": api_path, "effect": "read" if read_only else "write", "outcome": "uncertain"}
+        trace.append(trace_entry)
     attempts = 2 if first_api_request and retry_first_ssl else 1
     for attempt in range(attempts):
         try:
             with urlopen(req, timeout=timeout, context=_ssl_ctx()) as resp:
                 raw = resp.read().decode("utf-8")
                 if not raw:
+                    if trace_entry is not None:
+                        trace_entry["outcome"] = "accepted"
                     return {}
                 try:
                     result = json.loads(raw)
@@ -204,9 +215,22 @@ def _http(
                         "content_type": resp.headers.get("Content-Type", ""),
                     })) from exc
                 if api_request:
-                    _check_api_response(result)
+                    try:
+                        _check_api_response(result)
+                    except RuntimeError as exc:
+                        if trace_entry is not None:
+                            try:
+                                response_code = json.loads(str(exc)).get("http_code")
+                            except (ValueError, AttributeError):
+                                response_code = None
+                            trace_entry["outcome"] = "rejected" if type(response_code) is int and 400 <= response_code < 500 else "uncertain"
+                        raise
+                if trace_entry is not None:
+                    trace_entry["outcome"] = "accepted"
                 return result
         except HTTPError as exc:
+            if trace_entry is not None:
+                trace_entry["outcome"] = "rejected" if 400 <= exc.code < 500 else "uncertain"
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(
                 json.dumps({"status": "error", "http_code": exc.code, "message": body})
@@ -651,9 +675,10 @@ def _parallel_read_calls(
     # Initialize truststore/context once before worker threads race to use it.
     _ssl_ctx()
     from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
 
     with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as executor:
-        futures = {name: executor.submit(task) for name, task in tasks.items()}
+        futures = {name: executor.submit(copy_context().run, task) for name, task in tasks.items()}
         return {name: future.result() for name, future in futures.items()}
 
 
@@ -690,10 +715,16 @@ def _resolve_trip_uuid(token: str, identifier: str) -> str:
         "filter": {"accountId": account_ids},
     })
     items = response.get("data", {}).get("items", [])
-    match = next((item for item in items if item.get("bookingId") == identifier), None)
-    if not match or not match.get("tripId"):
+    matches = {str(item["tripId"]) for item in items
+               if str(item.get("bookingId", "")).casefold() == identifier.strip().casefold() and item.get("tripId")}
+    if len(matches) > 1:
+        _die(f"Booking code {identifier} matches multiple trips. Use the exact trip UUID.", EXIT_VALIDATION)
+    total = response.get("data", {}).get("total")
+    if (type(total) is int and total > len(items)) or (total is None and len(items) >= 200):
+        _die("Booking-code lookup is incomplete. Use the exact trip UUID from trips list; no detail request was sent.", EXIT_VALIDATION)
+    if not matches:
         _die(f"Trip {identifier} not found", EXIT_NOT_FOUND)
-    return str(match["tripId"])
+    return matches.pop()
 
 
 def _manifest_url(envelope: dict[str, Any]) -> str | None:
@@ -921,7 +952,7 @@ def _present(value: Any, key: str | None = None) -> Any:
     return value
 
 
-def _out(data: Any, fmt: str = "json", compact: bool = False) -> None:
+def _out(data: Any, fmt: str = "json", compact: bool = False, *, page: dict | None = None) -> None:
     """Print data as JSON (default) or human-readable. `compact` strips noise.
 
     API-derived data is passed through _present(); dry-run previews (top-level
@@ -934,7 +965,10 @@ def _out(data: Any, fmt: str = "json", compact: bool = False) -> None:
         data = _compact(data)
     if fmt == "json":
         indent = None if compact else 2
-        print(json.dumps({"status": "ok", "data": data}, indent=indent, default=str, separators=(",", ":") if compact else None))
+        result = {"status": "ok", "data": data}
+        if page is not None:
+            result["page"] = page
+        print(json.dumps(result, indent=indent, default=str, separators=(",", ":") if compact else None))
     else:
         if isinstance(data, list):
             for item in data:
@@ -944,6 +978,17 @@ def _out(data: Any, fmt: str = "json", compact: bool = False) -> None:
             _print_dict(data)
         else:
             print(data)
+
+
+def _collection_page(response: dict, offset: int, limit: int) -> dict:
+    data = _response_data(response)
+    items = data.get("items", []) if isinstance(data, dict) else []
+    total = data.get("total") if isinstance(data, dict) else None
+    known = type(total) is int and total >= offset + len(items)
+    has_more = offset + len(items) < total if known else len(items) >= limit
+    return {"offset": offset, "limit": limit, "returned": len(items), "total": total if known else None,
+            "hasMore": has_more, "complete": not has_more and offset == 0,
+            "nextOffset": offset + len(items) if has_more and items else None}
 
 
 def _print_dict(d: dict[str, Any], indent: int = 0) -> None:
@@ -959,7 +1004,9 @@ def _print_dict(d: dict[str, Any], indent: int = 0) -> None:
 
 
 def _die(message: str, code: int = EXIT_ERROR) -> None:
-    print(json.dumps({"status": "error", "message": message}), file=sys.stderr)
+    from airsprint_agent import AgentError, error_result
+    kind = {EXIT_VALIDATION: "validation", EXIT_NOT_FOUND: "not_found", EXIT_AUTH: "authentication"}.get(code, "request_failed")
+    print(json.dumps(error_result(AgentError(message, kind), trace=_REQUEST_TRACE.get())), file=sys.stderr)
     raise typer.Exit(code)
 
 
@@ -1144,6 +1191,9 @@ files_app = typer.Typer(help="File uploads & retrieval", no_args_is_help=True)
 content_app = typer.Typer(help="Content: FAQ, policies, system notices, concierge", no_args_is_help=True)
 network_app = typer.Typer(help="My Network connections and flight-sharing groups", no_args_is_help=True)
 device_app = typer.Typer(help="Android-compatible notification-device registration", no_args_is_help=True)
+agent_app = typer.Typer(help="Structured command discovery and a persistent typed runtime", no_args_is_help=True)
+events_app = typer.Typer(help="Inspect durable events and collect changes from safe lists", no_args_is_help=True)
+mcp_app = typer.Typer(help="MCP 2.0 tools and signed webhook events", no_args_is_help=True)
 
 app.add_typer(auth_app, name="auth")
 app.add_typer(user_app, name="user")
@@ -1167,6 +1217,9 @@ app.add_typer(files_app, name="files")
 app.add_typer(content_app, name="content")
 app.add_typer(network_app, name="network")
 app.add_typer(device_app, name="device")
+app.add_typer(agent_app, name="agent")
+app.add_typer(events_app, name="events")
+app.add_typer(mcp_app, name="mcp")
 
 # Common options
 Username = typer.Option(None, "--username", "-u", envvar="AIRSPRINT_USERNAME", help="Login email")
@@ -1530,7 +1583,8 @@ def user_update(
 @trips_app.command("list")
 def trips_list(
     upcoming: bool = typer.Option(True, "--upcoming/--past", help="Show upcoming (default) or past trips"),
-    limit: int = typer.Option(25, "--limit", "-n", help="Max trips to return"),
+    limit: int = typer.Option(25, "--limit", "-n", min=1, max=200, help="Max trips to return"),
+    offset: int = typer.Option(0, "--offset", min=0, help="Continue from page.nextOffset"),
     timezone: Optional[str] = Timezone,
     username: Optional[str] = Username,
     password: Optional[str] = Password,
@@ -1553,7 +1607,7 @@ def trips_list(
 
     payload = {
         "sort": [{"departureDate": sort_dir}],
-        "page": {"limit": limit, "offset": 0},
+        "page": {"limit": limit, "offset": offset},
         "filter": {
             "departureTime": time_filter,
             "accountId": account_ids,
@@ -1561,7 +1615,7 @@ def trips_list(
     }
     resp = api_post(token, "/my-leg", payload)
     items = resp.get("data", {}).get("items", [])
-    _out(items, fmt, compact)
+    _out(items, fmt, compact, page=_collection_page(resp, offset, limit))
 
 
 @trips_app.command("get")
@@ -3050,7 +3104,8 @@ def explore_counts(
 @messages_app.command("list")
 def messages_list(
     unread: Optional[bool] = typer.Option(None, "--unread/--all", help="Filter unread only"),
-    limit: int = typer.Option(25, "--limit", "-n", help="Max results"),
+    limit: int = typer.Option(25, "--limit", "-n", min=1, max=200, help="Max results"),
+    offset: int = typer.Option(0, "--offset", min=0, help="Continue from page.nextOffset"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
@@ -3062,11 +3117,11 @@ def messages_list(
         filt["isRead"] = False
     resp = api_post(token, "/my-notifications", {
         "sort": [],
-        "page": {"limit": limit, "offset": 0},
+        "page": {"limit": limit, "offset": offset},
         "filter": filt,
     })
     items = resp.get("data", {}).get("items", [])
-    _out(items, fmt)
+    _out(items, fmt, page=_collection_page(resp, offset, limit))
 
 
 @messages_app.command("read")
@@ -6947,15 +7002,80 @@ def auth_reset_confirm(
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+
+@agent_app.command("commands")
+def agent_commands(group: Optional[str] = typer.Option(None, "--group", help="Limit discovery to one command group"),
+                   query: Optional[str] = typer.Option(None, "--query", help="Search command names and descriptions")):
+    """List public commands and their effects without credentials or network calls."""
+    from airsprint_agent import CommandRegistry
+    print(json.dumps({"status": "ok", "data": CommandRegistry(sys.modules[__name__]).catalog(group, query)}, separators=(",", ":")))
+
+
+@agent_app.command("describe")
+def agent_describe(command: str = typer.Option(..., "--command", help="Exact command, e.g. 'customs prepare'")):
+    """Return one command's typed form, required fields, effects and workflow guidance."""
+    from airsprint_agent import CommandRegistry
+    print(json.dumps({"status": "ok", "data": CommandRegistry(sys.modules[__name__]).describe(command)}, separators=(",", ":")))
+
+
+@agent_app.command("serve")
+def agent_serve():
+    """Run typed JSON-line requests in one process. One request and result per line."""
+    from airsprint_agent import serve_jsonl
+    serve_jsonl(sys.modules[__name__])
+
+
+def _event_store():
+    from airsprint_events import EventStore, default_db_path
+    owner = os.getenv("AIRSPRINT_USERNAME", "").strip().lower() or "local"
+    return EventStore(default_db_path(), owner)
+
+
+@agent_app.command("operation")
+def agent_operation(operation_key: str = typer.Option(..., "--operation-key", help="Stable key used for the original write")):
+    """Inspect a write receipt without another AirSprint request."""
+    print(json.dumps({"status": "ok", "data": _event_store().operation(operation_key)}))
+
+
+@events_app.command("list")
+def events_list(after: int = typer.Option(0, "--after", min=0), limit: int = typer.Option(50, "--limit", min=1, max=100)):
+    """Read observed events after a local sequence number."""
+    print(json.dumps({"status": "ok", "data": _event_store().list_events(after, limit)}))
+
+
+@events_app.command("get")
+def events_get(source: str = typer.Option(..., "--source", help="notifications or trips"), resource_id: str = typer.Option(..., "--id")):
+    """Read an observed record without refreshing AirSprint."""
+    if source not in {"notifications", "trips"}:
+        _die("Source must be notifications or trips.")
+    print(json.dumps({"status": "ok", "data": _event_store().record(source, resource_id)}))
+
+
+@events_app.command("status")
+def events_status():
+    """Show collection timestamps, active subscriptions and queued deliveries."""
+    print(json.dumps({"status": "ok", "data": _event_store().status()}))
+
+
+@events_app.command("collect")
+def events_collect():
+    """Collect one complete snapshot from safe lists; the first snapshot is silent."""
+    from airsprint_events import collect
+    print(json.dumps({"status": "ok", "data": collect(sys.modules[__name__], _event_store())}))
+
+
+@mcp_app.command("serve")
+def mcp_serve(
+    transport: str = typer.Option("stdio", "--transport", help="stdio or http (MCP 2026-07-28)"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8765, "--port", min=1, max=65535),
+    interval: int = typer.Option(60, "--interval", min=60, help="Seconds between safe event collection cycles"),
+):
+    """Serve typed tools and durable event subscriptions for one authenticated owner."""
+    from airsprint_mcp import serve
+    serve(sys.modules[__name__], transport=transport, host=host, port=port, interval=interval)
+
+
 if __name__ == "__main__":
-    try:
-        app()
-    except RuntimeError as exc:
-        # Surface our structured-error JSON cleanly instead of a Python traceback.
-        msg = str(exc)
-        try:
-            parsed = json.loads(msg)
-        except json.JSONDecodeError:
-            parsed = {"status": "error", "message": msg}
-        sys.stderr.write(json.dumps(parsed) + "\n")
-        sys.exit(EXIT_ERROR)
+    from airsprint_agent import cli_main
+    sys.exit(cli_main(sys.modules[__name__]))
