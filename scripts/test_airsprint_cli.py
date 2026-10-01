@@ -16,8 +16,11 @@ import airsprint_cli as cli
 class AirSprintCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.runner = CliRunner()
+        self.addCleanup(patch.stopall)
+        patch("socket.create_connection", side_effect=AssertionError("Tests must stay offline")).start()
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
+        patch.object(cli, "CUSTOMS_DRAFT_DIR", Path(self.temporary.name) / "drafts").start()
         self.passport_scan = Path(self.temporary.name) / "passport.jpg"
         self.passport_scan.write_bytes(b"\xff\xd8\xfftest-passport-scan")
 
@@ -562,7 +565,7 @@ class AirSprintCliTests(unittest.TestCase):
 
     def test_booking_create_builds_exact_android_trip_book_body(self) -> None:
         patches = self.booking_create_patches()
-        with patches[0], patches[1], patches[2], patches[3], patches[4] as read, patch.object(cli, "api_post") as post:
+        with patches[0], patches[1], patches[2], patches[3], patches[4] as read, patch.object(cli, "api_post") as post, patch.object(cli, "_require_booking_share_eligibility", return_value={"basis": "owned-aircraft"}):
             result = self.runner.invoke(cli.app, [
                 "booking", "create",
                 "--leg", "CYUL>CYYZ@2026-09-01T16:00",
@@ -1801,7 +1804,7 @@ class AirSprintCliTests(unittest.TestCase):
         with (
             patch.object(cli, "_guard_booking_probe"),
             patch.object(cli, "get_api_token", return_value="token"),
-            patch.object(cli, "api_get", return_value=self.CUSTOMS_LEG) as read,
+            patch.object(cli, "api_get", side_effect=lambda _t, p: self.CUSTOMS_LEG if p.startswith("/my-leg/") else {"data": {"id": "link-9", "leg": {"id": "leg-1", "passengers": [{**r, "customsDeclarationAlreadySubmitted": False} for r in self.CUSTOMS_LEG["data"]["legPassengers"]]}}}) as read,
         ):
             result = self.runner.invoke(cli.app, [
                 "customs", "create", "--leg-id", "leg-1", "--passengers", "Jane Doe",
@@ -1812,7 +1815,7 @@ class AirSprintCliTests(unittest.TestCase):
 
     def test_customs_create_matches_android_submit_declaration_body(self) -> None:
         result, read = self.customs_dry_run(
-            "--passengers", "Jane Doe, John Roe", "--purpose", "business", "--description", "Meetings",
+            "--passengers", "Jane Doe, John Roe", "--family", "yes", "--purpose", "business", "--description", "Meetings",
             "--link-id", "link-9",
             "--has-pet", "yes",
             "--has-alcohol-or-tobacco", "yes", "--alcohol-type", "wine", "--alcohol-volume", "2 x 750 ml",
@@ -1823,12 +1826,12 @@ class AirSprintCliTests(unittest.TestCase):
         )
 
         self.assertEqual(result.exit_code, 0, result.output)
-        read.assert_called_once_with("token", "/my-leg/leg-1")
+        self.assertEqual(read.call_args_list[0].args, ("token", "/my-leg/leg-1"))
         data = json.loads(result.output)["data"]
         self.assertEqual(data["path"], "/canadianCustomsDeclaration/create")
         self.assertEqual(data["declarations"], 2)
-        self.assertEqual(data["link"], "reusing link link-9")
-        self.assertIn("signature", data["message"].lower())
+        self.assertEqual(data["submissionStatus"]["linkId"], "link-9")
+        self.assertIn("Local draft", data["message"])
         self.assertEqual(data["payload"], {
             "canadianCustomsDeclationLinkId": "link-9",
             "legPassengerIds": ["leg-passenger-1", "leg-passenger-2"],
@@ -1863,7 +1866,7 @@ class AirSprintCliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         data = json.loads(result.output)["data"]
         self.assertEqual(data["payload"], {
-            "canadianCustomsDeclationLinkId": "(new link for leg leg-1)",
+            "canadianCustomsDeclationLinkId": "<link created at submission>",
             "legPassengerIds": ["leg-passenger-1"],
             "date": "2026-09-02T04:00:00.000Z",
             "purposeOfTravel": "PLEASURE",
@@ -1874,109 +1877,7 @@ class AirSprintCliTests(unittest.TestCase):
             "importedGoodsFromUS": False,
             "hasHighValueCurrency": False,
         })
-        self.assertIn('/canadian-customs-declaration-link/create {"legId": "leg-1"}', data["link"])
-
-    def test_customs_create_requires_every_answer_and_the_details_behind_yes(self) -> None:
-        cases = [
-            (["--has-pet", "no"], "--has-alcohol-or-tobacco"),
-            ([*self.CUSTOMS_ANSWERED_NO, "--has-alcohol-or-tobacco", "yes"], "--alcohol-type"),
-            ([*self.CUSTOMS_ANSWERED_NO, "--has-imported-goods", "yes", "--imported-goods", "Watch",
-              "--imported-goods-currency", "CAD"], "--imported-goods-from-us"),
-            ([*self.CUSTOMS_ANSWERED_NO, "--has-imported-goods", "yes", "--imported-goods", "Watch",
-              "--imported-goods-currency", "EUR", "--imported-goods-from-us", "no"], "CAD, USD"),
-            ([*self.CUSTOMS_ANSWERED_NO, "--has-high-value-currency", "yes"], "--high-value-currency-description"),
-            ([*self.CUSTOMS_ANSWERED_NO, "--purpose", "business"], "--description"),
-            ([*self.CUSTOMS_ANSWERED_NO, "--date", "2026-09-02T10:00"], "YYYY-MM-DD"),
-            ([*self.CUSTOMS_ANSWERED_NO, "--passengers", "A,B,C,D,E"], "at most 4"),
-            ([*self.CUSTOMS_ANSWERED_NO, "--has-alcohol-or-tobacco", "yes", "--alcohol-type", "wine",
-              "--alcohol-volume", "1 bottle", "--alcohol-value-cad", "forty"], "--alcohol-value-cad"),
-        ]
-        for extra, expected in cases:
-            with self.subTest(extra=extra):
-                result, read = self.customs_dry_run(*extra)
-                self.assertEqual(result.exit_code, cli.EXIT_VALIDATION, result.output)
-                self.assertIn(expected, result.output)
-                read.assert_not_called()
-
-        no_tz = self.runner.invoke(cli.app, [
-            "customs", "create", "--leg-id", "leg-1", "--passengers", "Jane Doe", "--purpose", "pleasure",
-            "--date", "2026-09-02", *self.CUSTOMS_ANSWERED_NO, "--dry-run",
-        ], env={"AIRSPRINT_TIMEZONE": ""})
-        self.assertEqual(no_tz.exit_code, cli.EXIT_VALIDATION, no_tz.output)
-        self.assertIn("--timezone", no_tz.output)
-
-    def test_customs_create_creates_the_declaration_link_first_like_the_app(self) -> None:
-        responses = [{"data": {"id": "link-77"}}, {"data": {"id": "declaration-1"}}]
-        with (
-            patch.object(cli, "_guard_booking_probe"),
-            patch.object(cli, "get_api_token", return_value="token"),
-            patch.object(cli, "api_get", return_value=self.CUSTOMS_LEG),
-            patch.object(cli, "api_post", side_effect=responses) as write,
-        ):
-            result = self.runner.invoke(cli.app, [
-                "customs", "create", "--leg-id", "leg-1", "--passengers", "Jane Doe",
-                "--purpose", "pleasure", "--date", "2026-09-02", "--timezone", "America/Montreal",
-                *self.CUSTOMS_ANSWERED_NO,
-            ])
-
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertEqual(write.call_count, 2)
-        self.assertEqual(
-            write.call_args_list[0].args,
-            ("token", "/canadian-customs-declaration-link/create", {"legId": "leg-1"}),
-        )
-        path, body = write.call_args_list[1].args[1:]
-        self.assertEqual(path, "/canadianCustomsDeclaration/create")
-        self.assertEqual(body["canadianCustomsDeclationLinkId"], "link-77")
-        self.assertEqual(json.loads(result.output)["data"]["linkId"], "link-77")
-
-        with (
-            patch.object(cli, "_guard_booking_probe"),
-            patch.object(cli, "get_api_token", return_value="token"),
-            patch.object(cli, "api_get", return_value=self.CUSTOMS_LEG),
-            patch.object(cli, "api_post", return_value={"data": {"id": "declaration-2"}}) as write,
-        ):
-            result = self.runner.invoke(cli.app, [
-                "customs", "create", "--leg-id", "leg-1", "--passengers", "Jane Doe",
-                "--purpose", "pleasure", "--date", "2026-09-02", "--timezone", "America/Montreal",
-                "--link-id", "link-9", *self.CUSTOMS_ANSWERED_NO,
-            ])
-        self.assertEqual(result.exit_code, 0, result.output)
-        write.assert_called_once()
-        self.assertEqual(write.call_args.args[1], "/canadianCustomsDeclaration/create")
-        self.assertEqual(write.call_args.args[2]["canadianCustomsDeclationLinkId"], "link-9")
-
-    def test_customs_booking_mode_resolves_leg_passenger_on_the_canadian_departure(self) -> None:
-        trip = {"data": {"legs": [
-            {
-                "id": "leg-us",
-                "departureAirport": {"address": {"country": "United States"}},
-                "passengers": [{"id": "leg-passenger-us", "passenger": {"id": "s", "firstName": "Jane", "lastName": "Doe"}}],
-            },
-            {
-                "id": "leg-1",
-                "departureAirport": {"address": {"country": "Canada"}},
-                "passengers": [{"id": "leg-passenger-1", "passenger": {"id": "s", "firstName": "Jane", "lastName": "Doe"}}],
-            },
-        ]}}
-        with (
-            patch.object(cli, "_guard_booking_probe"),
-            patch.object(cli, "get_api_token", return_value="token"),
-            patch.object(cli, "_resolve_trip_uuid", return_value="trip-uuid"),
-            patch.object(cli, "api_get", return_value=trip) as read,
-        ):
-            result = self.runner.invoke(cli.app, [
-                "customs", "create", "--booking", "ABCDE", "--passengers", "Jane Doe",
-                "--purpose", "pleasure", "--date", "2026-09-01", "--timezone", "America/Montreal",
-                *self.CUSTOMS_ANSWERED_NO, "--dry-run",
-            ])
-
-        self.assertEqual(result.exit_code, 0, result.output)
-        read.assert_called_once_with("token", "/trip/trip-uuid")
-        data = json.loads(result.output)["data"]
-        self.assertEqual(data["payload"]["legPassengerIds"], ["leg-passenger-1"])
-        self.assertEqual(data["payload"]["canadianCustomsDeclationLinkId"], "(new link for leg leg-1)")
-        self.assertEqual(data["payload"]["date"], "2026-09-01T04:00:00.000Z")
+        self.assertEqual(data["submissionStatus"], "unverified-until-link-created")
 
     def test_manifest_highlights_extract_ops_fields(self) -> None:
         text = """Trip Sheet
@@ -2334,7 +2235,6 @@ class AirSprintCliTests(unittest.TestCase):
             (["user", "get", "--id", "user-id"], "/user/user-id"),
             (["files", "get", "--id", "file-id"], "/my-file/file-id"),
             (["files", "public-get", "--id", "file-id"], "/file-public/file-id"),
-            (["customs", "link-get", "--id", "link-id"], "/canadian-customs-declaration-link/link-id"),
             (["quote", "aircraft-get", "--id", "aircraft-id"], "/aircraft/aircraft-id"),
             (["content", "get", "--id", "content-id"], "/content/content-id"),
             (["content", "faq-get", "--id", "faq-id"], "/faq/faq-id"),

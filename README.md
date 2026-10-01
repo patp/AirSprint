@@ -1,18 +1,18 @@
 # AirSprint CLI
 
 Agent-safe command-line access to the current `api.airsprint.com` owner API,
-audited against AirSprint Android 6.1.10 (version code 133).
+audited against AirSprint Android 6.1.12 (version code 135).
 
-The offline source audit found 112 Android repository calls and 105 unique
+The offline source audit found 111 Android repository calls and 105 unique
 method/route contracts; the complete matrix and APK checksum are in
 [ANDROID_CONTRACT.md](ANDROID_CONTRACT.md).
 
-The [2026-09-16 audit report](AUDIT_2026-09-16.md) records the source evidence,
+The [2026-10-01 audit report](AUDIT_2026-10-01.md) records the source evidence,
 corrections, offline validation and remaining limits. Route regression tests
 compare the implementation with the extracted Android inventory.
 
 Every write is a **form**: agents answer questions with typed options and the
-CLI builds the exact Android 6.1.10 request. No public command accepts JSON or
+CLI builds the exact Android 6.1.12 request. No public command accepts JSON or
 API field names — only IDs (passenger, passport, pet, flight, trip, leg,
 airport, aircraft) cross the boundary. This keeps agents away from the wire
 format and lets the CLI add guard rails without changing how it is driven.
@@ -248,34 +248,44 @@ python3 scripts/airsprint_cli.py pet upload-document \
 
 ### Canadian customs
 
-```bash
-python3 scripts/airsprint_cli.py customs create \
-  --booking BOOKING_CODE \
-  --passengers "Jane Doe,John Doe" \
-  --purpose PLEASURE \
-  --date 2026-09-01 --timezone America/Montreal \
-  --has-pet no --has-alcohol-or-tobacco no \
-  --has-imported-goods no --has-high-value-currency no \
-  --dry-run
-```
-
-The command is the app's customs form: it resolves passenger names to
-leg-passenger UUIDs (max 4 per declaration), creates the declaration link the
-app creates when the form opens (or reuses `--link-id`), and creates one
-declaration per person in a single request. Every yes/no question must be
-answered and the details behind a "yes" are required, as in the app.
-`--date` is the form's declaration date (a calendar day, converted from local
-midnight to UTC like the app), so it needs `--timezone`. Card-payment details
-are deliberately not accepted. `customs list` sends only `page` and `filter`;
-it never sends the invalid `sort`. Fix dates with:
+Prepare local drafts for the **actual return leg arriving in Canada**. No
+form or link is submitted during preparation. Missing answers remain visible.
+Draft names use `BOOKING-firstname-lastname.json`; group drafts include every
+full name separated by `--`. Omit `--draft` on creation to generate this name.
+First-name-only aliases and arbitrary filenames are rejected. The example
+below assumes booking code `RETURN`.
 
 ```bash
-python3 scripts/airsprint_cli.py customs update-date \
-  --id DECLARATION_UUID --date 2026-09-01T14:00:00Z --confirm
+python3 scripts/airsprint_cli.py customs prepare \
+  --leg-id RETURN_LEG_UUID --passengers "Jane Doe,John Roe" --draft RETURN-jane-doe--john-roe.json
+python3 scripts/airsprint_cli.py customs review --draft RETURN-jane-doe--john-roe.json
+# Fill/correct answers using customs prepare --draft RETURN-jane-doe--john-roe.json [typed options].
+# After showing and confirming each person's information individually:
+python3 scripts/airsprint_cli.py customs certify --draft RETURN-jane-doe--john-roe.json --passenger "Jane Doe" --approve yes
+python3 scripts/airsprint_cli.py customs certify --draft RETURN-jane-doe--john-roe.json --passenger "John Roe" --approve yes
+# On the owner's final instruction:
+python3 scripts/airsprint_cli.py customs submit --draft RETURN-jane-doe--john-roe.json --confirm
+python3 scripts/airsprint_cli.py customs status --link-id RETURN_LINK_UUID
 ```
 
-Certification/signature is not in the API and must still be completed in the
-AirSprint app.
+One form per person; `--family yes` groups at most four family members living
+at the same address, with individual certifications still required. Edits
+clear certifications. Submission checks the same itinerary, passport and
+address data and reads `customsDeclarationAlreadySubmitted` for each person.
+Already-submitted, unknown or uncertain status blocks another submission.
+A private journal also prevents replay from a new draft after an interrupted
+request. No retry or automatic read-back occurs.
+
+`customs create` now only prepares a local draft. Post-submission date edits
+are retired. See [the full workflow](SKILL.md#canadian-customs-prepare-review-certify-each-person-submit).
+
+### Trip passport audit
+
+`leg audit-travel-info --leg-id ID` shows the actual trip-profile IDs,
+passport selections, attached scans, addresses and customs status. Use
+`passport list --passenger-id ID` for unsaved guests. A same-named saved
+profile does not establish that its passport is attached to the booked leg.
+PDF, JPEG and PNG remain supported.
 
 ## Other current groups
 
@@ -288,7 +298,7 @@ AirSprint app.
 | `explore` | Empty and shared flights; use `flights --compact` |
 | `network` | Current connections and sharing groups |
 | `passenger`, `passport`, `pet` | Saved traveler data and documents |
-| `customs` | Canadian declarations and date correction |
+| `customs` | Canadian drafts, individual certification, submission and status |
 | `quote`, `hours` | Quotes, airports, aircraft, Hours Exchange |
 | `messages`, `feedback` | Notifications and the post-flight questionnaire |
 | `files`, `content` | File resolution, FAQ, policy, system and concierge content |
@@ -303,12 +313,12 @@ agents.
 
 ```bash
 python3 -m unittest discover -s scripts -p 'test_*.py' -v
-python3 -m py_compile scripts/airsprint_cli.py scripts/test_airsprint_cli.py
-ruff check scripts/airsprint_cli.py scripts/test_airsprint_cli.py
+python3 -m py_compile scripts/*.py
+ruff check scripts
 git diff --check
 ```
 
 The test suite includes a guard that fails if any public command grows a
 `--body`, `--json`, `--payload`, or `--options` option, and exact-body tests
 that compare each form's request with the payload models decompiled from
-Android 6.1.10.
+Android 6.1.12.

@@ -6,7 +6,7 @@ description: Use the local AirSprint owner CLI for trips, booking, passengers, p
 # AirSprint CLI agent guide
 
 Use this CLI for AirSprint owner operations against `https://api.airsprint.com/api`.
-It follows the current AirSprint Android 6.1.10 API. Retired prod2, follower, and
+It follows the current AirSprint Android 6.1.12 API. Retired prod2, follower, and
 known-broken passport PATCH commands are intentionally absent.
 The source audit covers all 105 unique Android method/route contracts; see
 `ANDROID_CONTRACT.md` for the checksum and complete mapping.
@@ -39,7 +39,7 @@ it never prints the full token.
 
 Every command that writes to AirSprint is a form: you answer questions with
 options (`--leg`, `--passengers`, `--catering yes`, ...) and the CLI builds the
-exact Android 6.1.10 request body itself. No public command accepts JSON, a
+exact Android 6.1.12 request body itself. No public command accepts JSON, a
 `--body`, or any API field name. You never need to know the wire format.
 
 - IDs are the only internals you handle: passenger, passport, pet, flight,
@@ -79,7 +79,8 @@ exact Android 6.1.10 request body itself. No public command accepts JSON, a
 - The CLI records live booking writes in `~/.airsprint_last_booking_write.json`.
 - `trips get`, `trips show`, `trips tripsheet`, `trips flight-get`, `trips
   leg-get`, `leg update-passengers`, `leg update-required-info`, and high-level
-  `customs create` default to no probe during that cooldown.
+  `customs prepare`, `customs submit` and `leg audit-travel-info` default to
+  no probe during that cooldown.
 - Only use `--probe` to override the cooldown when the user explicitly wants an
   immediate read and understands that it can notify the app.
 - The first safe API read may retry once only for `WRONG_VERSION_NUMBER`.
@@ -161,6 +162,9 @@ and destination checks first read airports and passengers; nothing is written):
   single leg afterwards with `leg update-required-info`.
 - Seats default to the number of passengers. `--aircraft-id` defaults to the
   account's aircraft.
+- Sharing requires the selected aircraft to belong to the active account,
+  or CJ2+ with Embraer Infinity access (Android 6.1.12). The CLI checks the
+  active account rather than combining rights from different accounts.
 - Sharing is off by default. `--open-to-share yes` with `--share-network
   my-network|airsprint-network`, `--share-seats`, `--share-groups`,
   `--share-pets-allowed`, `--share-children-allowed`, and
@@ -191,9 +195,9 @@ python3 scripts/airsprint_cli.py booking lock --flight-id FLIGHT_UUID --release 
 ```
 
 An existing-flight booking never carries a customs declaration: the app's
-`BookSharedPassenger` sends only `id` and `destinationAddress`. Declare customs
-with `customs create` and attach the declaration afterwards with
-`leg update-required-info --customs`.
+`BookSharedPassenger` sends only `id` and `destinationAddress`. Prepare Canadian
+customs on the actual return leg with `customs prepare`,
+then review, certify each traveller and submit separately.
 
 Cancellation is one confirmed request with no read-back:
 
@@ -210,7 +214,8 @@ Android 6.1.10 sends only `legId` and `reason`; do not add a booking code,
 ## Updating passengers on a booked leg
 
 `PATCH /leg/{id}` replaces the passenger list completely. The CLI always sends
-the full current list, keyed by saved passenger UUID, never `legPassenger.id`.
+the full current list, keyed by the actual passenger-profile UUID (including
+unsaved guests), never `legPassenger.id`.
 It reads that list once through the owner's `GET /my-leg/{id}` route.
 
 ```bash
@@ -224,7 +229,7 @@ python3 scripts/airsprint_cli.py leg update-passengers \
 ```
 
 The command refuses to PATCH if any existing leg passenger cannot be mapped to
-a saved passenger UUID. This prevents accidental passenger loss.
+a passenger-profile UUID. This prevents accidental passenger loss.
 A missing or malformed passenger-list field is also refused; it is never
 treated as an empty list.
 
@@ -258,6 +263,15 @@ Passengers cannot be added or dropped here; use `leg update-passengers`.
 Airports, aircraft, date, and share settings are not editable through this form.
 
 ## Saved passengers and passports
+
+Use `leg audit-travel-info --leg-id ID` to inspect the **actual trip profiles**.
+The operation's passenger UUID can differ from a same-named Saved Passenger;
+reconciliation by AirSprint/FL3XX can leave an old selection pointing to a
+passport on a different profile. Do not create replacements from names alone.
+`passport list --passenger-id ACTUAL_ID` includes an unsaved guest that the
+saved-passenger list omits. Check number, dates, nationality, authority and
+scan separately, and preserve exact trip IDs. PDF, JPEG and PNG are supported.
+The leg audit also shows customs submission status per traveller.
 
 `passport list` performs one bounded `POST /my-passenger` read and flattens the
 exact embedded `passports` records. Do not call `POST /my-passport`; the
@@ -374,9 +388,11 @@ python3 scripts/airsprint_cli.py passport update-authority \
   --id PASSPORT_UUID --authority 'OTTAWA' --confirm
 ```
 
-The app displays the first passport of a passenger and uses it when booking;
-`selectedPassportId` does not persist. Reorder with one passenger GET and one
-PATCH:
+On a saved passenger profile, the app displays the first passport and uses
+it when booking; a saved-profile `selectedPassportId` update does not persist.
+An existing leg has its own selection: preserve it and inspect the actual trip
+profile. To change the saved profile's default, reorder with one passenger GET
+and one PATCH:
 
 ```bash
 python3 scripts/airsprint_cli.py passport make-primary \
@@ -387,53 +403,110 @@ python3 scripts/airsprint_cli.py passport make-primary \
 
 `make-primary` only reorders a passport already attached to that passenger.
 
-## Canadian customs
+## Canadian customs: prepare, review, certify each person, submit
 
-`customs create` is the app's "Canadian Customs Declaration" form. Name the
-passengers of one leg leaving Canada (max 4 per declaration, same address);
-the CLI resolves their leg-passenger IDs, creates the declaration link the app
-creates when the form opens, and submits one declaration per person.
+Canadian declarations belong to the **specific active leg arriving in Canada**.
+The outbound and return have different leg-passenger IDs and different links.
+A submitted outbound form does not complete the return. `--booking` selects
+exactly one active Canadian arrival; ambiguous itineraries need `--leg-id`.
 
-```bash
-python3 scripts/airsprint_cli.py customs create \
-  --booking BOOKING_CODE \
-  --passengers "Jane Doe,John Doe" \
-  --purpose PLEASURE \
-  --date 2026-09-01 --timezone America/Montreal \
-  --has-pet no \
-  --has-alcohol-or-tobacco yes --alcohol-type wine --alcohol-volume "2 x 750 ml" --alcohol-value-cad 45.50 \
-  --has-imported-goods no \
-  --has-high-value-currency no \
-  --souvenir-items "Maple syrup" \
-  --dry-run
-```
-
-- Every yes/no question must be answered; the details behind a "yes" are
-  required, exactly as the app validates: alcohol/tobacco needs type, volume
-  and CAD value; imported goods need a description, `--imported-goods-currency`
-  (`CAD | USD`) and `--imported-goods-from-us yes|no`; high-value currency
-  needs a description. `--description` is required for `BUSINESS`.
-- `--date` is the form's "Date" (the Traveller Declaration Form section), a
-  calendar day. It needs `--timezone`/`AIRSPRINT_TIMEZONE` because the app
-  sends that day's local midnight in UTC. The departure date is not part of
-  the request; the server already knows it from the leg.
-- `--link-id` reuses a link from `customs link-create`; omit it and the CLI
-  creates one for the leg first, as the app does.
-- `--leg-id` reads the booked leg once with `GET /my-leg/{id}` to resolve
-  the leg-passenger IDs.
-- Payment-authorization card details are deliberately not accepted;
-  certification/signature stays in the AirSprint app.
+1. Start a **local draft** with `customs prepare` (`customs create` is now an
+   alias that also only prepares). It reads the leg once and an existing
+   declaration link once, and makes **no API writes**, including link creation.
+   Missing answers stay visible as blockers. Draft files are private (0600).
+   Filenames always include the booking code and full first/last name:
+   `BOOKING-firstname-lastname.json`. Accents are normalized; a group includes
+   every full name separated by `--`. Omit `--draft` to generate the name.
+   Explicit paths must use that same filename; first-name-only aliases and
+   UUID filenames are rejected. Existing drafts are never overwritten by a
+   new preparation. Passenger selection also requires the full name.
+2. Gather each traveller's answers. Never invent "no", reuse another trip's
+   purpose, or infer certification from a booking approval. Compare the
+   passport scan with the actual trip profile, including authority and dates.
+   Show route, local dates/times, actual passenger and passport IDs, destination
+   address, all customs answers and existing submission status.
+3. Correct answers with `customs prepare --draft FILE` and typed options.
+   This is offline. `--refresh` reads the same leg/link again after travel
+   information was corrected. **Any edit or refresh clears all certifications.**
+4. Present each person's complete information **one at a time**, quote the
+   app's statement, and ask for that person's explicit certification. Only
+   after that answer run `customs certify --passenger NAME --approve yes`.
+   Never certify everyone from one general approval. `--approve no` removes
+   a certification. This step only saves local state.
+5. Once all individual certifications exist, show the final recap. On the
+   owner's explicit final submission instruction run `customs submit --confirm`.
+   The CLI rechecks the leg, passports, address and per-passenger submitted
+   status before sending. Changed data requires another review/certification.
 
 ```bash
-python3 scripts/airsprint_cli.py customs update-date \
-  --id DECLARATION_UUID --date 2026-09-01T14:00:00Z --dry-run
-python3 scripts/airsprint_cli.py customs update-date \
-  --id DECLARATION_UUID --date 2026-09-01T14:00:00Z --confirm
+# Incomplete local draft: no answers are invented and no declaration is sent.
+python3 scripts/airsprint_cli.py customs prepare \
+  --leg-id RETURN_LEG_UUID --passengers "Jane Doe,John Roe" \
+  --draft /private/path/RETURN-jane-doe--john-roe.json
+
+# Fill answers explicitly after collecting them. These are examples, not defaults.
+python3 scripts/airsprint_cli.py customs prepare --draft /private/path/RETURN-jane-doe--john-roe.json \
+  --purpose PLEASURE --date 2026-10-07 --timezone America/Toronto \
+  --has-pet no --has-alcohol-or-tobacco no \
+  --has-imported-goods no --has-high-value-currency no
+python3 scripts/airsprint_cli.py customs review --draft /private/path/RETURN-jane-doe--john-roe.json
+
+# Run each only after that person's information has been shown and certified.
+python3 scripts/airsprint_cli.py customs certify --draft /private/path/RETURN-jane-doe--john-roe.json \
+  --passenger "Jane Doe" --approve yes
+python3 scripts/airsprint_cli.py customs certify --draft /private/path/RETURN-jane-doe--john-roe.json \
+  --passenger "John Roe" --approve yes
+# Separate, final instruction to submit:
+python3 scripts/airsprint_cli.py customs submit --draft /private/path/RETURN-jane-doe--john-roe.json --confirm
 ```
 
-`customs list` sends only `page` and `filter`; never add `sort` because the API
-returns 400. Signature/certification is not exposed by the API. Always tell the
-owner to complete the signature in the app.
+The statement is: **"I certify that the above declaration is true and complete.
+By checking this box, I confirm my agreement."** Android 6.1.12 keeps this
+checkbox locally; its repository submits the form without an
+`agreedToDeclaration` field or separate signature endpoint. Do not tell the
+owner to sign again after a confirmed submission. "Submitted" means accepted
+by the AirSprint form API, not customs clearance.
+
+**One form per person by default.** `--family yes` explicitly confirms all
+named travellers are family residing at the same address; at most four can
+share one form. A common hotel does not establish a shared home address.
+Every person still needs an individual certification. When answers differ,
+prepare separate drafts per person; never copy one person's answers to others.
+
+Every yes/no question must be answered before certification. A "yes" requires
+its details: alcohol/tobacco type, volume and CAD value; imported-goods
+items, currency (`CAD|USD`) and U.S. origin; high-value-currency description.
+`BUSINESS` requires `--description`. `--date` is the Traveller Declaration
+Form's calendar date, converted from device-local midnight using `--timezone`;
+it is not automatically the outbound departure date. Card details are omitted.
+
+### Submitted status and duplicate protection
+
+```bash
+python3 scripts/airsprint_cli.py customs status --link-id RETURN_LINK_UUID --compact
+python3 scripts/airsprint_cli.py leg audit-travel-info --leg-id RETURN_LEG_UUID
+python3 scripts/airsprint_cli.py passport list --passenger-id ACTUAL_TRIP_PASSENGER_UUID
+```
+
+`status` (also `link-get`) exposes `customsDeclarationAlreadySubmitted` and
+`submissionStatus: submitted|not-submitted` for **each passenger on that leg**,
+including false values in compact mode. The leg's `customsDeclarationId` names
+this link; it is not one traveller's declaration record ID. Missing/ambiguous
+status blocks submission. `customs list` alone is not a completeness check.
+
+- Already submitted passengers block the whole attempted submission. Prepare
+  only the remaining people, with their own answers and certifications.
+- Before each form POST, the CLI saves a journal entry. Success records the
+  returned declaration IDs. A timeout, interruption, or malformed response
+  remains blocked as `uncertain`/`submitting`; **never rerun or make a new
+  draft to retry**. Check the server status and resolve with AirSprint first.
+- The journal also blocks another draft for the same leg-passenger IDs and
+  serializes submissions on this machine. Never run submissions concurrently
+  on different machines; the API has no verified idempotency-key contract.
+- No automatic retry or post-write read-back occurs. Local submitted drafts
+  cannot be edited or resubmitted. The old `customs update-date` write is retired.
+- `AIRSPRINT_CUSTOMS_DRAFT_DIR` can set the private draft/journal directory;
+  default `drafts/customs/` under the CLI installation. Keep the journal across deployments.
 
 ## Surveys and feedback
 

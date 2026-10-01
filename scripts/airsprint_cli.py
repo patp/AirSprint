@@ -25,6 +25,8 @@ if __name__ == "__main__" and sys.argv[1:] == ["--skill"]:
     raise SystemExit(0)
 
 import json
+import hashlib
+import fcntl
 import mimetypes
 import os
 import re
@@ -32,6 +34,7 @@ import ssl
 import subprocess
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone as _tz_utc
 from typing import Any, Callable, Optional
 from urllib.error import HTTPError, URLError
@@ -50,11 +53,12 @@ import typer
 # ---------------------------------------------------------------------------
 
 API_BASE_URL = "https://api.airsprint.com/api"
-ANDROID_APP_VERSION = "6.1.10"
-ANDROID_APP_VERSION_CODE = 133
+ANDROID_APP_VERSION = "6.1.12"
+ANDROID_APP_VERSION_CODE = 135
 API_TOKEN_CACHE = Path.home() / ".airsprint_api_token.json"
 DATA_CACHE = Path.home() / ".airsprint_cache.json"  # local mirror: airports, aircraft
 BOOKING_WRITE_GUARD = Path.home() / ".airsprint_last_booking_write.json"
+CUSTOMS_DRAFT_DIR = Path(os.environ.get("AIRSPRINT_CUSTOMS_DRAFT_DIR", str(Path(__file__).resolve().parents[1] / "drafts" / "customs")))
 BOOKING_READ_COOLDOWN_SECONDS = 8
 DATA_CACHE_TTL = 7 * 24 * 3600  # 7 days
 ACCOUNT_CACHE_TTL = 15 * 60
@@ -192,13 +196,16 @@ def _http(
                 if not raw:
                     return {}
                 try:
-                    return json.loads(raw)
+                    result = json.loads(raw)
                 except json.JSONDecodeError as exc:
                     raise RuntimeError(json.dumps({
                         "status": "error",
                         "message": "API returned a non-JSON response",
                         "content_type": resp.headers.get("Content-Type", ""),
                     })) from exc
+                if api_request:
+                    _check_api_response(result)
+                return result
         except HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(
@@ -213,6 +220,30 @@ def _http(
                 json.dumps({"status": "error", "message": msg})
             ) from exc
     raise AssertionError("unreachable")
+
+
+def _check_api_response(response: Any) -> None:
+    """Android APIClient checks the envelope's HTTP code even on HTTP 200.
+
+    For example, a refused /flight/lock must remain a failed request. Do not
+    retry it or let the output formatter discard the failure envelope.
+    """
+    if not isinstance(response, dict):
+        return
+    code = response.get("httpStatusCode")
+    if code is None:
+        return
+    if type(code) is not int:
+        raise RuntimeError(json.dumps({
+            "status": "error", "message": "API returned an invalid httpStatusCode.",
+        }))
+    if not 200 <= code < 300:
+        message = next((response[key] for key in ("failureMessage", "httpStatusReason", "message")
+                        if isinstance(response.get(key), str) and response[key].strip()), "API request failed")
+        error = {"status": "error", "http_code": code, "message": message}
+        if isinstance(response.get("status"), str):
+            error["api_status"] = response["status"]
+        raise RuntimeError(json.dumps(error))
 
 
 def _multipart_value(value: Any, field: str) -> str:
@@ -896,7 +927,7 @@ def _out(data: Any, fmt: str = "json", compact: bool = False) -> None:
     API-derived data is passed through _present(); dry-run previews (top-level
     "dry_run": true) are printed exactly as they would be sent.
     """
-    is_dry_run = isinstance(data, dict) and data.get("dry_run") is True
+    is_dry_run = isinstance(data, dict) and (data.get("dry_run") is True or data.get("localDraft") is True)
     if _PRESENT_OUTPUT and not is_dry_run:
         data = _present(data)
     if compact and not is_dry_run:
@@ -1892,6 +1923,57 @@ def _build_share_settings(
     }
 
 
+def _selection_aircraft(name: str) -> str:
+    """Android SelectionAircraftEnum.getByName, after uppercasing the name."""
+    name = name.upper()
+    return "CJ3" if "CJ3" in name else "CJ2" if "CJ2" in name else "EMBRAER"
+
+
+def _require_booking_share_eligibility(token: str, aircraft_id: str) -> dict[str, str]:
+    """Apply Android 6.1.12 ShareEligibility to a new trip's aircraft.
+
+    Read the actual active account, never union entitlements across accounts
+    or silently change account selection. Only catalog/profile reads occur.
+    New-trip forms have no existing leg status; this command cannot edit a
+    booked leg's sharing settings.
+    """
+    user = _response_data(api_get(token, "/me"))
+    active_id = user.get("activeAccountId") if isinstance(user, dict) else None
+    if not isinstance(active_id, str) or not active_id.strip():
+        _die("Cannot verify sharing: select an active account in the AirSprint app first. No booking sent.", EXIT_VALIDATION)
+    accounts = _get_accounts(token, refresh=True)
+    matching = [account for account in accounts if account.get("id") == active_id]
+    if len(matching) != 1:
+        _die("Cannot verify sharing for the active account. Check the account selected in the AirSprint app. No booking sent.", EXIT_VALIDATION)
+    access = matching[0].get("accessLevels")
+    if not isinstance(access, list) or not all(isinstance(item, dict) for item in access):
+        _die("Cannot verify the active account's aircraft access levels. No booking sent.", EXIT_VALIDATION)
+
+    def text(item: dict[str, Any], key: str) -> str:
+        value = item.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    basis = None
+    owned_ids = {text(item, "aircraftId") for item in access} - {""}
+    if aircraft_id.strip() in owned_ids:
+        basis = "owned-aircraft"
+    elif any(text(item, "aircraftName")
+             and _selection_aircraft(text(item, "aircraftName")) == "EMBRAER"
+             and "INFINITY" in text(item, "accessLevelName").upper() for item in access):
+        aircraft = _response_data(api_get(token, f"/aircraft/{aircraft_id}"))
+        if not isinstance(aircraft, dict) or aircraft.get("id") != aircraft_id or not text(aircraft, "name"):
+            _die("Cannot verify the selected aircraft for sharing. No booking sent.", EXIT_VALIDATION)
+        if _selection_aircraft(text(aircraft, "name")) == "CJ2":
+            basis = "embraer-infinity-cj2"
+    if basis is None:
+        _die(
+            "The active account cannot offer this aircraft for sharing. Android allows an owned aircraft "
+            "or a CJ2 with Embraer Infinity access. Use --open-to-share no or select an eligible account "
+            "in the AirSprint app. No booking sent.", EXIT_VALIDATION,
+        )
+    return {"accountId": active_id, "aircraftId": aircraft_id, "basis": basis}
+
+
 def _build_trip_passenger(
     passenger_id: str,
     passport_id: str | None,
@@ -2256,7 +2338,7 @@ def booking_create(
 ):
     """Book a new trip the way the AirSprint app does (POST /trip/book).
 
-    Answer the booking form with options; the CLI builds Android 6.1.10's exact
+    Answer the booking form with options; the CLI builds Android 6.1.12's exact
     request. Catering, ground transportation, and notes apply to every leg —
     adjust one leg afterwards with `leg update-required-info`. Run
     `booking info` first for aircraft, passenger, and airport IDs.
@@ -2266,6 +2348,7 @@ def booking_create(
     every passenger, a passport on file whose photo/scan has been uploaded
     (AirSprint requires the passport image before departure); US-touching or
     international trips need a destination address (hotel, residence, ...).
+    Sharing requires an eligible aircraft on the active account.
     """
     catering_flag = _yes_no(catering, "--catering")
     ground_flag = _yes_no(ground_transportation, "--ground-transportation")
@@ -2317,6 +2400,7 @@ def booking_create(
         return code if _UUID_RE.match(code) else _resolve_airport(auth(), code)
 
     resolved_aircraft = aircraft_id or _get_default_aircraft(auth())
+    share_eligibility = _require_booking_share_eligibility(auth(), resolved_aircraft) if open_flag else None
 
     passenger_reads: dict[str, Any] = {}
 
@@ -2382,6 +2466,7 @@ def booking_create(
             "passengers": passenger_ids,
             "payload": payload,
             "routeCheck": route_check,
+            **({"shareEligibility": share_eligibility} if share_eligibility else {}),
             "message": "Would POST /trip/book exactly once; no read-back would follow.",
         }, fmt, compact)
         return
@@ -2491,8 +2576,78 @@ def _leg_passenger_payload(row: Any) -> dict[str, Any] | None:
         for key in ("customsDeclarationId", "destinationAddress", "passport"):
             value = row.get(key, nested.get(key))
             if value not in (None, "", [], {}):
-                payload[key] = value
+                payload[key] = _leg_destination_address_update(value) if key == "destinationAddress" else value
+        # Detail responses expose the selection as selectedPassportId rather
+        # than passport:{id}. Keep it when changing another passenger field.
+        if "passport" not in payload and row.get("selectedPassportId"):
+            payload["passport"] = {"id": row["selectedPassportId"]}
     return payload
+
+
+def _audit_leg_travel_info(leg: dict[str, Any]) -> dict[str, Any]:
+    """Inspect the actual trip profiles, which may differ from saved profiles."""
+    passengers = []
+    for row in _leg_passenger_rows(leg):
+        if not isinstance(row, dict):
+            _die("Cannot audit an incomplete leg-passenger record.", EXIT_ERROR)
+        records = row.get("passports") or []
+        records = [p for p in records if isinstance(p, dict)] if isinstance(records, list) else []
+        selected = row.get("selectedPassportId") or (row.get("passport") or {}).get("id")
+        issues = []
+        if not _saved_passenger_id(row):
+            issues.append("missingPassengerId")
+        if not records:
+            issues.append("noPassportOnTripProfile")
+        passport = next((p for p in records if p.get("id") == selected), None) if selected else next(iter(records), None)
+        if selected and passport is None:
+            issues.append("selectedPassportNotOnTripProfile")
+        if passport is not None:
+            if not passport.get("passportNumber"):
+                issues.append("missingPassportNumber")
+            if not _passport_scan_attached(passport):
+                issues.append("missingPassportScan")
+        address = row.get("destinationAddress")
+        address_complete = isinstance(address, dict) and all(address.get(k) for k in ("street", "city", "state", "zip"))
+        passengers.append({
+            "name": _passenger_name(row), "passengerId": _saved_passenger_id(row),
+            "legPassengerId": _leg_passenger_id(row), "selectedPassportId": selected,
+            "passportIds": [p.get("id") for p in records],
+            "passportNumberEnding": str(passport.get("passportNumber", ""))[-4:] if passport else None,
+            "scanAttached": _passport_scan_attached(passport) if passport else False,
+            "destinationAddressComplete": address_complete,
+            "issues": issues,
+        })
+    return {
+        "legId": leg.get("id"), "bookingId": leg.get("bookingId"), "passengers": passengers,
+        "customsLinkId": leg.get("customsDeclarationId"),
+        "message": "Trip-profile IDs can differ from Saved Passengers. Use these passenger IDs for this leg. "
+                   "A scan and matching IDs do not verify the printed passport data. "
+                   "Use customs link-get to check customsDeclarationAlreadySubmitted for each passenger.",
+    }
+
+
+@leg_app.command("audit-travel-info")
+def leg_audit_travel_info(
+    leg_id: str = typer.Option(..., "--leg-id"),
+    probe: bool = typer.Option(False, "--probe/--no-probe"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Check trip-profile passport links, scans and addresses with one guarded leg read."""
+    _guard_booking_probe(probe)
+    token = get_api_token(username, password)
+    leg = _response_data(api_get(token, f"/my-leg/{leg_id}"))
+    if not isinstance(leg, dict):
+        _die("Unexpected leg response.", EXIT_ERROR)
+    audit = _audit_leg_travel_info(leg)
+    link_id = leg.get("customsDeclarationId")
+    status = _customs_submission_status(api_get(token, f"/canadian-customs-declaration-link/{link_id}"), leg_id) if link_id else None
+    by_id = {p["legPassengerId"]: p for p in status["passengers"]} if status else {}
+    for passenger in audit["passengers"]:
+        submitted = by_id.get(passenger["legPassengerId"], {})
+        passenger["customsSubmissionStatus"] = submitted.get("submissionStatus", "unknown")
+        passenger["customsDeclarationAlreadySubmitted"] = submitted.get("customsDeclarationAlreadySubmitted")
+    _out(audit, fmt, compact)
 
 
 @leg_app.command("update-passengers")
@@ -3217,8 +3372,8 @@ def _resolve_airport(token: str, icao: str) -> str:
 
     # Fall back to single-airport lookup; opportunistically extend cache
     resp = api_post(token, "/airport", {
-        "sort": [], "page": {"limit": 1, "offset": 0},
-        "filter": {"query": icao},
+        "sort": [], "page": {"limit": 100, "offset": 0},
+        "filter": {"name": icao},
     })
     items = resp.get("data", {}).get("items", [])
     for a in items:
@@ -4482,6 +4637,7 @@ def _passenger_passport_ids(passenger: Any) -> list[str]:
 @passport_app.command("list")
 def passport_list(
     limit: int = typer.Option(100, "--limit", help="Maximum saved passengers to scan"),
+    passenger_id: Optional[str] = typer.Option(None, "--passenger-id", help="Inspect one actual trip-profile UUID, including an unsaved guest"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
@@ -4493,13 +4649,16 @@ def passport_list(
     In particular, ``nationality`` is not relabelled or inferred as ``country``.
     """
     token = get_api_token(username, password)
-    resp = api_post(token, "/my-passenger", {
-        "sort": [],
-        "page": {"limit": limit, "offset": 0},
-        "filter": {},
-    })
-    data = resp.get("data", resp)
-    passengers = data.get("items", []) if isinstance(data, dict) else data
+    if passenger_id:
+        passengers = [_response_data(api_get(token, f"/my-passenger/{passenger_id}"))]
+    else:
+        resp = api_post(token, "/my-passenger", {
+            "sort": [],
+            "page": {"limit": limit, "offset": 0},
+            "filter": {},
+        })
+        data = resp.get("data", resp)
+        passengers = data.get("items", []) if isinstance(data, dict) else data
     passports: list[dict[str, Any]] = []
     if isinstance(passengers, list):
         for passenger in passengers:
@@ -5038,6 +5197,9 @@ def _trip_legs(trip: Any) -> list[dict[str, Any]]:
 
 
 def _leg_departure_country(leg: dict[str, Any]) -> str | None:
+    flight = leg.get("flight")
+    if isinstance(flight, dict) and flight.get("departureAirportCountry"):
+        return flight["departureAirportCountry"]
     airport = leg.get("departureAirport")
     if isinstance(airport, dict):
         address = airport.get("address")
@@ -5075,12 +5237,10 @@ def _resolve_customs_passengers(leg: dict[str, Any], names: list[str]) -> list[s
     for requested in names:
         normalized = " ".join(requested.casefold().split())
         matches = [row for row, name in normalized_rows if name == normalized]
-        if not matches:
-            matches = [row for row, name in normalized_rows if normalized in name]
         if len(matches) != 1:
             available = ", ".join(_passenger_name(row) for row in rows) or "none"
             _die(
-                f'Passenger "{requested}" matched {len(matches)} leg passengers. Available: {available}',
+                f'Passenger "{requested}" matched {len(matches)} leg passengers. Use the full first and last name. Available: {available}',
                 EXIT_VALIDATION,
             )
         leg_passenger_id = _leg_passenger_id(matches[0])
@@ -5096,6 +5256,43 @@ def _resolve_customs_passengers(leg: dict[str, Any], names: list[str]) -> list[s
 
 _CUSTOMS_CURRENCIES = ("CAD", "USD")
 _CUSTOMS_MAX_PASSENGERS = 4  # app: "Maximum 4 people residing at the same address per declaration"
+_CUSTOMS_CERTIFICATION = "I certify that the above declaration is true and complete. By checking this box, I confirm my agreement."
+
+
+def _customs_submission_status(response: Any, leg_id: str | None = None) -> dict[str, Any]:
+    """The app disables passengers using this server flag, not a signature field."""
+    data = _response_data(response)
+    leg = data.get("leg") if isinstance(data, dict) else None
+    if not isinstance(leg, dict) or not leg.get("id") or (leg_id and leg.get("id") != leg_id):
+        _die("Customs link does not identify the requested leg; no declaration submitted.", EXIT_VALIDATION)
+    rows = leg.get("passengers")
+    if not isinstance(rows, list):
+        _die("Cannot verify customs submission status; no declaration submitted.", EXIT_VALIDATION)
+    passengers = []
+    seen = set()
+    for row in rows:
+        if (not isinstance(row, dict) or not isinstance(row.get("id"), str)
+                or not row["id"] or row["id"] in seen
+                or type(row.get("customsDeclarationAlreadySubmitted")) is not bool):
+            _die("Incomplete or ambiguous customs submission status; no declaration submitted.", EXIT_VALIDATION)
+        seen.add(row["id"])
+        submitted = row["customsDeclarationAlreadySubmitted"]
+        passengers.append({
+            "legPassengerId": row["id"], "name": _passenger_name(row),
+            "customsDeclarationAlreadySubmitted": submitted,
+            "submissionStatus": "submitted" if submitted else "not-submitted",
+        })
+    return {"linkId": data.get("id"), "legId": leg["id"], "passengers": passengers}
+
+
+def _require_customs_not_submitted(status: dict[str, Any], passenger_ids: list[str]) -> None:
+    by_id = {p["legPassengerId"]: p for p in status["passengers"]}
+    if any(p not in by_id for p in passenger_ids):
+        _die("Selected passengers are missing from the customs link; no declaration submitted.", EXIT_VALIDATION)
+    already = [by_id[p]["name"] for p in passenger_ids if by_id[p]["customsDeclarationAlreadySubmitted"]]
+    if already:
+        _die("Already submitted / déjà soumise: " + ", ".join(already)
+             + ". Duplicate submission blocked. Select only passengers not yet submitted.", EXIT_VALIDATION)
 
 
 def _customs_declaration_date(value: str | None, timezone: str | None) -> str:
@@ -5216,11 +5413,314 @@ def customs_list(
     _out(resp.get("data", {}).get("items", resp.get("data", resp)), fmt, compact)
 
 
+def _customs_draft_checksum(draft: dict[str, Any]) -> str:
+    content = {k: v for k, v in draft.items() if k != "checksum"}
+    return hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def _customs_certification_digest(draft: dict[str, Any]) -> str:
+    return _customs_draft_checksum({k: draft[k] for k in ("legId", "legPassengerIds", "snapshot", "answers", "family")})
+
+
+def _customs_draft_filename(draft: dict[str, Any]) -> str:
+    """Use the booking and each traveller's full name, never first-name aliases."""
+    snapshot = draft["snapshot"]
+    slugs = []
+    for person in snapshot["passengers"]:
+        name = str(person.get("name") or "").strip()
+        if len(name.split()) < 2:
+            _die("Customs drafts require each traveller's full first and last name.", EXIT_VALIDATION)
+        normalized = "".join(c for c in unicodedata.normalize("NFKD", name) if not unicodedata.combining(c))
+        slug = re.sub(r"[\W_]+", "-", normalized.casefold()).strip("-")
+        if not slug:
+            _die("Cannot build a draft filename from the traveller's full name.", EXIT_VALIDATION)
+        slugs.append(slug)
+    if not slugs:
+        _die("A customs draft needs at least one named traveller.", EXIT_VALIDATION)
+    booking = re.sub(r"[^A-Za-z0-9_-]+", "-", str(snapshot.get("bookingId") or draft["legId"])).strip("-")
+    return booking + "-" + "--".join(slugs) + ".json"
+
+
+def _require_customs_draft_filename(path: Path, draft: dict[str, Any]) -> None:
+    expected = _customs_draft_filename(draft)
+    if path.name != expected:
+        _die(f"Use the full-name draft filename {expected}. First-name-only and other aliases are not supported.", EXIT_VALIDATION)
+
+
+def _save_customs_draft(path: Path, draft: dict[str, Any]) -> None:
+    _require_customs_draft_filename(path, draft)
+    draft["checksum"] = _customs_draft_checksum(draft)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _atomic_write_json(path, draft)
+
+
+def _load_customs_draft(path: Path) -> dict[str, Any]:
+    try:
+        draft = json.loads(path.read_text())
+    except (OSError, ValueError):
+        _die("Cannot read customs draft. Use customs prepare to create it.", EXIT_VALIDATION)
+    if (not isinstance(draft, dict) or draft.get("schema") != "airsprint-customs-draft-v1"
+            or draft.get("checksum") != _customs_draft_checksum(draft)):
+        _die("Invalid or manually modified customs draft. Rebuild it with customs prepare.", EXIT_VALIDATION)
+    _require_customs_draft_filename(path, draft)
+    return draft
+
+
+def _customs_leg_snapshot(leg: dict[str, Any], passenger_ids: list[str]) -> dict[str, Any]:
+    audit = _audit_leg_travel_info(leg)
+    rows = {r.get("id"): r for r in _leg_passenger_rows(leg) if isinstance(r, dict)}
+    flight = leg.get("flight") or leg
+    itinerary = {k: flight.get(k) for k in (
+        "departureTime", "arrivalTime", "departureAirportCode", "arrivalAirportCode",
+        "departureAirportCountry", "arrivalAirportCountry", "departureAirportTimezone", "arrivalAirportTimezone",
+    )}
+    blockers = []
+    if str(leg.get("status", "")).upper() == "CANCELLED":
+        blockers.append("cancelledLeg")
+    if str(itinerary["arrivalAirportCountry"] or "").casefold() not in {"canada", "ca", "can"}:
+        blockers.append("CanadianCustomsRequiresLegArrivingInCanada")
+    if not all(itinerary[k] for k in ("departureTime", "arrivalTime", "departureAirportCode", "arrivalAirportCode")):
+        blockers.append("incompleteItinerary")
+    selected = []
+    for passenger_id in passenger_ids:
+        match = next((p for p in audit["passengers"] if p["legPassengerId"] == passenger_id), None)
+        if match is None:
+            _die("Draft passenger is no longer on this leg. Prepare a new draft.", EXIT_VALIDATION)
+        item = dict(match)
+        row = rows[passenger_id]
+        passports = row.get("passports") or []
+        record = next((p for p in passports if p.get("id") == item["selectedPassportId"]), None) if item["selectedPassportId"] else next(iter(passports), None)
+        item["passport"] = {k: record.get(k) for k in (
+            "id", "passportNumber", "nationality", "issuingAuthority", "dateOfBirth", "dateOfBirthTimestamp",
+            "expirationDate", "expirationDateTimestamp",
+        )} if record else None
+        item["destinationAddress"] = _leg_destination_address_update(row.get("destinationAddress") or {})
+        if not item["destinationAddressComplete"] and any(
+            str(itinerary[k] or "").casefold() in {"united states", "usa", "us"}
+            for k in ("departureAirportCountry", "arrivalAirportCountry")
+        ):
+            item["issues"].append("missingDestinationAddress")
+        if record:
+            for field in ("passportNumber", "nationality", "issuingAuthority"):
+                if not record.get(field):
+                    item["issues"].append("missingPassportField:" + field)
+            for field in ("dateOfBirth", "expirationDate"):
+                if not (record.get(field) or record.get(field + "Timestamp")):
+                    item["issues"].append("missingPassportField:" + field)
+        blockers.extend(item["name"] + ":" + issue for issue in item["issues"])
+        selected.append(item)
+    return {"legId": leg.get("id"), "bookingId": leg.get("bookingId"), "itinerary": itinerary,
+            "passengers": selected, "blockers": blockers}
+
+
+def _customs_form_from_answers(answers: dict[str, Any], link_id: str, ids: list[str]) -> tuple[dict[str, Any] | None, list[str]]:
+    required = ["purpose", "date", "timezone", "has_pet", "has_alcohol_or_tobacco", "has_imported_goods", "has_high_value_currency"]
+    missing = [key for key in required if answers.get(key) is None or answers.get(key) == ""]
+    purpose = _optional_enum(answers.get("purpose"), "--purpose", ("BUSINESS", "PLEASURE"))
+    if purpose == "BUSINESS" and not _customs_text(answers.get("description")):
+        missing.append("description")
+    flags = {k: _optional_yes_no(answers.get(k), "--" + k.replace("_", "-")) for k in
+             ("has_pet", "has_alcohol_or_tobacco", "has_imported_goods", "has_high_value_currency", "imported_goods_from_us")}
+    for condition, fields in (
+        ("has_alcohol_or_tobacco", ["alcohol_type", "alcohol_volume", "alcohol_value_cad"]),
+        ("has_imported_goods", ["imported_goods", "imported_goods_currency", "imported_goods_from_us"]),
+        ("has_high_value_currency", ["high_value_currency_description"]),
+    ):
+        if flags[condition]:
+            missing.extend(k for k in fields if answers.get(k) is None or answers.get(k) == "")
+    amount = _customs_money(answers.get("alcohol_value_cad"), "--alcohol-value-cad")
+    if amount is not None and not (0 <= amount < float("inf")):
+        _die("--alcohol-value-cad must be a finite non-negative amount.", EXIT_VALIDATION)
+    currency = _optional_enum(answers.get("imported_goods_currency"), "--imported-goods-currency", _CUSTOMS_CURRENCIES)
+    date_value = _customs_declaration_date(answers["date"], answers["timezone"]) if answers.get("date") and answers.get("timezone") else None
+    if missing:
+        return None, ["--" + k.replace("_", "-") for k in dict.fromkeys(missing)]
+    return _build_customs_body(
+        link_id=link_id, leg_passenger_ids=ids, date=date_value, purpose=purpose,
+        description=_customs_text(answers.get("description")) or "", has_pet=flags["has_pet"],
+        has_alcohol_or_tobacco=flags["has_alcohol_or_tobacco"],
+        alcohol_type=_customs_text(answers.get("alcohol_type")), alcohol_volume=_customs_text(answers.get("alcohol_volume")),
+        alcohol_value_cad=amount, has_imported_goods=flags["has_imported_goods"],
+        imported_goods=_customs_text(answers.get("imported_goods")), imported_goods_currency=currency,
+        imported_goods_from_us=flags["imported_goods_from_us"] or False,
+        souvenir_items=_customs_text(answers.get("souvenir_items")), has_high_value_currency=flags["has_high_value_currency"],
+        high_value_currency_description=_customs_text(answers.get("high_value_currency_description")),
+    ), []
+
+
+def _customs_draft_preview(draft: dict[str, Any], path: Path) -> dict[str, Any]:
+    ids = draft["legPassengerIds"]
+    groups = [ids] if draft["family"] else [[p] for p in ids]
+    body, missing = _customs_form_from_answers(draft["answers"], draft.get("linkId") or "<link created at submission>", ids)
+    status = draft.get("submissionStatus")
+    already = [p["name"] for p in (status or {}).get("passengers", [])
+               if p["legPassengerId"] in ids and p["customsDeclarationAlreadySubmitted"]]
+    blockers = list(draft["snapshot"]["blockers"]) + missing
+    blockers.extend(name + ":alreadySubmitted" for name in already)
+    forms = [{**body, "legPassengerIds": group} for group in groups] if body else []
+    digest = _customs_certification_digest(draft)
+    certifications = draft.get("certifications", {})
+    pending = [p["name"] for p in draft["snapshot"]["passengers"]
+               if certifications.get(p["legPassengerId"], {}).get("digest") != digest]
+    return {"localDraft": True, "draft": str(path), "state": draft["state"], "legId": draft["legId"],
+            "snapshot": draft["snapshot"], "answers": draft["answers"], "family": draft["family"],
+            "forms": len(groups), "declarations": len(ids), "payloads": forms,
+            **({"payload": forms[0]} if len(forms) == 1 else {}),
+            "submissionStatus": status or "unverified-until-link-created", "blockers": blockers,
+            "readyForApproval": not blockers and draft["state"] == "draft",
+            "pendingCertifications": pending,
+            "readyForSubmission": not blockers and not pending and draft["state"] == "draft",
+            "certification": _CUSTOMS_CERTIFICATION,
+            "message": "Local draft only. Review passports against scans and every answer with the travellers. "
+                       "Certify each person with customs certify, then customs submit --draft ... --confirm. "
+                       "Submitted status is per leg and per passenger; preparation sends nothing to AirSprint."}
+
+
+@customs_app.command("review")
+def customs_review(
+    draft_file: str = typer.Option(..., "--draft"),
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Review a local customs draft without authentication or network requests."""
+    path = Path(draft_file).expanduser().resolve()
+    _out(_customs_draft_preview(_load_customs_draft(path), path), fmt, compact)
+
+
+@customs_app.command("certify")
+def customs_certify(
+    draft_file: str = typer.Option(..., "--draft"),
+    passenger: str = typer.Option(..., "--passenger", help="One exact traveller name or leg-passenger UUID, never a list"),
+    approve: str = typer.Option(..., "--approve", help="yes records that traveller's explicit certification; no removes it"),
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Record one person's certification locally after showing and confirming their information."""
+    approval = _yes_no(approve, "--approve")
+    path = Path(draft_file).expanduser().resolve()
+    draft = _load_customs_draft(path)
+    preview = _customs_draft_preview(draft, path)
+    if draft["state"] != "draft":
+        _die("Only an unsubmitted draft can be certified.", EXIT_VALIDATION)
+    people = [p for p in draft["snapshot"]["passengers"]
+              if passenger == p["legPassengerId"] or passenger.strip().casefold() == p["name"].casefold()]
+    if len(people) != 1:
+        _die("Select exactly one traveller by full name or leg-passenger UUID.", EXIT_VALIDATION)
+    if approval and preview["blockers"]:
+        _die("Complete and review the draft first: " + ", ".join(preview["blockers"]), EXIT_VALIDATION)
+    person = people[0]
+    certifications = draft.setdefault("certifications", {})
+    if approval:
+        certifications[person["legPassengerId"]] = {
+            "digest": _customs_certification_digest(draft), "name": person["name"],
+            "certifiedAt": datetime.now(_tz_utc.utc).isoformat(), "statement": _CUSTOMS_CERTIFICATION,
+        }
+    else:
+        certifications.pop(person["legPassengerId"], None)
+    _save_customs_draft(path, draft)
+    _out({"draft": str(path), "person": person, "answers": draft["answers"], "certification": _CUSTOMS_CERTIFICATION,
+          "certified": approval, "pendingCertifications": _customs_draft_preview(draft, path)["pendingCertifications"],
+          "message": "Recorded locally. No declaration submitted."}, fmt, compact)
+
+
+@customs_app.command("submit")
+def customs_submit(
+    draft_file: str = typer.Option(..., "--draft"),
+    confirm: bool = typer.Option(False, "--confirm"),
+    probe: bool = typer.Option(False, "--probe/--no-probe"),
+    username: Optional[str] = Username, password: Optional[str] = Password,
+    fmt: str = Format, compact: bool = Compact,
+):
+    """Submit a reviewed local draft once after fresh leg and submission-status checks."""
+    if not confirm:
+        _die("--confirm required after individual certifications. Nothing submitted.", EXIT_VALIDATION)
+    path = Path(draft_file).expanduser().resolve()
+    CUSTOMS_DRAFT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Serialize submissions from this CLI on this machine, including different draft files.
+    with (CUSTOMS_DRAFT_DIR / ".submit.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _die("Another customs submission is in progress. Nothing sent.", EXIT_VALIDATION)
+        draft = _load_customs_draft(path)
+        preview = _customs_draft_preview(draft, path)
+        if draft["state"] != "draft":
+            _die("Draft is " + draft["state"] + ". It cannot be submitted again. Check customs status.", EXIT_VALIDATION)
+        if preview["blockers"]:
+            _die("Draft is incomplete: " + ", ".join(preview["blockers"]), EXIT_VALIDATION)
+        if preview["pendingCertifications"]:
+            _die("Each traveller must be certified first: " + ", ".join(preview["pendingCertifications"]), EXIT_VALIDATION)
+        ledger_path = CUSTOMS_DRAFT_DIR / "submissions.json"
+        try:
+            ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
+        except (OSError, ValueError):
+            _die("Cannot read the customs submission journal. Nothing submitted.", EXIT_VALIDATION)
+        if not isinstance(ledger, dict):
+            _die("Invalid customs submission journal. Nothing submitted.", EXIT_VALIDATION)
+        keys = [draft["legId"] + "/" + p for p in draft["legPassengerIds"]]
+        if any(k in ledger for k in keys):
+            _die("A submission was already attempted for these leg passengers. Duplicate blocked even from a new draft. Check customs status.", EXIT_VALIDATION)
+        _guard_booking_probe(probe)
+        token = get_api_token(username, password)
+        leg = _response_data(api_get(token, f"/my-leg/{draft['legId']}"))
+        if not isinstance(leg, dict):
+            _die("Unexpected leg response; draft not submitted.", EXIT_ERROR)
+        current = _customs_leg_snapshot(leg, draft["legPassengerIds"])
+        if current != draft["snapshot"]:
+            _die("Trip, passport or address data changed since preparation. Refresh the draft and review it again. Nothing submitted.", EXIT_VALIDATION)
+        link_id = draft.get("linkId") or leg.get("customsDeclarationId")
+        if not link_id:
+            link = api_post(token, "/canadian-customs-declaration-link/create", {"legId": draft["legId"]})
+            link_id = _entity_id(link, "link")
+            if not link_id:
+                _die("No link ID returned; no declaration submitted.", EXIT_ERROR)
+        draft["linkId"] = link_id
+        status = _customs_submission_status(api_get(token, f"/canadian-customs-declaration-link/{link_id}"), draft["legId"])
+        draft["submissionStatus"] = status
+        _save_customs_draft(path, draft)
+        _require_customs_not_submitted(status, draft["legPassengerIds"])
+        results = []
+        for form in preview["payloads"]:
+            form["canadianCustomsDeclationLinkId"] = link_id
+            draft.update(state="submitting", pendingLegPassengerIds=form["legPassengerIds"], results=results)
+            for passenger_id in form["legPassengerIds"]:
+                ledger[draft["legId"] + "/" + passenger_id] = {"state": "submitting", "draft": str(path), "linkId": link_id}
+            _atomic_write_json(ledger_path, ledger)
+            _save_customs_draft(path, draft)  # Before the write: even a killed process cannot silently resubmit.
+            try:
+                response = api_post(token, "/canadianCustomsDeclaration/create", form)
+                records = _response_data(response)
+                records = records if isinstance(records, list) else [records]
+                if len(records) != len(form["legPassengerIds"]) or any(not isinstance(r, dict) or not r.get("id") for r in records):
+                    raise RuntimeError("Submission response did not identify every declaration.")
+            except Exception as exc:
+                draft["state"] = "uncertain"
+                for passenger_id in form["legPassengerIds"]:
+                    ledger[draft["legId"] + "/" + passenger_id]["state"] = "uncertain"
+                _atomic_write_json(ledger_path, ledger)
+                _save_customs_draft(path, draft)
+                raise RuntimeError(json.dumps({"status": "error", "message": "Submission stopped; status is uncertain. Do not resubmit. Check customs status.",
+                                               "draft": str(path), "linkId": link_id, "completedForms": results, "cause": str(exc)})) from exc
+            results.append({"legPassengerIds": form["legPassengerIds"], "submissionStatus": "submitted", "result": response})
+            for passenger_id in form["legPassengerIds"]:
+                ledger[draft["legId"] + "/" + passenger_id]["state"] = "submitted"
+            _atomic_write_json(ledger_path, ledger)
+            for p in status["passengers"]:
+                if p["legPassengerId"] in form["legPassengerIds"]:
+                    p.update(customsDeclarationAlreadySubmitted=True, submissionStatus="submitted")
+            draft.update(results=results, submissionStatus=status)
+            _save_customs_draft(path, draft)
+        draft.update(state="submitted", pendingLegPassengerIds=[], approvedByCaller=True)
+        _save_customs_draft(path, draft)
+        _out({"draft": str(path), "state": "submitted", "linkId": link_id, "results": results,
+              "submissionStatus": status, "message": "Submitted once per form after certification. No read-back performed."}, fmt, compact)
+
+
+@customs_app.command("prepare")
 @customs_app.command("create")
 def customs_create(
-    booking_id: Optional[str] = typer.Option(None, "--booking", help="Booking code or trip UUID (uses its leg departing Canada)"),
+    booking_id: Optional[str] = typer.Option(None, "--booking", help="Booking code or trip UUID (selects its active leg arriving in Canada)"),
     leg_id: Optional[str] = typer.Option(None, "--leg-id", help="Booked-leg UUID"),
-    passengers: Optional[str] = typer.Option(None, "--passengers", help="Comma-separated passenger names on that leg (max 4 per declaration, same address)"),
+    passengers: Optional[str] = typer.Option(None, "--passengers", help="Comma-separated full first and last names; one form each by default. Use separate commands for different answers."),
+    family: Optional[str] = typer.Option(None, "--family", help="yes confirms all named passengers are family living at the same address (max 4); one shared form"),
     purpose: Optional[str] = typer.Option(None, "--purpose", help="BUSINESS | PLEASURE"),
     description: Optional[str] = typer.Option(None, "--description", help="Purpose details; required for BUSINESS"),
     date: Optional[str] = typer.Option(None, "--date", help="YYYY-MM-DD — the Traveller Declaration Form date (needs --timezone)"),
@@ -5236,168 +5736,95 @@ def customs_create(
     souvenir_items: Optional[str] = typer.Option(None, "--souvenir-items", help="Souvenirs or miscellaneous items (optional)"),
     has_high_value_currency: Optional[str] = typer.Option(None, "--has-high-value-currency", help="yes | no; yes needs --high-value-currency-description"),
     high_value_currency_description: Optional[str] = typer.Option(None, "--high-value-currency-description", help="Currency or monetary instruments of CAD 10,000 or more"),
-    link_id: Optional[str] = typer.Option(None, "--link-id", help="Existing declaration link (`customs link-create`); when omitted one is created for the leg first, as the app does"),
+    link_id: Optional[str] = typer.Option(None, "--link-id", help="Existing declaration link; a missing link is created only at final submission"),
     timezone: Optional[str] = Timezone,
+    draft_file: Optional[str] = typer.Option(None, "--draft", help="Local BOOKING-firstname-lastname.json path; reuse to complete or correct answers"),
+    refresh: bool = typer.Option(False, "--refresh", help="Refresh trip/passport/address/status data and invalidate certifications"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     probe: bool = typer.Option(False, "--probe/--no-probe", help="Override recent-booking-write cooldown"),
     username: Optional[str] = Username, password: Optional[str] = Password,
     fmt: str = Format, compact: bool = Compact,
 ):
-    """Submit the Canadian customs declaration form for named passengers on one leg.
+    """Create or correct a LOCAL draft; never submit a declaration.
 
-    Every yes/no question must be answered and the details behind a "yes" are
-    required, as in the app. One request naming several passengers creates one
-    declaration per person. Certification/signature still happens in the
-    AirSprint app.
+    Omit unanswered questions to save an incomplete draft. Reuse --draft to
+    fill answers without a network call; --refresh reads the same leg again.
+    Each traveller must then be certified individually before customs submit.
     """
-    if not (booking_id or leg_id):
-        _die("Provide --booking or --leg-id.", EXIT_VALIDATION)
-    names = _csv(passengers, "--passengers", required=True)
-    if len(names) > _CUSTOMS_MAX_PASSENGERS:
-        _die(
-            f"A declaration covers at most {_CUSTOMS_MAX_PASSENGERS} people residing at the same address; "
-            "submit another declaration for the others. Nothing was sent.",
-            EXIT_VALIDATION,
-        )
-    if not purpose:
-        _die("--purpose is required: BUSINESS or PLEASURE.", EXIT_VALIDATION)
-    purpose_value = _enum(purpose, "--purpose", ("BUSINESS", "PLEASURE"))
-    description_text = (description or "").strip()
-    if purpose_value == "BUSINESS" and not description_text:
-        _die("--description is required when --purpose is BUSINESS. Nothing was sent.", EXIT_VALIDATION)
-    _use_timezone(timezone)
-    declaration_date = _customs_declaration_date(date, timezone)
-    unanswered = [
-        option for option, answer in (
-            ("--has-pet", has_pet),
-            ("--has-alcohol-or-tobacco", has_alcohol_or_tobacco),
-            ("--has-imported-goods", has_imported_goods),
-            ("--has-high-value-currency", has_high_value_currency),
-        ) if answer is None
-    ]
-    if unanswered:
-        _die("Answer every declaration question with yes or no: " + ", ".join(unanswered) + ". Nothing was sent.", EXIT_VALIDATION)
-    pet = _yes_no(has_pet, "--has-pet")
-    alcohol = _yes_no(has_alcohol_or_tobacco, "--has-alcohol-or-tobacco")
-    imported = _yes_no(has_imported_goods, "--has-imported-goods")
-    high_value = _yes_no(has_high_value_currency, "--has-high-value-currency")
-    alcohol_type_text = _customs_text(alcohol_type)
-    alcohol_volume_text = _customs_text(alcohol_volume)
-    alcohol_value = _customs_money(alcohol_value_cad, "--alcohol-value-cad")
-    if alcohol and not (alcohol_type_text and alcohol_volume_text and alcohol_value is not None):
-        _die(
-            "--has-alcohol-or-tobacco yes needs --alcohol-type, --alcohol-volume and --alcohol-value-cad. Nothing was sent.",
-            EXIT_VALIDATION,
-        )
-    goods_text = _customs_text(imported_goods)
-    currency = _optional_enum(imported_goods_currency, "--imported-goods-currency", _CUSTOMS_CURRENCIES)
-    if imported and not (goods_text and currency):
-        _die(
-            "--has-imported-goods yes needs --imported-goods and --imported-goods-currency (CAD or USD). Nothing was sent.",
-            EXIT_VALIDATION,
-        )
-    if imported and imported_goods_from_us is None:
-        _die("--has-imported-goods yes needs --imported-goods-from-us yes|no. Nothing was sent.", EXIT_VALIDATION)
-    from_us = _yes_no(imported_goods_from_us, "--imported-goods-from-us") if imported_goods_from_us is not None else False
-    high_value_text = _customs_text(high_value_currency_description)
-    if high_value and not high_value_text:
-        _die("--has-high-value-currency yes needs --high-value-currency-description. Nothing was sent.", EXIT_VALIDATION)
-
-    _guard_booking_probe(probe)
-    token = get_api_token(username, password)
-    if leg_id:
-        leg = _response_data(api_get(token, f"/my-leg/{leg_id}"))
-        if not isinstance(leg, dict):
-            _die(f"Unexpected leg response for {leg_id}.", EXIT_ERROR)
+    path = Path(draft_file).expanduser().resolve() if draft_file else None
+    existing = _load_customs_draft(path) if path is not None and path.exists() else None
+    if existing and existing["state"] != "draft":
+        _die("A submitted or uncertain draft cannot be edited. Check customs status before preparing another.", EXIT_VALIDATION)
+    if existing and any((booking_id, leg_id, passengers, link_id)):
+        _die("To edit a draft, use --draft with answer options or --refresh. Its leg and passengers cannot be replaced.", EXIT_VALIDATION)
+    if not existing and bool(booking_id) == bool(leg_id):
+        _die("Provide exactly one of --booking or --leg-id.", EXIT_VALIDATION)
+    answer_values = {
+        "purpose": purpose, "description": description, "date": date, "timezone": timezone,
+        "has_pet": has_pet, "has_alcohol_or_tobacco": has_alcohol_or_tobacco,
+        "alcohol_type": alcohol_type, "alcohol_volume": alcohol_volume, "alcohol_value_cad": alcohol_value_cad,
+        "has_imported_goods": has_imported_goods, "imported_goods": imported_goods,
+        "imported_goods_currency": imported_goods_currency, "imported_goods_from_us": imported_goods_from_us,
+        "souvenir_items": souvenir_items, "has_high_value_currency": has_high_value_currency,
+        "high_value_currency_description": high_value_currency_description,
+    }
+    answers = dict(existing["answers"]) if existing else {}
+    answers.update({k: v for k, v in answer_values.items() if v is not None})
+    family_flag = _yes_no(family, "--family") if family is not None else (existing["family"] if existing else False)
+    # Validate any supplied answers before auth; incomplete answers remain visible in the draft.
+    _customs_form_from_answers(answers, "preview", [])
+    names = [] if existing else _csv(passengers, "--passengers", required=True)
+    count = len(existing["legPassengerIds"]) if existing else len(names)
+    if family_flag and count > _CUSTOMS_MAX_PASSENGERS:
+        _die("Family forms cover at most 4 people residing at the same address.", EXIT_VALIDATION)
+    if existing and not refresh:
+        draft = dict(existing)
     else:
-        trip_uuid = _resolve_trip_uuid(token, booking_id or "")
-        trip = api_get(token, f"/trip/{trip_uuid}")
-        legs = _trip_legs(trip)
-        if not legs:
-            _die(f"No legs found for {booking_id}.", EXIT_NOT_FOUND)
-        canadian_departures = [
-            item for item in legs
-            if (_leg_departure_country(item) or "").casefold() == "canada"
-        ]
-        leg = canadian_departures[0] if canadian_departures else legs[0]
-    leg_uuid = leg_id or leg.get("id")
-    if not isinstance(leg_uuid, str) or not leg_uuid:
-        _die("Could not determine the leg UUID; pass --leg-id explicitly.", EXIT_ERROR)
-    leg_passenger_ids = _resolve_customs_passengers(leg, names)
-    body = _build_customs_body(
-        link_id=link_id or f"(new link for leg {leg_uuid})",
-        leg_passenger_ids=leg_passenger_ids,
-        date=declaration_date,
-        purpose=purpose_value,
-        description=description_text,
-        has_pet=pet,
-        has_alcohol_or_tobacco=alcohol,
-        alcohol_type=alcohol_type_text,
-        alcohol_volume=alcohol_volume_text,
-        alcohol_value_cad=alcohol_value,
-        has_imported_goods=imported,
-        imported_goods=goods_text,
-        imported_goods_currency=currency,
-        imported_goods_from_us=from_us,
-        souvenir_items=_customs_text(souvenir_items),
-        has_high_value_currency=high_value,
-        high_value_currency_description=high_value_text,
-    )
-    link_note = (
-        f"reusing link {link_id}" if link_id
-        else f'POST /canadian-customs-declaration-link/create {{"legId": "{leg_uuid}"}} runs first, as in the app'
-    )
+        _guard_booking_probe(probe)
+        token = get_api_token(username, password)
+        if existing:
+            leg_id = existing["legId"]
+        if leg_id:
+            leg = _response_data(api_get(token, f"/my-leg/{leg_id}"))
+        else:
+            trip_uuid = _resolve_trip_uuid(token, booking_id or "")
+            trip = api_get(token, f"/trip/{trip_uuid}")
+            legs = [item for item in _trip_legs(trip) if str(item.get("status", "")).upper() != "CANCELLED"]
+            returns = [item for item in legs if str((item.get("flight") or item).get("arrivalAirportCountry", "")).casefold() in {"canada", "ca", "can"}]
+            if len(returns) != 1:
+                _die("Booking must have exactly one active leg arriving in Canada. Select its --leg-id explicitly.", EXIT_VALIDATION)
+            leg = returns[0]
+        if not isinstance(leg, dict) or not isinstance(leg.get("id"), str):
+            _die("Unexpected leg response.", EXIT_ERROR)
+        ids = existing["legPassengerIds"] if existing else _resolve_customs_passengers(leg, names)
+        snapshot = _customs_leg_snapshot(leg, ids)
+        resolved_link_id = (existing.get("linkId") if existing else link_id) or leg.get("customsDeclarationId")
+        status = _customs_submission_status(api_get(token, f"/canadian-customs-declaration-link/{resolved_link_id}"), leg["id"]) if resolved_link_id else None
+        draft = {"schema": "airsprint-customs-draft-v1", "state": "draft", "legId": leg["id"],
+                 "legPassengerIds": ids, "linkId": resolved_link_id, "snapshot": snapshot, "submissionStatus": status}
+    draft.update(answers=answers, family=family_flag, certifications={})
+    if path is None:
+        path = CUSTOMS_DRAFT_DIR / _customs_draft_filename(draft)
+        if path.exists():
+            _die(f"Draft already exists: {path}. Use --draft to edit it; it was not overwritten.", EXIT_VALIDATION)
+    _require_customs_draft_filename(path, draft)
+    if not dry_run:
+        _save_customs_draft(path, draft)
+    preview = _customs_draft_preview(draft, path)
     if dry_run:
-        _out({
-            "dry_run": True,
-            "method": "POST",
-            "path": "/canadianCustomsDeclaration/create",
-            "payload": body,
-            "declarations": len(leg_passenger_ids),
-            "link": link_note,
-            "message": "Certification/signature still needs the AirSprint app.",
-        }, fmt, compact)
-        return
-    if not link_id:
-        link = api_post(token, "/canadian-customs-declaration-link/create", {"legId": leg_uuid})
-        link_id = _entity_id(link, "link")
-        if not link_id:
-            _die(f"Could not create the declaration link for leg {leg_uuid}; nothing was declared.", EXIT_ERROR)
-        body["canadianCustomsDeclationLinkId"] = link_id
-    result = api_post(token, "/canadianCustomsDeclaration/create", body)
-    _out({
-        "result": result,
-        "declarations": len(leg_passenger_ids),
-        "linkId": link_id,
-        "message": "Created once; certification/signature still needs the AirSprint app.",
-    }, fmt, compact)
+        preview.update(dry_run=True, method="POST", path="/canadianCustomsDeclaration/create")
+    _out(preview, fmt, compact)
 
 
-@customs_app.command("update-date")
+@customs_app.command("update-date", hidden=True)
 def customs_update_date(
-    declaration_id: str = typer.Option(..., "--id", help="Customs declaration UUID"),
-    date: str = typer.Option(..., "--date", help="ISO departure leaving Canada"),
+    declaration_id: str = typer.Option(..., "--id"),
+    date: str = typer.Option(..., "--date"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     confirm: bool = typer.Option(False, "--confirm"),
-    username: Optional[str] = Username,
-    password: Optional[str] = Password,
-    fmt: str = Format,
-    compact: bool = Compact,
 ):
-    """Fix the single customs date field (departure leaving Canada)."""
-    path = f"/canadianCustomsDeclaration/{declaration_id}"
-    payload = {"options": {"date": _iso_datetime(date)}}
-    if dry_run:
-        _out({"dry_run": True, "method": "PATCH", "path": path, "payload": payload}, fmt, compact)
-        return
-    if not confirm:
-        _die("--confirm required to update a customs declaration date.", EXIT_VALIDATION)
-    token = get_api_token(username, password)
-    result = api_patch(token, path, payload)
-    _out({
-        "result": result,
-        "message": "Date patched once; signature/certification still needs the app. No read-back performed.",
-    }, fmt, compact)
+    """Retired: edit local drafts before certification and submission."""
+    _die("Submitted declarations are final in this CLI. Edit the local draft date with customs prepare --draft ... --date ... before submission. No PATCH sent.", EXIT_VALIDATION)
 
 
 @customs_app.command("link-create")
@@ -5421,17 +5848,19 @@ def customs_link_create(
     _out(api_post(token, "/canadian-customs-declaration-link/create", payload), fmt, compact)
 
 
+@customs_app.command("status")
 @customs_app.command("link-get")
 def customs_link_get(
-    link_id: str = typer.Option(..., "--id", help="Customs declaration link UUID"),
+    link_id: str = typer.Option(..., "--id", "--link-id", help="Customs declaration link UUID (not a passenger declaration ID)"),
     username: Optional[str] = Username,
     password: Optional[str] = Password,
     fmt: str = Format,
     compact: bool = Compact,
 ):
-    """Get a customs-declaration link (GET /canadian-customs-declaration-link/{id})."""
+    """Read the link and each passenger's submitted status, without submitting."""
     token = get_api_token(username, password)
-    _out(api_get(token, f"/canadian-customs-declaration-link/{link_id}"), fmt, compact)
+    response = api_get(token, f"/canadian-customs-declaration-link/{link_id}")
+    _out({"link": response, "submissionStatus": _customs_submission_status(response)}, fmt, compact)
 
 
 # ---------------------------------------------------------------------------

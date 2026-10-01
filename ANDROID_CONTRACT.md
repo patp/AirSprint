@@ -1,16 +1,16 @@
-# Android 6.1.10 contract audit
+# Android 6.1.12 contract audit
 
 This is the source-backed API contract for AirSprint CLI. The audit was made
-offline from the Android 6.1.10 APK (version code 133), installed from Google
-Play on 2026-09-16, without probing a booked trip. The audited `base.apk`
+offline from the Android 6.1.12 APK (version code 135), installed from Google
+Play on 2026-10-01, without probing a booked trip. The audited `base.apk`
 SHA-256 is:
 
 ```text
-388e12c6fa0c5d6c5f51424103efed9590a3ba590d1c096c891b9e053d1d8413
+f9f689cf22a6c74558800d468765bdbb1c293713f1fe87057ab0ca774d2284e5
 ```
 
-The decompiled repository layer contains 112 calls to `APIClient.request`.
-Seven are duplicate uses of the same method and normalized route, leaving 105
+The decompiled repository layer contains 111 calls to `APIClient.request`.
+Six are duplicate uses of the same method and normalized route, leaving 105
 unique HTTP contracts:
 
 | Method | Unique contracts |
@@ -29,15 +29,46 @@ request body from the decompiled Android payload models. The comparison
 includes methods, bodyless requests, request envelopes, field names, field
 order, ID types, and high-risk no-probe behavior—not only matching URL text.
 
-The 6.1.10 inventory with source locations is in `scripts/android_contracts.json`.
+The 6.1.12 inventory with source locations is in `scripts/android_contracts.json`.
 The regression suite checks the actual CLI call sites against that independent
-inventory, including pre-reads and upload routes. It allows only the documented
-customs-date extension. This would have caught the invalid `GET /leg/{id}`.
+inventory, including pre-reads and upload routes. The old customs-date
+extension is retired. This would have caught the invalid `GET /leg/{id}`.
 
 The original 6.1.4 analysis remains under `tmp/android-verify/analysis/`.
 Addresses in the historical findings below refer to that baseline unless
-explicitly marked 6.1.10. The fresh analysis is under
-`tmp/audit-2026-09-16/analysis/`; see `AUDIT_2026-09-16.md` for changes and limits.
+explicitly marked 6.1.10 or 6.1.12. The fresh analysis is under
+`tmp/audit-2026-10-01/analysis/`; see `AUDIT_2026-10-01.md` for changes and limits.
+
+## October 1 workflow corrections
+
+- Android 6.1.12 `RemoteCustomDeclarationRepository.submitDeclaration`
+  (0x88ec9c, POST at 0x88f280) does not serialize `agreedToDeclaration`.
+  The local form model does contain it; the checkbox text is at 0x8859c0
+  and callback `setAgreedToDeclaration` at 0x8905a0. There is no separate
+  signature/approve route. CLI certification is local and person-by-person.
+- `CustomsDeclarationLinkModel` decodes each leg passenger's
+  `customsDeclarationAlreadySubmitted` (0x7807ac). That flag, for the exact
+  Canadian-arrival leg and leg-passenger ID, is the duplicate-submission guard.
+  One link's status never establishes another leg's status.
+- `customs prepare` saves private local drafts, including incomplete answers.
+  Individual certifications bind to the exact itinerary, passenger/passport
+  fields, address and answers. `submit` checks those again, requires all
+  certifications, checks live submitted flags, and journals every attempted
+  form before its POST. Unknown outcomes are blocked; no retries or read-back.
+- The app permits four people residing at one address on one form
+  (0x883324). CLI policy is one form each unless family at the same address
+  is explicitly confirmed. Each family member still needs certification.
+- Passport form upload extensions are PDF/JPG/PNG (0x8eb3b0). No forced JPEG
+  conversion was added. Actual trip profiles and selected passport IDs must
+  be audited independently of same-named saved profiles.
+- Existing destination addresses are normalized through the five-field
+  Android request model; nullable `street2` from reads is omitted on writes.
+  `selectedPassportId` is preserved as `passport: {id}` when changing another
+  field, and is checked against attached records in the travel-info audit.
+- New `ShareEligibility` permits owned aircraft, or CJ2 with Embraer Infinity
+  access. Booking sharing reads the active account and enforces this rule.
+- Airport fallback uses `filter.name` and an exact ICAO match. The HTTP layer
+  checks embedded `httpStatusCode`, including failures returned over HTTP 200.
 
 ## Method
 
@@ -175,9 +206,8 @@ API itself does not make the document mandatory.
 - `--dry-run` previews are printed exactly as the body would be sent;
   `--compact` (which strips empty values from API responses) never edits a
   preview, so always-present empty keys such as `baggage: []` stay visible.
-  One placeholder exists: `customs create` without `--link-id` previews
-  `canadianCustomsDeclationLinkId` as `(new link for leg …)` because the app
-  creates that link at submit time; the live body carries the returned UUID.
+  Customs drafts without a link use a placeholder until submission creates
+  the link. The final body carries the returned UUID.
 - `LegUpdateOptions` (`PATCH /leg/{id}/required-info`) carries only the
   sections the form filled; `leg update-required-info` sends only answered
   sections and uses the model's key order.
@@ -199,9 +229,8 @@ API itself does not make the document mandatory.
   `DateFormat("yyyy-MM-dd").tryParse(date).toUtc().toIso8601String()`. The
   validator (`CustomDeclarationController.passengerFormIsValid`, 0x8a6c54)
   requires `travelDescription` only for `BUSINESS`, and the details behind
-  each "yes". `customs create` now sends this body, creates the link first,
-  and enforces the same answers; it used to send only the answered booleans,
-  no link ID and the leg's departure timestamp as `date`.
+  each "yes". `customs submit` builds this body from a completed local draft
+  after individual certification. `customs create` / `prepare` never submit.
 - `/empty-leg/book` and `/shared-flight/book` passengers: the CLI used to
   accept `--customs PAX=DECLARATION` and emit `customsDeclarationId`, a key
   `BookSharedPassenger.toJson` (0x70760c) can never produce; the option is
@@ -230,8 +259,8 @@ API itself does not make the document mandatory.
 ## Guard rails beyond the app
 
 These CLI refusals are stricter than Android and happen before the
-write is sent. Baggage and unanswered customs questions are refused before
-any request at all; the passport and destination checks first need read-only
+write is sent. Unanswered customs questions remain in local drafts and block
+certification/submission. Passport and destination checks need read-only
 lookups (airport mirror, `GET /my-passenger/{id}` for passports):
 
 - Baggage must be answered on every booking form (`--baggage NAME=QTY` or
@@ -327,7 +356,7 @@ single Android route supports several app functions.
 | `/baggage-type` | `booking baggage-types` |
 | `/booking-survey/create` | `booking survey` |
 | `/canadian-customs-declaration-link/create` | `customs link-create` |
-| `/canadianCustomsDeclaration/create` | `customs create` |
+| `/canadianCustomsDeclaration/create` | `customs submit` (certified local draft only) |
 | `/cancel-own` | `booking cancel` |
 | `/concierge` | `content concierge` |
 | `/empty-leg/book` | `booking empty-leg` |
@@ -386,7 +415,7 @@ single Android route supports several app functions.
 
 These commands are useful but are not claims about the Android source:
 
-- `customs update-date` uses the separately verified declaration PATCH.
+- The former `customs update-date` extension is retired; only unsubmitted local drafts can be corrected.
 - `passport make-primary` reorders `passportIds` because
   `selectedPassportId` does not persist in the live owner API.
 - `trips show` enriches the trip object with its manifest and uses AnyDoc first,
